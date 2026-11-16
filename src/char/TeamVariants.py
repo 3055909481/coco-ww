@@ -12,7 +12,6 @@ import hashlib
 import json
 import re
 import shutil
-import tempfile
 from pathlib import Path
 
 from ok import Logger
@@ -20,7 +19,7 @@ from ok.util.config import Config
 from src.char.CustomCharLoader import (
     TEAM_CODE_MODE_IMPORT, TEAM_IMPORT_SUFFIX, TEAM_MANIFEST_FILE,
     clear_team_char_cache, get_custom_team_folder, get_custom_team_root, get_team_key,
-    import_custom_team, normalize_team,
+    import_custom_team, make_work_folder, normalize_team,
 )
 
 logger = Logger.get_logger(__name__)
@@ -170,7 +169,7 @@ def stash_current(team):
     if active is None:
         return None
     root = get_variant_root(class_names, create=True)
-    temp = Path(tempfile.mkdtemp(prefix=".stash-", dir=root))
+    temp = make_work_folder(root, ".stash-")
     try:
         shutil.copytree(live, temp / "copy", ignore=COPY_IGNORE)
         target = root / active
@@ -193,7 +192,7 @@ def activate_variant(team, variant_id):
     live = get_custom_team_folder(class_names)
     parent = get_custom_team_root(create=True)
     stash_current(class_names)
-    temp = Path(tempfile.mkdtemp(prefix=f".{get_team_key(class_names)}-", dir=parent))
+    temp = make_work_folder(parent, f".{get_team_key(class_names)}-")
     try:
         shutil.copytree(source, temp / "new", ignore=COPY_IGNORE)
         if live.exists():
@@ -231,7 +230,7 @@ def add_variant_from_archive(info):
     while (root / variant_id).is_dir() or variant_id == active:
         number += 1
         variant_id = f"{base}_{number}"
-    temp = Path(tempfile.mkdtemp(prefix=".add-", dir=root))
+    temp = make_work_folder(root, ".add-")
     try:
         folder = temp / "copy"
         folder.mkdir()

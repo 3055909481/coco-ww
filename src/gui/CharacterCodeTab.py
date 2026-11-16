@@ -44,7 +44,6 @@ from src.char.TeamVariants import (
     import_archive_as_active, list_variants,
 )
 
-BASE_CHAR_URL = "https://raw.githubusercontent.com/ok-oldking/ok-wuthering-waves/refs/heads/master/src/char/BaseChar.py"
 # 椰果版的工坊就是这个 GitHub 仓库: codes/ 放队伍 zip, teams.json 是仓库里的 Actions 生成的索引。
 WORKSHOP_REPO = "wk321425/ok-ww-char-code"
 WORKSHOP_BRANCH = "main"
@@ -1030,19 +1029,21 @@ class CharacterCodeTab(CustomTab):
         self.char_image_label.setFixedSize(52, 52)
         self.char_image_label.setAlignment(Qt.AlignCenter)
         self.member_combo = ComboBox(parent=right)
-        self.member_combo.setMinimumWidth(190)
+        self.member_combo.setMinimumWidth(150)
         self.member_combo.currentIndexChanged.connect(self._member_selected)
         self.team_info_button = Button(self.tr("Team Info"), icon="info")
         self.team_info_button.clicked.connect(self._show_team_info)
         self.team_info_button.hide()
-        self.ask_ai_button = Button(self.tr("Ask AI"), icon="chat")
-        self.ask_ai_button.clicked.connect(self._copy_ask_ai_template)
         top.addWidget(self.char_image_label)
         top.addWidget(QLabel(self.tr("Character Code")))
         top.addWidget(self.member_combo)
         # 同一支队伍的多份代码: 下拉里选哪份就换成哪份, 当前那份自动收回存档库
+        # 顶栏从左到右: 选角色 / 选存档(占掉剩余宽度) / 删存档 / 拉取 / 队伍说明, 右边缘和下面的保存按钮对齐
         self.variant_combo = ComboBox(parent=right)
-        self.variant_combo.setMinimumWidth(240)
+        # 存档名很长, 不能让它把整行撑出窗口: 宽度跟着窗口走, 放不下就截断, 全名看悬停提示
+        self.variant_combo.setSizeAdjustPolicy(ComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.variant_combo.setMinimumContentsLength(10)
+        self.variant_combo.setMinimumWidth(160)
         self.variant_combo.setToolTip("这支队伍存着的几份代码, 选一份立刻换过去; 现在这份会自动存起来, 随时能换回")
         self.variant_combo.currentIndexChanged.connect(self._variant_selected)
         self.fetch_variants_button = Button("拉取同队代码", icon="download")
@@ -1052,12 +1053,10 @@ class CharacterCodeTab(CustomTab):
         self.delete_variant_button.setToolTip("删除不要的存档")
         self.delete_variant_button.clicked.connect(self._delete_variants)
         top.addWidget(QLabel("存档"))
-        top.addWidget(self.variant_combo)
-        top.addWidget(self.fetch_variants_button)
+        top.addWidget(self.variant_combo, 1)
         top.addWidget(self.delete_variant_button)
-        top.addStretch(1)
+        top.addWidget(self.fetch_variants_button)
         top.addWidget(self.team_info_button)
-        top.addWidget(self.ask_ai_button)
         right_layout.addLayout(top)
 
         self.editor = CodeEditor(right)
@@ -1207,6 +1206,9 @@ class CharacterCodeTab(CustomTab):
             self.variant_combo.addItem(variant["label"], userData=variant["id"])
         self.variant_combo.setCurrentIndex(0 if variants else -1)
         self.variant_combo.blockSignals(False)
+        self.variant_combo.setToolTip(
+            (f"现在生效: {variants[0]['label']}\n" if variants else "")
+            + "这支队伍存着的几份代码, 选一份立刻换过去; 现在这份会自动存起来, 随时能换回")
         has_team = self.current_team is not None
         self.variant_combo.setEnabled(has_team and len(variants) > 1)
         self.fetch_variants_button.setEnabled(has_team and not self.workshop_busy)
@@ -1358,7 +1360,7 @@ class CharacterCodeTab(CustomTab):
     def _set_editor_enabled(self, enabled):
         self.editor.setReadOnly(not enabled)
         for widget in (self.member_combo, self.delete_team_button,
-                       self.export_team_button, self.ask_ai_button, self.reset_button, self.save_button):
+                       self.export_team_button, self.reset_button, self.save_button):
             widget.setEnabled(enabled)
         # Workshop button should always remain enabled to allow browsing & importing any team
         self.workshop_button.setEnabled(not self.workshop_busy)
@@ -1902,13 +1904,6 @@ class CharacterCodeTab(CustomTab):
                 selections.append(selection)
         self.editor.setExtraSelections(selections)
 
-    def _copy_ask_ai_template(self):
-        if self.current_char_cls is None:
-            return
-        class_name = self.current_char_cls.__name__
-        template = f'''```python\n{self.editor.toPlainText()}\n```\n\n{self.tr("I want to implement:")}\n\n{self.tr("Please modify the full {class_name} character automation code above.").format(class_name=class_name)}\n\n{self.tr("Return only the complete modified Python code for the whole file, not a patch and not an explanation.")}\n{self.tr("Keep the class name as {class_name}. Preserve imports that are still needed.").format(class_name=class_name)}\n\n{self.tr("Use this BaseChar reference while reasoning about helper methods, task APIs, state, switching, cooldowns, and combat flow:")}\n{BASE_CHAR_URL}\n'''
-        QApplication.clipboard().setText(template)
-        show_info_bar(self.window(), self.tr("Ask AI template copied. Paste it into an AI chatbot."), title=self.tr("Copied"))
 
     def _open_upload_team(self):
         QDesktopServices.openUrl(QUrl(UPLOAD_TEAM_URL))

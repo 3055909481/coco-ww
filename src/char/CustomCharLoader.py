@@ -4,7 +4,7 @@ import inspect
 import json
 import re
 import shutil
-import tempfile
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -39,6 +39,22 @@ _team_class_cache = {}
 # them once per member per team, which turns a scan over every team into a hundred
 # file reads. Cache the result and keep the existing clear hooks pointed at it.
 _builtin_code_cache = {}
+
+
+def make_work_folder(parent, prefix):
+    """在 parent 下建一个临时工作目录, 权限照常从 parent 继承。
+
+    不能用 tempfile.mkdtemp: Python 3.12.4 起它在 Windows 上建出来的目录只有创建者自己能访问。
+    程序是管理员身份运行的, 这种目录一旦改名成队伍目录, 普通权限的工具(备份、git、编辑器)就全读不了。
+    """
+    parent = Path(parent)
+    while True:
+        folder = parent / f"{prefix}{uuid.uuid4().hex[:8]}"
+        try:
+            folder.mkdir()
+            return folder
+        except FileExistsError:
+            continue
 
 
 def get_english_char_name(char_cls_or_name):
@@ -573,7 +589,7 @@ def import_custom_team(archive_info):
     codes = archive_info["codes"]
     folder = get_custom_team_folder(class_names)
     parent = get_custom_team_root(create=True)
-    temp_folder = Path(tempfile.mkdtemp(prefix=f".{get_team_key(class_names)}-", dir=parent))
+    temp_folder = make_work_folder(parent, f".{get_team_key(class_names)}-")
     try:
         for class_name in class_names:
             code = codes[class_name]
