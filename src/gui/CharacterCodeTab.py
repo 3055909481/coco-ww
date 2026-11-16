@@ -34,7 +34,7 @@ from src.char.CharFactory import apply_team_char_classes, char_dict
 from src.char.CustomCharLoader import (
     TEAM_CODE_MODE_BUILTIN, TEAM_CODE_MODE_IMPORT, TEAM_CODE_STATE_NONE,
     changed_import_members, create_custom_team, delete_custom_team, drifted_team_members,
-    export_custom_team, get_english_char_name,
+    export_custom_team, get_custom_team_folder, get_english_char_name,
     import_custom_team, inspect_team_archive, list_custom_teams, normalize_custom_teams,
     normalize_team, read_builtin_char_code, read_team_char_code, read_team_manifest,
     save_team_code_as_import, switch_all_teams_code_mode, switch_team_code_mode, team_code_state,
@@ -463,6 +463,54 @@ class TranslatedDialog(Dialog):
         return value_widget
 
 
+# 队伍里三个人的显示顺序: 主C -> 副C -> 辅助, 和游戏里配队的习惯一致。
+# 定位取框架给每个角色登记的类型; 漂泊者登记的是主C, 但实际配队里都是打辅助位的(风主、雷主), 排到副C一档。
+ROLE_RANK = {"MainDps": 0, "SubDps": 1, "Healer": 2}
+# 框架的三档不够细, 这里补两处:
+# - 漂泊者登记的是主C, 实际配队里是风主/雷主这种辅助位, 排在真正的副C后面
+# - 登记成 Healer 的角色里, 纯治疗/纯拐排最后, 坎特蕾拉、千咲、卜灵、布兰特这类带输出的排在它们前面
+ROLE_RANK_OVERRIDES = {
+    "Rover": 1.5,
+    **{name: 2.5 for name in (
+        "ShoreKeeper", "Verina", "Mornye", "Suisui", "Baizhi", "Youhu", "Lily", "Jianxin", "Taoqi")},
+}
+
+
+def _char_roles():
+    """{类名: 排序档位}, 同时认英文显示名(工坊索引里写的是显示名)。"""
+    roles = {}
+    for info in char_dict.values():
+        class_name = info["cls"].__name__
+        rank = ROLE_RANK_OVERRIDES.get(class_name)
+        if rank is None:
+            rank = ROLE_RANK.get(str(getattr(info.get("char_type"), "value", "")), 3)
+        roles[class_name.casefold()] = rank
+        roles[get_english_char_name(class_name).casefold()] = rank
+    return roles
+
+
+def team_display_order(names, team=None):
+    """把三个角色排成 主C、副C、辅助。
+
+    同一档里有两个人时(双主C、双辅助), 本地队伍看谁的代码文件大: 整条轴都写在持宏者那份里,
+    持宏者排前面; 分不出来或者是工坊里的条目, 就按名字排, 保证每次顺序一样。"""
+    roles = _char_roles()
+    sizes = {}
+    if team is not None:
+        try:
+            folder = get_custom_team_folder(team)
+            for name in names:
+                path = folder / f"{name}.py"
+                sizes[name] = path.stat().st_size if path.is_file() else 0
+        except (OSError, ValueError):
+            sizes = {}
+    return sorted(names, key=lambda name: (
+        roles.get(str(name).strip().casefold(), 3),
+        -sizes.get(name, 0),
+        get_english_char_name(str(name).strip()).casefold(),
+    ))
+
+
 def workshop_team_slug(team):
     names = sorted((
         re.sub(r"[^A-Za-z0-9-]+", "_", get_english_char_name(name)).strip("_")
@@ -808,11 +856,13 @@ class WorkshopDialog(TranslatedDialog):
     def _team_display_text(self, code):
         members = code.get("members")
         if members and isinstance(members, list):
-            names = [self.tr(get_english_char_name(m.strip())) for m in members if m.strip()]
+            names = [self.tr(get_english_char_name(m))
+                     for m in team_display_order([m.strip() for m in members if m.strip()])]
             return ", ".join(names)
         raw_team = code.get("team", "")
         if raw_team:
-            names = [self.tr(get_english_char_name(m.strip())) for m in raw_team.split(",") if m.strip()]
+            names = [self.tr(get_english_char_name(m))
+                     for m in team_display_order([m.strip() for m in raw_team.split(",") if m.strip()])]
             return ", ".join(names)
         return ""
 
@@ -1128,7 +1178,7 @@ class CharacterCodeTab(CustomTab):
         self.team_list.clear()
         selected_row = -1
         for row, team in enumerate(teams):
-            display_team = sorted(team, key=lambda name: get_english_char_name(name).casefold())
+            display_team = team_display_order(team, team)
             label = ", ".join(self.tr(get_english_char_name(name)) for name in display_team)
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, list(team))
@@ -1190,7 +1240,7 @@ class CharacterCodeTab(CustomTab):
         self.current_team_row = row
         self.member_combo.blockSignals(True)
         self.member_combo.clear()
-        for class_name in self.current_team:
+        for class_name in team_display_order(self.current_team, self.current_team):
             self.member_combo.addItem(self.tr(get_english_char_name(class_name)), userData=class_name)
         self.member_combo.setCurrentIndex(member_index)
         self.member_combo.blockSignals(False)
@@ -1434,7 +1484,7 @@ class CharacterCodeTab(CustomTab):
         if self.current_team is None:
             return
         team = self.current_team
-        display_team = sorted(team, key=lambda name: get_english_char_name(name).casefold())
+        display_team = team_display_order(team, team)
         team_name = ", ".join(self.tr(get_english_char_name(name)) for name in display_team)
         box = confirmation_dialog(
             self.tr("Delete Team"),

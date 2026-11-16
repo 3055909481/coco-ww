@@ -2296,3 +2296,12 @@ msgstr "為每個帳號分別設定任務。關閉時執行原有多帳號每日
 
 msgid "Edit account order, enabled accounts, tasks and task settings."
 msgstr "編輯帳號順序、啟用狀態、執行任務及任務設定。"
+
+msgid "Lily"
+msgstr "莉莉"
+
+msgid "Qingxiao"
+msgstr "清宵"
+
+msgid "Suoming"
+msgstr "鎖暝"
