@@ -257,7 +257,11 @@ config = {
     </p>
 """,
     'screenshots_folder': "screenshots",
-    'gui_title': 'OK-WW 椰果版',  # Optional
+    'gui_title': 'OK-WW 椰果版',
+    # 任务页: 两个分区直接叫功能名, 自动战斗排上面
+    'tasks_trigger_title': '自动战斗',
+    'tasks_onetime_title': '刷4C声骸',
+    'tasks_trigger_first': True,  # Optional
     'game_name': 'Wuthering Waves',
     # 'coco_feature_folder': get_path(__file__, 'assets/coco_feature'),  # required if using feature detection
     'log_file': 'logs/ok-ww.log',  # Optional, auto rotating every day

@@ -21,8 +21,6 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
         self.description = "Click Start after Entering Dungeon or Teleporting to The Boss"
         self.name = "🌀 Farm 4C Echo in Dungeon/World"
         self.icon = task_icon('boss')
-        self.group_name = 'Daily Activities'
-        self.group_icon = task_icon('category-daily')
         self.default_config.update({
             'Teleport to Boss': 'No',
             'Boss Level': "80",

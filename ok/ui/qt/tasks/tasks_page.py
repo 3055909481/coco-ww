@@ -55,6 +55,29 @@ def _app_tr(text):
     return og.app.tr(text) if og.app is not None and text else (text or "")
 
 
+def _page_option(key, default=None):
+    """任务页的外观选项, 写在应用的 config.py 里:
+    tasks_onetime_title / tasks_trigger_title 两个分区的名字, tasks_trigger_first 触发任务分区排在上面。"""
+    config = getattr(og.app, "config", None) if og.app is not None else None
+    try:
+        value = config.get(key) if config is not None else None
+    except Exception:
+        value = None
+    return default if value in (None, "") else value
+
+
+def onetime_title() -> str:
+    return _page_option("tasks_onetime_title") or _t("TasksPage", "On-demand")
+
+
+def trigger_title() -> str:
+    return _page_option("tasks_trigger_title") or _t("TasksPage", "Triggers")
+
+
+def trigger_first() -> bool:
+    return bool(_page_option("tasks_trigger_first", False))
+
+
 # --- task actions -----------------------------------------------------------------
 
 def start_task(task, parent: QWidget) -> None:
@@ -759,14 +782,18 @@ class TasksPage(QWidget):
         top.addWidget(self.filter_tabs)
         top.addStretch(1)
 
-        self.onetime_section = TaskSection(_t("TasksPage", "On-demand"), task_category_icon(KIND_ONETIME, "bolt"))
-        self.trigger_section = TaskSection(_t("TasksPage", "Triggers"), task_category_icon(KIND_TRIGGER, "timer"))
+        self.onetime_section = TaskSection(onetime_title(), task_category_icon(KIND_ONETIME, "bolt"))
+        self.trigger_section = TaskSection(trigger_title(), task_category_icon(KIND_TRIGGER, "timer"))
         self.onetime_section.toggled.connect(lambda _on: self._layout_sections())
         self.trigger_section.toggled.connect(lambda _on: self._layout_sections())
         self.list_column = QVBoxLayout()
         self.list_column.setSpacing(12)
-        self.list_column.addWidget(self.onetime_section, 1)
-        self.list_column.addWidget(self.trigger_section, 0)
+        if trigger_first():
+            self.list_column.addWidget(self.trigger_section, 0)
+            self.list_column.addWidget(self.onetime_section, 1)
+        else:
+            self.list_column.addWidget(self.onetime_section, 1)
+            self.list_column.addWidget(self.trigger_section, 0)
         # Takes the free height when no section does, keeping collapsed headers on top.
         self.list_column.addStretch(0)
         list_holder = QWidget()
@@ -817,7 +844,9 @@ class TasksPage(QWidget):
         self._build_filters()
         selected = self.selected_task if self.selected_task in self.rows else None
         if selected is None and (self.onetime_tasks or self.trigger_tasks):
-            selected = (self.onetime_tasks or self.trigger_tasks)[0]
+            first, second = ((self.trigger_tasks, self.onetime_tasks) if trigger_first()
+                             else (self.onetime_tasks, self.trigger_tasks))
+            selected = (first or second)[0]
         self.select_task(selected)
         self._apply_filter()
 
@@ -838,10 +867,12 @@ class TasksPage(QWidget):
         self.filter_tabs.add_tab(KIND_ALL, _t("TasksPage", "All"), len(self.onetime_tasks) + len(self.trigger_tasks),
                                  task_category_icon(KIND_ALL))
         if both_kinds:
-            self.filter_tabs.add_tab(KIND_ONETIME, _t("TasksPage", "On-demand"), len(self.onetime_tasks),
-                                     task_category_icon(KIND_ONETIME, "bolt"))
-            self.filter_tabs.add_tab(KIND_TRIGGER, _t("TasksPage", "Triggers"), len(self.trigger_tasks),
-                                     task_category_icon(KIND_TRIGGER, "timer"))
+            kind_tabs = [
+                (KIND_ONETIME, onetime_title(), len(self.onetime_tasks), task_category_icon(KIND_ONETIME, "bolt")),
+                (KIND_TRIGGER, trigger_title(), len(self.trigger_tasks), task_category_icon(KIND_TRIGGER, "timer")),
+            ]
+            for tab in (reversed(kind_tabs) if trigger_first() else kind_tabs):
+                self.filter_tabs.add_tab(*tab)
         if groups:
             self.filter_tabs.add_separator()
             for name, group_icon in groups.items():
@@ -882,7 +913,9 @@ class TasksPage(QWidget):
             section.set_collapsible(key == KIND_ALL)
         self._title_sections(key)
         if self.selected_task in self.rows and self.rows[self.selected_task].isHidden():
-            first = next((row.task for section in (self.onetime_section, self.trigger_section)
+            ordered = ((self.trigger_section, self.onetime_section) if trigger_first()
+                       else (self.onetime_section, self.trigger_section))
+            first = next((row.task for section in ordered
                           for row in section.rows if not row.isHidden()), None)
             self.select_task(first)
         self._layout_sections()
@@ -890,8 +923,8 @@ class TasksPage(QWidget):
     def _title_sections(self, key: str) -> None:
         """A category shown as one section takes the category's name and icon."""
 
-        self.onetime_section.set_title(_t("TasksPage", "On-demand"), task_category_icon(KIND_ONETIME, "bolt"))
-        self.trigger_section.set_title(_t("TasksPage", "Triggers"), task_category_icon(KIND_TRIGGER, "timer"))
+        self.onetime_section.set_title(onetime_title(), task_category_icon(KIND_ONETIME, "bolt"))
+        self.trigger_section.set_title(trigger_title(), task_category_icon(KIND_TRIGGER, "timer"))
         if not key.startswith(GROUP_PREFIX):
             return
         shown = [section for section in (self.onetime_section, self.trigger_section) if not section.isHidden()]
