@@ -14,8 +14,8 @@ from PySide6.QtGui import (
     QColor, QDesktopServices, QFontMetricsF, QPainter, QPixmap, QTextCursor, QTextFormat, QTextLayout,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QAbstractItemView, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit, QSplitter, QStyle,
+    QApplication, QCheckBox, QFileDialog, QAbstractItemView, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit, QSizePolicy, QSplitter, QStyle,
     QStyledItemDelegate, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QTextEdit,
     QVBoxLayout, QWidget,
 )
@@ -988,37 +988,43 @@ class CharacterCodeTab(CustomTab):
             translate_ui("Switch every team between imported and built in code"))
         self.switch_all_button.clicked.connect(self._switch_all_code_mode)
         left_layout.addWidget(self.switch_all_button)
-        team_buttons = QVBoxLayout()
-        first_team_button_row = QHBoxLayout()
+        # 六个按钮排成 3 行 2 列的等宽格子, 宽度跟着左栏走
+        team_buttons = QGridLayout()
+        team_buttons.setColumnStretch(0, 1)
+        team_buttons.setColumnStretch(1, 1)
         self.create_team_button = Button(self.tr("Create Team"), icon="plus", variant="primary")
         self.create_team_button.clicked.connect(self._create_team)
         self.delete_team_button = Button(self.tr("Delete Team"), icon="trash")
         self.delete_team_button.clicked.connect(self._delete_team)
         self.workshop_button = Button(self.tr("Workshop"), icon="layers")
         self.workshop_button.clicked.connect(self._open_workshop)
-        first_team_button_row.addWidget(self.create_team_button)
-        first_team_button_row.addWidget(self.delete_team_button)
-        second_team_button_row = QHBoxLayout()
         self.import_team_button = Button(self.tr("Import Team"), icon="download")
         self.import_team_button.clicked.connect(self._import_team)
         self.export_team_button = Button(self.tr("Export Selected"), icon="export")
         self.export_team_button.clicked.connect(self._export_team)
-        second_team_button_row.addWidget(self.workshop_button)
-        second_team_button_row.addWidget(self.import_team_button)
-        third_team_button_row = QHBoxLayout()
         self.upload_team_button = Button(self.tr("Upload Team"), icon="github")
         self.upload_team_button.clicked.connect(self._open_upload_team)
-        third_team_button_row.addWidget(self.export_team_button)
-        third_team_button_row.addWidget(self.upload_team_button)
+        grid_buttons = (
+            self.create_team_button, self.delete_team_button,
+            self.workshop_button, self.import_team_button,
+            self.export_team_button, self.upload_team_button,
+        )
+        for index, button in enumerate(grid_buttons):
+            # 宽度不看各自的字数, 只按格子平分, 六个才会一样大
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            team_buttons.addWidget(button, 1 + index // 2, index % 2)
+        # 左栏至少留出两个最宽按钮的位置, 字不会被截
+        widest = max(button.sizeHint().width() for button in grid_buttons)
+        buttons_width = 2 * widest + max(team_buttons.horizontalSpacing(), 6)
+        self.team_list.setMinimumWidth(max(210, buttons_width))
+        self.team_list.setMaximumWidth(max(300, buttons_width))
+        self.switch_all_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.export_current_button = None
         if (getattr(og, "app", None) and getattr(og.app, "config", {}).get("debug", False)
                 and (Path.cwd() / ".git").is_dir()):
             self.export_current_button = Button(self.tr("Export Current"), icon="export")
             self.export_current_button.clicked.connect(self._export_current_team)
-            team_buttons.addWidget(self.export_current_button)
-        team_buttons.addLayout(first_team_button_row)
-        team_buttons.addLayout(second_team_button_row)
-        team_buttons.addLayout(third_team_button_row)
+            team_buttons.addWidget(self.export_current_button, 0, 0, 1, 2)
         left_layout.addLayout(team_buttons)
 
         right = QWidget(splitter)

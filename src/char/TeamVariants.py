@@ -56,14 +56,17 @@ def variant_label(manifest):
     name = str(manifest.get("name") or "").strip() or "未命名"
     version = str(manifest.get("version") or "").strip()
     author = str(manifest.get("author") or "").strip()
-    label = f"{name} v{version}" if version else name
-    if author:
-        label = f"{label} · {author}"
-    # 同一支队伍的包名常常一样, 轴叫什么写在说明第一行, 带上才分得清
+    # 包名多半是三个角色的英文名(同队的包全一样, 队伍列表里也已经有了), 下拉里不显示;
+    # 轴叫什么写在说明第一行, 拿它当标题。包名本身带中文的才用包名。
     lines = [line.strip() for line in str(manifest.get("description") or "").splitlines() if line.strip()]
-    if lines:
-        label = f"{label} — {lines[0][:28]}"
-    return label
+    if any(ord(char) > 0x2E7F for char in name):
+        title = name
+    elif lines:
+        title = lines[0][:30]
+    else:
+        title = ""
+    parts = [f"{title} v{version}".strip() if version else title, author]
+    return " · ".join(part for part in parts if part) or name
 
 
 def _signature(folder, class_names):
