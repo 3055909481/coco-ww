@@ -1974,9 +1974,31 @@ class CharacterCodeTab(CustomTab):
         self.char_image_label.clear()
         if not self.show_char_feature_image:
             return
-        pixmap = self._get_char_feature_image(self.char_label_by_cls.get(self.current_char_cls))
+        pixmap = self._get_char_head_image(self.current_char_cls)
+        if pixmap is None:
+            pixmap = self._get_char_feature_image(self.char_label_by_cls.get(self.current_char_cls))
         if pixmap is not None and not pixmap.isNull():
             self.char_image_label.setPixmap(pixmap)
+
+    def _get_char_head_image(self, char_cls):
+        """游戏内的角色头像 assets/char_heads/<类名>.png; 没有这张图就返回 None, 退回模板截图。"""
+        name = getattr(char_cls, "__name__", char_cls)
+        if not name:
+            return None
+        key = ("head", str(name))
+        if key in self.char_feature_images:
+            return self.char_feature_images[key]
+        image = None
+        path = Path("assets") / "char_heads" / f"{name}.png"
+        if path.exists():
+            source = QPixmap(str(path))
+            if not source.isNull():
+                ratio = self.devicePixelRatioF()
+                side = round(52 * ratio)
+                image = source.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                image.setDevicePixelRatio(ratio)
+        self.char_feature_images[key] = image
+        return image
 
     def _load_char_feature_index(self):
         feature_index = {}
