@@ -270,6 +270,23 @@ def team_code_state(team):
     return get_team_code_mode(class_names)
 
 
+def team_runs_custom_code(team):
+    """队伍现在跑的代码是不是自定义的: 任何一个成员的代码和内置的不一样就算。
+
+    直接写进队伍目录、没走过导入的队伍没有导入副本, team_code_state 是 none,
+    但跑的照样是自定义代码; 列表前面的圆点按这个画。"""
+    class_names = normalize_team(team)
+    try:
+        for class_name, char_cls in _team_char_classes(class_names).items():
+            current = read_team_char_code(class_names, char_cls).replace("\r\n", "\n")
+            if current != read_builtin_char_code(char_cls).replace("\r\n", "\n"):
+                return True
+    except Exception as e:
+        logger.error(f"compare team code with built in failed for {class_names}: {e}")
+        return True
+    return False
+
+
 def normalize_team_code(team):
     """Complete the imported copies older versions left behind half written.
 

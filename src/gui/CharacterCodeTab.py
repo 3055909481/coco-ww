@@ -33,7 +33,7 @@ from ok.ui.qt.widget.CustomTab import CustomTab
 from src.char.CharFactory import apply_team_char_classes, char_dict
 from src.char.CustomCharLoader import (
     TEAM_CODE_MODE_BUILTIN, TEAM_CODE_MODE_IMPORT, TEAM_CODE_STATE_NONE,
-    changed_import_members, create_custom_team, delete_custom_team, drifted_team_members,
+    changed_import_members, create_custom_team, team_runs_custom_code, delete_custom_team, drifted_team_members,
     export_custom_team, get_custom_team_folder, get_english_char_name,
     import_custom_team, inspect_team_archive, list_custom_teams, normalize_custom_teams,
     normalize_team, read_builtin_char_code, read_team_char_code, read_team_manifest,
@@ -75,7 +75,8 @@ TEAM_CODE_STATE_ROLE = Qt.UserRole + 1
 
 
 def _state_colors(state):
-    return TEAM_CODE_STATE_COLORS[TEAM_CODE_MODE_IMPORT if state == TEAM_CODE_MODE_IMPORT else TEAM_CODE_MODE_BUILTIN]
+    custom = state in (TEAM_CODE_MODE_IMPORT, "custom")
+    return TEAM_CODE_STATE_COLORS[TEAM_CODE_MODE_IMPORT if custom else TEAM_CODE_MODE_BUILTIN]
 
 
 def team_state_color(state):
@@ -138,7 +139,22 @@ class TeamListDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+TEAM_DOT_CUSTOM = "custom"
+
+
+def team_dot_state(team, state):
+    """圆点按实际在跑的代码画: 导入的、或者直接写在队伍目录里和内置不一样的, 都算自定义(蓝);
+    只有真在跑内置代码才红。state 仍是 team_code_state 的结果, 切换按钮照旧只认它。"""
+    if state == TEAM_CODE_MODE_IMPORT:
+        return state
+    if state == TEAM_CODE_MODE_BUILTIN:
+        return state
+    return TEAM_DOT_CUSTOM if team_runs_custom_code(team) else TEAM_CODE_MODE_BUILTIN
+
+
 def team_state_tooltip(state):
+    if state == TEAM_DOT_CUSTOM:
+        return "自定义代码生效中（直接写在队伍目录里，没有导入副本）"
     if state == TEAM_CODE_MODE_IMPORT:
         return translate_ui("Imported code is in effect")
     if state == TEAM_CODE_MODE_BUILTIN:
@@ -1188,7 +1204,7 @@ class CharacterCodeTab(CustomTab):
             label = ", ".join(self.tr(get_english_char_name(name)) for name in display_team)
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, list(team))
-            self._mark_team_state(item, states[team])
+            self._mark_team_state(item, team_dot_state(team, states[team]))
             self.team_list.addItem(item)
             if team == selected_team:
                 selected_row = row
@@ -1225,7 +1241,7 @@ class CharacterCodeTab(CustomTab):
         if row >= 0:
             item = self.team_list.item(row)
             if item is not None:
-                self._mark_team_state(item, states[team])
+                self._mark_team_state(item, team_dot_state(team, states[team]))
         self._update_switch_all_button(states)
 
     def _team_selected(self, row):
