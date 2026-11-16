@@ -25,21 +25,8 @@ F_LOG_DEBOUNCE = 1.0     # 按住不放时别刷日志
 F_TASK_NAME = 'FStartCombatTask'
 
 
-def f_settings(task):
-    """读界面上的(开关, F 之后等待秒数)。
-
-    【没装那张卡片就返回默认值(开, 0 秒)】—— 把队伍导给别人时对方没有 ok_tasks/
-    里的那个任务, 功能照常, 只是他那边没有界面可调。
-    """
-    executor = getattr(task, 'executor', None)
-    for group in ('trigger_tasks', 'onetime_tasks'):
-        for other in getattr(executor, group, None) or ():
-            if type(other).__name__ == F_TASK_NAME:
-                try:
-                    return bool(other.enabled), float(getattr(other, 'f_start_delay', 0) or 0)
-                except Exception:
-                    return True, 0.0
-    return True, 0.0
+# 监视线程的实现在主程序 src/combat/AxisWatch.py (椰果版), 这里只导入
+from src.combat.AxisWatch import f_settings, start_enable_watch, start_f_watch
 
 
 # ==================== 自动战斗开关监视 ====================
@@ -57,102 +44,6 @@ def f_settings(task):
 # 站在里面永远看不到"刚才关过"。只有独立线程能观察到 enabled 的 True->False->True。
 # 判据跟物理 F 键那条路完全一致: 记一个时间戳, 调用方比 `> last_opener` 就放行。
 ENABLE_POLL_INTERVAL = 0.2
-
-
-def start_enable_watch(task, logger=None):
-    """盯 task.enabled 的 False->True 跳变, 把时刻记到 task._ww_task_restarted_at。
-
-    daemon 线程, 跟着进程退出。每个 task 只启一次。
-    """
-    if getattr(task, '_ww_enable_watch_started', False):
-        return
-    task._ww_enable_watch_started = True
-    if not hasattr(task, '_ww_task_restarted_at'):
-        # -1 = "从没重启过", 跟 last_opener 的"没跑过"对齐
-        task._ww_task_restarted_at = -1
-
-    def watch():
-        was_on = None
-        while True:
-            try:
-                now_on = bool(getattr(task, 'enabled', False))
-                if was_on is False and now_on:
-                    task._ww_task_restarted_at = time.time()
-                    if logger:
-                        logger.info('auto combat re-enabled -> opener re-armed')
-                was_on = now_on
-                time.sleep(ENABLE_POLL_INTERVAL)
-            except Exception:
-                return          # 进程收尾时安静退出
-
-    threading.Thread(target=watch, name='ok_ww_enable_watch', daemon=True).start()
-
-
-def start_f_watch(task, logger=None):
-    """把【物理】F 键按下的墙钟时间记到 task._f_last_press。每个 task 只启一次。
-
-    线程是 daemon, 跟着进程退出, 不用管回收。
-    """
-    if getattr(task, '_f_watch_started', False):
-        return
-    task._f_watch_started = True
-    if not hasattr(task, '_f_last_press'):
-        # 【初值取 -1 而不是 0】: 读取方是 `if f_press > self.last_opener`, 而
-        # last_opener 的"没跑过"也是 -1。给 0 的话开局第一次判定就恒成立(0 > -1),
-        # 会连 use_liberation 那道检查一起跳过 —— 两边都用 -1 表示"从没发生过"才对得上
-        task._f_last_press = -1
-
-    def watch():
-        try:
-            user32 = ctypes.windll.user32
-            user32.GetAsyncKeyState.restype = ctypes.c_short
-        except Exception as e:
-            task._f_watch_started = False
-            if logger:
-                logger.error(f'f watch: GetAsyncKeyState unavailable ({e}), '
-                             f'the "press F to re-arm the opener" shortcut stays off')
-            return
-        last_log = 0
-        was_down = False
-        while True:
-            try:
-                down = bool(user32.GetAsyncKeyState(F_VK) & 0x8000)
-                if down and not was_down and f_settings(task)[0]:
-                    # 【上升沿才算一次按下】。原来是"只要按着就每轮记一次",
-                    # 对 _f_last_press(取最新时刻)无所谓, 但下面 _f_pressed_at 是
-                    # 给框架消费的, 按住不放时反复刷新会让它永远"刚刚才按"
-                    now = time.time()
-                    # 【宏正在跑 = 正在战斗, 这下 F 是玩家手动处决, 不是重开副本】(2026-09-11 日志:
-                    # 06:17:40 手动处决的那一下 F 打出了 "opener re-armed" —— 下一次进长离就会从头
-                    # 跑启动轴)。只在宏空闲时才把 F 当成"重开了一局"
-                    if (getattr(task, '_three_fire_macro_busy', False)
-                            or getattr(task, '_ww_macro_busy', False)):
-                        if logger and now - last_log >= F_LOG_DEBOUNCE:
-                            last_log = now
-                            logger.info('physical F pressed while the macro is running '
-                                        '(manual execution) - opener NOT re-armed')
-                        was_down = down
-                        time.sleep(F_POLL_INTERVAL)
-                        continue
-                    task._f_last_press = now
-                    # 【这里是本线程和框架的唯一交接点】(2026-08-19):
-                    # 框架 CombatCheck.note_f_key() 原本自己调 GetAsyncKeyState,
-                    # 判据是【低位】—— 那一位的语义是"距上次调用之间被按过",
-                    # 【读一次就清, 而且整个进程共享】。本线程 20 毫秒轮询一次,
-                    # 每次调用都会把低位清掉, 框架那边就永远读到 0 ——
-                    # 结果是 watcher 一直在打日志, 而"按 F 直接进战斗"从来不触发。
-                    # 现在改成【一个读者】: 本线程读键, 顺手把框架要的时间戳也写了,
-                    # 框架不再自己读(见 CombatCheck.note_f_key 里的 watcher 分支)。
-                    task._f_pressed_at = now
-                    if logger and now - last_log >= F_LOG_DEBOUNCE:
-                        last_log = now
-                        logger.info('physical F pressed, opener re-armed')
-                was_down = down
-                time.sleep(F_POLL_INTERVAL)
-            except Exception:
-                return          # 进程收尾时 ctypes/解释器可能已经拆掉了, 安静退出
-
-    threading.Thread(target=watch, name='ok_ww_f_watch', daemon=True).start()
 
 
 # ==================== SendInput 左键(秧秧 2羽1苍 那一段用) ====================

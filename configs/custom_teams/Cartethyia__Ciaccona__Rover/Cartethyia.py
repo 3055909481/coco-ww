@@ -29,61 +29,8 @@ F_LOG_DEBOUNCE = 1.0
 F_TASK_NAME = 'FStartCombatTask'
 
 
-def f_settings(task):
-    """读界面上的(开关, F 之后等待秒数)。没装那张卡片就返回默认值(开, 0 秒)。"""
-    executor = getattr(task, 'executor', None)
-    for group in ('trigger_tasks', 'onetime_tasks'):
-        for other in getattr(executor, group, None) or ():
-            if type(other).__name__ == F_TASK_NAME:
-                try:
-                    return bool(other.enabled), float(getattr(other, 'f_start_delay', 0) or 0)
-                except Exception:
-                    return True, 0.0
-    return True, 0.0
-
-
-def start_f_watch(task, logger=None):
-    """把【物理】F 键按下的墙钟时间记到 task._f_last_press。每个 task 只启一次。"""
-    if getattr(task, '_f_watch_started', False):
-        return
-    task._f_watch_started = True
-    if not hasattr(task, '_f_last_press'):
-        # 【初值取 -1 不是 0】: 读取方是 `f_press > self.last_opener`, 而
-        # last_opener 的"没跑过"也是 -1。给 0 的话开局第一次判定恒成立
-        task._f_last_press = -1
-
-    def watch():
-        try:
-            user32 = ctypes.windll.user32
-            user32.GetAsyncKeyState.restype = ctypes.c_short
-        except Exception as e:
-            task._f_watch_started = False
-            if logger:
-                logger.error(f'f watch: GetAsyncKeyState unavailable ({e})')
-            return
-        last_log = 0
-        was_down = False
-        while True:
-            try:
-                down = bool(user32.GetAsyncKeyState(F_VK) & 0x8000)
-                if down and not was_down and f_settings(task)[0]:
-                    now = time.time()
-                    task._f_last_press = now
-                    # 【本线程是和框架的唯一交接点】: 框架 CombatCheck.note_f_key()
-                    # 自己调 GetAsyncKeyState 用的是【低位】—— 读一次就清、整个进程
-                    # 共享。本线程 50ms 轮询会把低位清光, 框架那边永远读到 0。
-                    # 改成一个读者: 本线程读键, 顺手把框架要的时间戳也写了
-                    task._f_pressed_at = now
-                    if logger and now - last_log >= F_LOG_DEBOUNCE:
-                        last_log = now
-                        logger.info('physical F pressed, opener re-armed')
-                was_down = down
-                time.sleep(F_POLL_INTERVAL)
-            except Exception:
-                return
-
-
-    threading.Thread(target=watch, name='ok_ww_f_watch', daemon=True).start()
+# 监视线程的实现在主程序 src/combat/AxisWatch.py (椰果版), 这里只导入
+from src.combat.AxisWatch import f_settings, start_f_watch
 
 
 class Cartethyia(NativeCartethyia):

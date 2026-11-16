@@ -17,32 +17,8 @@ LOCK_THRESHOLD = 0.70
 ENABLE_POLL_INTERVAL = 0.2
 
 
-def start_enable_watch(task, logger=None):
-    """盯 task.enabled 的 False->True 跳变, 把时刻记到 task._ww_task_restarted_at。
-
-    daemon 线程, 跟着进程退出。每个 task 只启一次。
-    """
-    if getattr(task, '_ww_enable_watch_started', False):
-        return
-    task._ww_enable_watch_started = True
-    if not hasattr(task, '_ww_task_restarted_at'):
-        task._ww_task_restarted_at = -1
-
-    def watch():
-        was_on = None
-        while True:
-            try:
-                now_on = bool(getattr(task, 'enabled', False))
-                if was_on is False and now_on:
-                    task._ww_task_restarted_at = time.time()
-                    if logger:
-                        logger.info('auto combat re-enabled -> opener re-armed')
-                was_on = now_on
-                time.sleep(ENABLE_POLL_INTERVAL)
-            except Exception:
-                return
-
-    threading.Thread(target=watch, name='ok_ww_enable_watch', daemon=True).start()
+# 监视线程的实现在主程序 src/combat/AxisWatch.py (椰果版), 这里只导入
+from src.combat.AxisWatch import start_enable_watch
 
 
 class Hiyuki(BaseChar):
