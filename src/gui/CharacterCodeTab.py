@@ -1064,7 +1064,8 @@ class CharacterCodeTab(CustomTab):
             button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             team_buttons.addWidget(button, 1 + index // 2, index % 2)
         # 左栏至少留出两个最宽按钮的位置, 字不会被截
-        widest = max(button.sizeHint().width() for button in grid_buttons)
+        # 这时候主题样式还没套上, 量出来的宽度比实际显示的(粗体字、内边距)小, 每个再留 12 的余量
+        widest = max(button.sizeHint().width() for button in grid_buttons) + 12
         buttons_width = 2 * widest + max(team_buttons.horizontalSpacing(), 6)
         self.team_list.setMinimumWidth(max(210, buttons_width))
         self.team_list.setMaximumWidth(max(300, buttons_width))
@@ -1085,24 +1086,27 @@ class CharacterCodeTab(CustomTab):
         self.char_image_label.setFixedSize(52, 52)
         self.char_image_label.setAlignment(Qt.AlignCenter)
         self.member_combo = ComboBox(parent=right)
-        self.member_combo.setMinimumWidth(150)
+        # 窗口缩到最小时这一行也要放得下: 两个下拉都允许被压窄, 不按内容撑宽
+        self.member_combo.setSizeAdjustPolicy(ComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.member_combo.setMinimumContentsLength(4)
+        self.member_combo.setMinimumWidth(120)
+        self.member_combo.setMaximumWidth(200)
         self.member_combo.currentIndexChanged.connect(self._member_selected)
         self.team_info_button = Button(self.tr("Team Info"), icon="info")
         self.team_info_button.clicked.connect(self._show_team_info)
         self.team_info_button.hide()
         top.addWidget(self.char_image_label)
-        top.addWidget(QLabel(self.tr("Character Code")))
         top.addWidget(self.member_combo)
         # 同一支队伍的多份代码: 下拉里选哪份就换成哪份, 当前那份自动收回存档库
         # 顶栏从左到右: 选角色 / 选存档(占掉剩余宽度) / 删存档 / 拉取 / 队伍说明, 右边缘和下面的保存按钮对齐
         self.variant_combo = ComboBox(parent=right)
         # 存档名很长, 不能让它把整行撑出窗口: 宽度跟着窗口走, 放不下就截断, 全名看悬停提示
         self.variant_combo.setSizeAdjustPolicy(ComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.variant_combo.setMinimumContentsLength(10)
-        self.variant_combo.setMinimumWidth(160)
+        self.variant_combo.setMinimumContentsLength(4)
+        self.variant_combo.setMinimumWidth(110)
         self.variant_combo.setToolTip("这支队伍存着的几份代码, 选一份立刻换过去; 现在这份会自动存起来, 随时能换回")
         self.variant_combo.currentIndexChanged.connect(self._variant_selected)
-        self.fetch_variants_button = Button("拉取同队代码", icon="download")
+        self.fetch_variants_button = Button("拉取同队", icon="download")
         self.fetch_variants_button.setToolTip("把工坊里这支队伍的所有代码一次下到存档里, 之后在左边的下拉里直接换")
         self.fetch_variants_button.clicked.connect(self._fetch_team_variants)
         self.delete_variant_button = Button("", icon="trash")
@@ -1128,6 +1132,8 @@ class CharacterCodeTab(CustomTab):
 
         bottom = QHBoxLayout()
         self.status_label = QLabel("")
+        # 状态文字再长也不能把保存按钮挤出窗口
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.reset_button = Button(self.tr("Reset to Built In"), icon="refresh")
         self.reset_button.clicked.connect(self._switch_code_mode)
         self.save_button = Button(self.tr("Save"), icon="check", variant="primary")
@@ -1334,7 +1340,7 @@ class CharacterCodeTab(CustomTab):
         self.workshop_button.setEnabled(not busy)
         self.workshop_button.setText("连接中…" if busy else self.tr("Workshop"))
         self.fetch_variants_button.setEnabled(not busy and self.current_team is not None)
-        self.fetch_variants_button.setText("下载中…" if busy else "拉取同队代码")
+        self.fetch_variants_button.setText("下载中…" if busy else "拉取同队")
 
     def _fetch_team_variants(self):
         if self.current_team is None or self.workshop_busy:
