@@ -1,0 +1,2997 @@
+import ctypes
+import threading
+import time
+
+from src.Labels import Labels
+from src.char.BaseChar import SwitchPriority
+from src.char.Denia import Denia as NativeDenia
+
+# char_name 可能是这两个值中的任何一个: CharFactory.py:122 把 char_moning 和
+# char_moning_new 映射到同一个类。只认前者的话换个立绘整段轴就静默跳过 ——
+# 跟琳奈那对(char_linnai / char_linnai2)、千咲那对是同一个坑, 已经栽过两次
+MORNYE_NAMES = {'char_moning', 'char_moning_new'}
+QINGXIAO_NAMES = {'char_qingxiao'}
+DENIA_NAMES = {'char_denia'}
+
+# ==================== 物理 F 键监视 ====================
+# opener_blocked_reason() 靠 task._f_last_press 区分"玩家按 F 重开了一局"和"战斗判定
+# 抖了一下"(抖动不会有人按 F): 按过就直接放行, 不用干等 OPENER_MIN_GAP 那 60 秒。
+#
+# 【为什么写在角色文件里】: 这个时间戳原来由 src/ 下的代码写。2026-08-19 的 v3.5.32
+# 更新用 git 检出把 src/ 整个盖回官方版, 写入方连一行痕迹都没剩, 只剩这边的 getattr
+# 读取方一直拿默认值 —— 那条捷径静默失效了。configs/custom_teams/ 不受更新影响,
+# 也是唯一能跟着"导出队伍"一起走的地方, 所以搬到这里来。
+#
+# 【为什么要单开一个线程】: 玩家按 F 是在【战斗开始之前】(进副本按 F 起手), 那一刻
+# 角色代码一行都没在跑。放在 do_perform / get_switch_priority 里采样接不住这一下,
+# 而且 get_switch_priority 会被框架对每个候选反复调用, 用 GetAsyncKeyState 的
+# "上次调用之后按过没有"低位来判会被前一次调用吃掉。所以老老实实轮询打时间戳。
+#
+# 【为什么读得到玩家、读不到宏自己按的 F】: GetAsyncKeyState 读的是真实键盘的硬件
+# 状态; 而框架和宏发的键走 PostMessage 直接投递给游戏窗口, 不经过硬件层, 读不到。
+F_VK = 0x46              # 'F'
+F_POLL_INTERVAL = 0.05   # 一次按键按住的时间远大于这个, 不会漏采
+F_LOG_DEBOUNCE = 1.0     # 按住不放时别刷日志
+# 界面上那张设置卡片, 在 ok_tasks/FStartCombatTask.py。放 ok_tasks/ 是因为选项必须由
+# 代码声明(json 里多出来的键会被 verify_config 丢掉), 而 config.py/src 每次更新都会被
+# 盖回官方版 —— 上一版的开关和时间就是这么没的。ok_tasks/ 不在仓库里, 更新不碰。
+F_TASK_NAME = 'FStartCombatTask'
+
+
+def f_settings(task):
+    """读界面上的(开关, F 之后等待秒数)。
+
+    【没装那张卡片就返回默认值(开, 0 秒)】—— 把队伍导给别人时对方没有 ok_tasks/
+    里的那个任务, 功能照常, 只是他那边没有界面可调。
+    """
+    executor = getattr(task, 'executor', None)
+    for group in ('trigger_tasks', 'onetime_tasks'):
+        for other in getattr(executor, group, None) or ():
+            if type(other).__name__ == F_TASK_NAME:
+                try:
+                    return bool(other.enabled), float(getattr(other, 'f_start_delay', 0) or 0)
+                except Exception:
+                    return True, 0.0
+    return True, 0.0
+
+
+def start_f_watch(task, logger=None):
+    """把【物理】F 键按下的墙钟时间记到 task._f_last_press。每个 task 只启一次。
+
+    线程是 daemon, 跟着进程退出, 不用管回收。
+    """
+    if getattr(task, '_f_watch_started', False):
+        return
+    task._f_watch_started = True
+    if not hasattr(task, '_f_last_press'):
+        # 【初值取 -1 而不是 0】: 读取方是 `if f_press > self.last_opener`, 而
+        # last_opener 的"没跑过"也是 -1。给 0 的话开局第一次判定就恒成立(0 > -1),
+        # 会连 use_liberation 那道检查一起跳过 —— 两边都用 -1 表示"从没发生过"才对得上
+        task._f_last_press = -1
+
+    def watch():
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetAsyncKeyState.restype = ctypes.c_short
+        except Exception as e:
+            task._f_watch_started = False
+            if logger:
+                logger.error(f'f watch: GetAsyncKeyState unavailable ({e}), '
+                             f'the "press F to re-arm the opener" shortcut stays off')
+            return
+        last_log = 0
+        was_down = False
+        while True:
+            try:
+                down = bool(user32.GetAsyncKeyState(F_VK) & 0x8000)
+                if down and not was_down and f_settings(task)[0]:
+                    # 【上升沿才算一次按下】。原来是"只要按着就每轮记一次",
+                    # 对 _f_last_press(取最新时刻)无所谓, 但下面 _f_pressed_at 是
+                    # 给框架消费的, 按住不放时反复刷新会让它永远"刚刚才按"
+                    now = time.time()
+                    task._f_last_press = now
+                    # 【这里是本线程和框架的唯一交接点】(2026-08-19):
+                    # 框架 CombatCheck.note_f_key() 原本自己调 GetAsyncKeyState,
+                    # 判据是【低位】—— 那一位的语义是"距上次调用之间被按过",
+                    # 【读一次就清, 而且整个进程共享】。本线程 20 毫秒轮询一次,
+                    # 每次调用都会把低位清掉, 框架那边就永远读到 0 ——
+                    # 结果是 watcher 一直在打日志, 而"按 F 直接进战斗"从来不触发。
+                    # 现在改成【一个读者】: 本线程读键, 顺手把框架要的时间戳也写了,
+                    # 框架不再自己读(见 CombatCheck.note_f_key 里的 watcher 分支)。
+                    # 采样率还比框架高(0.05 vs 战斗判定那一轮), 反而更灵敏
+                    task._f_pressed_at = now
+                    if logger and now - last_log >= F_LOG_DEBOUNCE:
+                        last_log = now
+                        logger.info('physical F pressed, opener re-armed')
+                was_down = down
+                time.sleep(F_POLL_INTERVAL)
+            except Exception:
+                return          # 进程收尾时 ctypes/解释器可能已经拆掉了, 安静退出
+
+    threading.Thread(target=watch, name='ok_ww_f_watch', daemon=True).start()
+
+
+
+class Denia(NativeDenia):
+    """达尼娅。清达莫队(清霄/达尼娅/莫宁)里她兼任【整条轴的持宏者】。
+
+    为什么整条轴写在一个文件里: 自定义角色文件由 CustomCharLoader 按路径单独加载,
+    互相 import 不到; 而且半秒级的三人接力一旦经过框架的选人循环就散了。
+    按键是全局的、谁在场谁在打, 所以持宏的是谁无所谓 —— 挑了达尼娅是沿用爱达千那队
+    的分工(引擎那一半原样搬过来), 而且清霄/莫宁两个文件里都还要留驱动入口, 越薄越好。
+
+    【入口】
+      启动轴: 轴的第一个动作是清霄的 R, 所以入口在 Qingxiao.do_perform ——
+              她的 get_switch_priority 在启动轴待跑时返回 MUST。
+              莫宁开局就在场时也能驱动(Mornye.do_perform), 宏自己会先把清霄换上来。
+      循环轴: 启动轴末尾是"变奏莫", 所以循环由 Mornye.do_perform 驱动, 每次调用跑一整轮。
+
+    ================= 轴 (用户 2026-08-21 提供) =================
+
+    启动轴:
+      清 R + A                          -> 达 E
+      -> 莫 A123 + 强化重击 + R + A123 + E + 强化重击 + 处决 + Q
+      -> 变奏达 A1 + R1 + A1A2 + 跳 + 空中A1A2 + EE + R2 + Q
+      -> 清(见下面那段) -> 变奏莫
+
+    循环轴:
+      莫 A123 + E + 强化重击 + R + Q
+      -> 变奏达 A1 + E + R1 + A1A2 + 跳 + 空中A1A2 + EE + R2 + Q
+      -> 清(见下面那段) -> 变奏莫
+
+    清霄段(用户 2026-08-21 逐步描述, 两条轴共用):
+      变奏进场 -> 【一直持续普攻】直到强化E亮起 -> 强化E(亮的时间很短, 要点得快、准)
+      -> 【按 E 的同时开始长按普攻】预输入重击 -> 强化重击 -> 进入变身形态
+      -> 【一直保持长按】-> 能量打完, 自动释放变身的强化重击
+      -> 释放的同时就开始按 F 追处决 -> R -> A -> Q -> 变奏莫
+      文字轴里写的 "aaa aa" / "aaaa" 都【不是"点几下"】: 前者是打到强化E亮为止,
+      后者是长按自己打出来的。
+
+    【启动轴和循环轴只差三处】(所以达尼娅段和清霄段是同一份代码带开关):
+      1. 启动轴开头多了 "清 R+A" 和 "达 E" 两格 —— 达尼娅的 E 提前放, 让充能早点转;
+      2. 达尼娅段: 启动轴是 "A R"(E 已经在开头放过了), 循环轴是 "A E R";
+      3. 清霄段: 循环轴的文字轴在强化E【之前】还写了一次处决(S_QING_F1_WINDOW);
+         变身重击之后那次处决两条轴都有。
+      莫宁段两条轴不一样, 但【都在地上】(用户 2026-08-21: "莫宁根本没升天"):
+      启动轴是 "A123 -> 重击 -> R -> A123 -> E -> 重击"(两发重击, 中间隔着大招),
+      循环轴是变奏入场后 "A123 -> E -> 重击 -> R"(一发重击)。
+      【别再照抄爱琳莫那条轴的莫宁段】: 她在那边会升天, 是因为那条轴里 R 先放、
+      重击是在 R 的演出里预输入的; 这条轴的重击在 R 【之前】, 她不起飞。
+
+    ================= 这条轴的两条总纲 (沿用爱达千) =================
+
+    1) 【持续普攻】。轴上没写"停"的地方就一直点 —— 全局开关 self.poking,
+       打开之后所有的间隙(macro_gap)和所有的切人(click_during)都自动带着点击。
+       【空中那几格必须关掉】: 多余的点击会变成下落攻击, 把整条尾巴带崩。
+    2) 【合轴 / 不等动画】。A 只要递出去了, 这时候切人上一个角色也会留在场上把动作
+       演完才消失。所以每一格的窗口量的是"最后那一下【递出去】要多久", 不是"演完"。
+
+    ================= 改这个文件之前先读的几条 =================
+
+    - 动画期间的按键是【被丢掉的, 不排队】。所以"点一下 -> 等一个动画长度 -> 再点一下"
+      要求预先知道动画多长, 猜错一次那一段就整个没了。正确做法是【连点一个窗口】
+      (macro_spam), 技能键同理(spam_key)。
+    - 连点间隔【不要低于 0.12】。爱琳莫那条轴上 0.08 那一轮, 角色在空中被多灌进去的
+      点击变成了下落攻击, 把整条尾巴带崩。
+    - 【技能键不能跟切人并行发】: 切人期间发出去的键会被游戏带过换人边界落在新角色
+      身上。点击落错人无所谓, 技能键落错人就是白烧一个 CD。
+      例外只有 switch_into_lib() 和 switch_out_while_key(), 见那两个方法的说明。
+    - 判"某状态消失"之前必须先确认它出现过; 判"某状态出现"之前必须先确认它消失过。
+    - configs/custom_teams/ 是按 mtime+size 热加载的, 改完不用重启;
+      src/ 下的框架文件是启动时 import 的, 改了必须重启 ok-ww。
+    - 【自定义 __init__ 里跟内置版取值不同的字段会被打回内置值】(CharFactory 换类时
+      replacement.__dict__.update(char.__dict__))。要保住就在 reset_state() 里重申。
+      本文件新加的字段内置版没有, 不受影响。
+    """
+
+    # ==================== 全局节奏 ====================
+
+    # 连点间隔。0.12 是实测的地板: 爱琳莫那条轴上 0.08 会让空中角色打出下落攻击。
+    # 【改它等于所有窗口作废】: 下面每一个 *_WINDOW 都是按"窗口/0.12 下"标定的
+    A_INTERVAL = 0.12
+    # 加密节奏: 用在"这一格要抢在连段超时之前接上"的地方
+    A_INTERVAL_FAST = 0.06
+    # 技能键的补发间隔。【必须比点击间隔大】: 补发的意义是"铺开覆盖整个动画",
+    # 不是连发 —— 挤在 0.12 秒里发 3 下等于只试了一个时刻
+    KEY_INTERVAL = 0.10
+    # 一个技能键的默认铺开窗口(够盖住一次入场/收招)
+    KEY_WINDOW = 0.10
+
+    # ---- 切人 ----
+    SWITCH_TIME_OUT = 2.5        # 超过这个还没切过去就是撞在动画里了, 记一笔往下走
+    # 【切人要穿过一整段大招演出时用这个】。演出期间游戏不接受换人, 切人键会一直重发
+    # 到演出结束那一帧 —— 而演出本身就能有四五秒, 用 2.5 的话必然判失败
+    SWITCH_THROUGH_LIB_TIME_OUT = 9.0
+    R_PREINPUT_MIN_LAG = 0.10    # 预输入大招键的最小滞后(switch_into_lib)
+    SWITCH_KEY_DOWN_TIME = 0.02  # 按住更久没用而且更慢(send_key 会阻塞整个按住时长)
+    SWITCH_KEY_INTERVAL = 0.0    # 0 = 每一轮轮询都发一次切人键, 多发没有副作用
+    SWITCH_SETTLE = 0.0          # 切到之后的缓冲, 默认不留
+    UNTRUSTED_CONFIRM = 3        # count 不达标时同一个 index 连读到这么多次也认
+    TRACE_SWITCH = True          # 每次切人记录轮询到的 in_team index, 查"键发了却不换人"
+    SWITCH_CD = 0.88             # 游戏的换人 CD(框架按 1 秒判, 这里压紧一点)
+    PRECHARGE_TO_SWITCH = 0.10   # 长按预输入: 按下沿留给离场角色消化的时间
+
+    # ==================== 普攻的段长 ====================
+    # 【全部按"最后一下递出去"标定, 不是"演完"】。一段地面普攻实测 0.29~0.38 秒。
+    # 【v1 全部沿用爱达千那条轴的 0.35】—— 这三个角色的真实段长还没量过,
+    # 拿到帧数之后按角色分开调, 别一起动
+    SEG_QING = 0.35
+    SEG_DEN = 0.35
+    # 【下面这两个 v1 还没用上】: 莫宁那几段和达尼娅跳起来那几格都是按"窗口 + 次数
+    # 上限"写的(见 O_MOR_* / S_DEN_AIR_*), 不是按段数。等量出真实段长再换成段数模型
+    SEG_MOR = 0.35
+    SEG_AIR = 0.55               # 跳起来之后那一下
+
+    # 最后一段只要【递出去】就行, 它的动画会在切人之后继续演(合轴), 所以只留这么多
+    A_LEAD = 0.20
+
+    # ==================== 大招 ====================
+    LIB_FIRE_WINDOW = 1.20       # 连发 R 等演出开始的上限。【给短】: 长了会白按掉下一发
+    LIB_KEY_INTERVAL = 0.03
+    LIB_READ_EVERY = 2           # 每发这么多次 R 才读一次屏(读屏 0.04 秒, 别拖慢发键)
+    LIB_ANIM_TIME_OUT = 8.0      # 等演出结束(HUD 回来)的上限
+    LIB_ANIM_TAIL = 0.15         # HUD 回来之后还要再点一会儿(收招期间的按键照样被吞)
+    HUD_NO_ANIM_GRACE = 0.35     # 一直读到 HUD 在场 = 这次压根没有演出(大招没放出来)
+
+    # ==================== 协奏(变奏) ====================
+    CON_WAIT_TIME_OUT = 2.0
+    CON_POLL_INTERVAL = 0.05
+    CON_ENOUGH = 1.0
+    CON_SAMPLE_MAX = 24
+    CON_STALL_GIVE_UP = 1.2      # 读数一动不动这么久就别等满超时了
+
+    # ==================== 回路条 ====================
+    FORTE_WAIT_CAP = 2.5         # 等回路条满的默认上限
+    FORTE_SAMPLE = 0.25          # 等的期间把两路读数采样进日志的间隔(查判据用)
+
+    # ==================== 处决(F) ====================
+    # 【框架的 f_break() 只在"提示当下就亮着"时才动作】: 提示晚出来哪怕 0.1 秒,
+    # 这一次调用就整个跳过 —— 这是"处决经常不放"的根因。所以在一个窗口里反复问。
+    # 没有处决可打时按 F 不会触发别的东西, 给长一点是净赚(但会占掉这一格的时间)
+    F_WINDOW = 0.60
+    F_RETRY_INTERVAL = 0.10
+    F_SPAM_INTERVAL = 0.08       # 盲发 F 盖住演出时的间隔(见 spam_f)
+    # f_break_window 的默认放弃线: 这么久还没见到提示就当这一轮没有处决可打。
+    # 【它挡住的是"把没有的东西等满"】—— 后面接着的是大招, 每多等一秒 R 就晚一秒
+    F_GIVEUP = 0.10
+
+    # ==================== 启动轴: 清 R+A ====================
+    # 开局清霄的大招。【不前置检查能量】: 读场下角色的大招可用性读的是残值(见
+    # opener_blocked_by 的说明), 发出去没反应最多白按几下, 判据是 HUD 掉没掉
+    O_QING_R_TAIL = 0.15         # R 演出结束之后还要点多久才轮到那一下 A
+
+    # ==================== 启动轴: 达 E ====================
+    # 【E 要等它真的放出来再走】(用户 2026-08-21: "达要放个E再切莫宁")。
+    # 实机 21:33 那一轮: >Den@5.60 denE@5.63 >Mor@5.82 —— 她【在场上只待了 0.19 秒】,
+    # 那两发 E 全被入场动画吞了, 提前转 CD 的目的一点没达到。
+    # 改成 resend_until_fired: 一直重发到 get_cd('resonance') > 0(= 真的进 CD)才往下走
+    O_DEN_E_FIRE_TIME_OUT = 1.20
+    O_DEN_E_TO_SWITCH = 0.05     # E 确认放出去之后到切莫宁
+
+    # ==================== 莫宁: 长按出重击 ====================
+    # 【她的重击一律靠"按住不放"打出来, 不点】(用户 2026-08-21: "你E放了以后直接长按
+    # 攻击键就行, 他能放强化重击会自动放, 你不要连续点按攻击了")。
+    # 按住期间她自己打普攻充条, 条一满强化重击就【自动出手】——
+    # 出手时机由游戏决定, 我们既不用猜窗口, 也不用去读那个滞后的条来决定何时按下去。
+    # 【这一格前后翻过两次车, 都是因为想自己控出手时机】:
+    #   固定窗口连点 -> 条不一定满(被打断补不回来) -> 退化成普通重击, 不起飞;
+    #   连点到读满再长按 -> 读数滞后 0.7~0.8 秒 -> "有强化重击了还在 A"。
+    # 【亮之前一直点】的上限(用户 2026-08-21: "在强化重击没亮之前一直持续点按就行,
+    # 亮了马上长按重击")。被怪打断的轮次就是靠这一段多点几下补回来的 ——
+    # 固定窗口补不回来, 而一直按住又会卡在出不来的蓄力里(那是"不连贯"的来源)。
+    #
+    # 5.0 -> 2.5 (用户 2026-08-22: "循环轴里莫宁怎么不放E也不放重击了")。
+    # 【循环轴里这一段每轮都跑满 5 秒】: morHeavyFill(CAP,A x71,5.03s) / (CAP,A x76,5.02s)
+    # —— 点了七十多下, is_mouse_forte_full 一次都没读到。但【紧接着的长按马上就读到
+    # 满、并且看着它掉下去】(morHeavy_up(forte,1.14s)) —— 也就是条其实早就满了,
+    # 是【连点期间读不到】(她一直在出招, 那个图标没渲染出来)。
+    # 治不了读数, 就别让它白烧时间: 上限砍一半, 剩下的交给长按那一段去判。
+    # 启动轴那边 1.29 秒就读到了, 2.5 够用
+    MOR_FILL_CAP = 2.5
+    # 【切进来的头这么久, 读到"条满"一律不算】: 变奏那一刹那屏幕上还是上一个角色的
+    # HUD, 而回路条是按固定屏幕区域找图的 —— 实机 morHeavyFill(lit,A x1,0.02s) 就是
+    # 这么来的, 结果 A123 整段被跳过, 变成"入场直接开R"
+    MOR_FILL_MIN = 0.60
+    MOR_A_INTERVAL = 0.06        # 这一段的连点间隔
+    # 【每隔这么久空出一小段不点, 专门给回路条的读数一个窗口】(2026-08-22 实机):
+    # 循环轴里连点期间 is_mouse_forte_full 一次都读不到(她一直在出招, 图标没渲染),
+    # 一停手长按就立刻读到满。代价是每轮少点两三下, 换来"条一满就能发现"
+    MOR_READ_EVERY = 0.45
+    MOR_READ_PAUSE = 0.12
+    # E 一直重发到【真的进了 CD】为止(用户 2026-08-22: "E没进CD就重新尝试放呗")
+    MOR_E_FIRE_TIME_OUT = 1.20
+    MOR_E_RESEND_INTERVAL = 0.10
+    # 6.0 -> 4.0: 这是【读不到条掉下去】那一轮的兑底时间, 完全是亏的;
+    # 正常一轮实测 1.14 秒就看到条掉下去了
+    # 【一直读不到条满时, 按住这么久就松手】—— 判据用不上的那一轮退化成固定时长,
+    # 而不是按到 MOR_HOLD_CAP。空中那一发就是这种情况(空中读不到回路条),
+    # 实机 morAirHeavy_up(CAP,3.04s) 里有两秒是白按的, 把后面的处决整个推迟
+    MOR_HOLD_BLIND = 0.80
+    MOR_HOLD_CAP = 4.0
+    MOR_FORTE_CONFIRM = 2        # 条满连着读到这么多帧才算(防单帧抖动误判成"放出去了")
+    MOR_HOLD_SAMPLE = 0.25       # 按住期间把条的读数采样进日志的间隔
+
+    # ============ 启动轴: 莫 A(到条满)+升天重击+R(空中)+空中A123+E+强化重击+处决+Q ====
+    # 【她是要起飞的】: 条满时的那一发重击就是升天重击。之前一度改成"整段在地上",
+    # 那是把 8-21 那次"莫宁根本没升天"当成了轴的形状 —— 实际那是【条没充满】,
+    # 打出来的退化成了普通重击。日志证据: morRise_up(timeout) / morHeavy1Blind
+    # 升天重击 -> R。【同样要给伤害留结算时间】, 理由见 L_MOR_HEAVY_TO_R。
+    # 这一格比循环轴那一格宽松: 松手条件是 stop_when=on_air, 人都被顶上天了说明
+    # 那一发已经生效, 所以只留一点余量
+    O_MOR_HEAVY_TO_R = 0.20
+    O_MOR_RISE_CONFIRM = 1.0     # 读屏确认"真的起飞了"的上限(判据是原版的 on_air)
+    # 【没起飞就重来一次】(用户 2026-08-21: "莫宁如果在地面上被打断过就不会重击升天了
+    # 直接放R了")。被打断的那一轮条充不满 / 长按被硬直吃掉, 打出来是普通重击, 人还在
+    # 地上 —— 这时候放 R 就是把一整段空中输出扔掉。重试只花"再充一次条"的时间
+    # (长按一圈), 换回来的是那一整段。
+    # 【别调太大】: 真打不上去的场合(怪一直在打断)每多一次就是几秒的空转
+    O_MOR_RISE_TRIES = 2
+    O_MOR_R_TAIL = 0.15          # R 演出结束之后的缓冲
+    # ---- 起飞了走这条(空中) ----
+    # 空中 A123。
+    # 【原来这里封了 max_clicks=3, 又是它把这一格毁了】(用户 2026-08-21 实机:
+    # "莫宁R后的A3还是没到位"): 日志 morAirA123_end(x3)@14.70, 从 14.30 起算
+    # 【0.40 秒就结束了】—— macro_spam 的循环条件是 `窗口没到 and n < max_clicks`,
+    # 窗口写 1.20 也没用。那 3 下全落在 R 的收招里, 一段都没打出来。
+    # 【空中连点是安全的, 不用封顶】: 爱琳莫那条轴同一个角色的同一格
+    # (Mornye.py 的 airA)就是 1.97 秒 / 0.12 间隔【不封顶】连点了十几下, 跑了几十轮。
+    # 1.97 也是那边逐帧标定过的"够打完空中A123 再接 E"的值, 直接拿过来
+    O_MOR_AIR_A_WINDOW = 1.97
+    O_MOR_AIR_A_TO_E = 0.08
+    # 空中那一发强化重击按住等它出手的上限(走 mor_hold_heavy, 跟地面同一套)。
+    # 【爱琳莫 2026-08-12 记的是"空中读不到回路条"】, 所以这一发以前是按固定时长盲打的
+    # —— 但盲打的代价是【被打断的那一轮什么都没发生, 代码还照样往下走】
+    # (用户 2026-08-22: "一定要确保强化重击放了再F")。
+    # 现在读得到就按读数走, 读不到就退化成盲打(fill 跑满 -> 按 MOR_HEAVY_FALLBACK),
+    # 不会比原来差。日志 morAirHeavyFill(CAP,...) 就是"这一轮确实读不到"
+    O_MOR_AIR_HEAVY_CAP = 3.0
+    # 【没打出来就再来一次】(用户 2026-08-22: "启动轴莫宁因为E空了又没等到强化重击,
+    # 提前处决走人了")。只在"条压根没亮"时重试 —— 那才是"资源没到"; 读不到条的
+    # 那种重试也读不到, 白按一遍
+    O_MOR_AIR_HEAVY_TRIES = 2
+    # ---- 没起飞走这条(地面兜底) ----
+    # 按住不放, 中途发 E, 条满了重击自动出手。
+    # 1.70 是 8-21 实机标定的那段 A 的长度("R后A不到A3就放E了"), 现在它的含义变成
+    # 【按住多久之后发 E】—— A 是按住自己打出来的, 不再由我们点
+    O_MOR_HOLD_TO_E = 1.70
+    O_MOR_E_WINDOW = KEY_WINDOW
+    O_MOR_E_TO_HEAVY = 0.35      # E 放出去 -> 强化重击
+    # 【强化重击打出来就接处决, 不留间隔】(用户 2026-08-21: "莫宁强化重击打出之后要接F处决")。
+    # 原来这里留了 0.80 秒等处决提示出来 —— 那是白等的: f_break_persist 本来就是
+    # "一直问到提示亮"的写法, 提示晚出来它自己会等, 而且等的期间照常点普攻
+    O_MOR_AFTER_HEAVY = 0.0
+    # 【这一发处决的窗口单独给长一点】: 起点在"重击当下", 而空中那一发的伤害要等她
+    # 落下去才结算 —— 提示比按住结束晚不少。
+    # 1.00 -> 2.00 (用户 2026-08-21: "莫宁没有接F"; 实机每一轮都是 morF_none(x8))。
+    # 【给长的代价很小】: 等的期间 f_break_persist 一直在点普攻, 那既是输出也在涨协奏
+    # (后面那道"协奏满了才 Q 切人"的门正好受益); 没有处决可打时按 F 也不触发别的东西
+    # 重击一放完就盲发 F 盖住演出, 见 mor_finish。提示是在重击【打中】那一刻亮的,
+    # 而后面等协奏那一段可能要一两秒 —— 不先盖住的话提示会在那段时间里亮起又消失
+    O_MOR_F_SPAM = 1.50
+    # 2.00 -> 0.50 (用户 2026-08-22: "循环轴莫宁明明可以变奏了又没变")。
+    # 实机: morFspam@13.11 -> con(full)@13.13 -> 【morF_none(x13) 又占了 2.02 秒】
+    # -> morQ@15.18 -> 切人@15.28。协奏 13.13 就满了, 却又干等了两秒才交棒 ——
+    # 那两秒里她一直在原地按 F + 点普攻, 画面上就是"能变奏了却不变"。
+    # 前面那 1.5 秒盲发已经覆盖过演出了, 这里只留一点兜"提示晚出来一点点"的余量
+    O_MOR_F_WINDOW = 0.50
+
+    # ==================== 莫宁 Q -> 变奏达 (启动/循环共用) ====================
+    # 【要确认协奏满了才切】(用户 2026-08-21: "莫宁有时候飞天强化重击结束协奏值不满,
+    # 要确认协奏值满了再切人")。0.0 那一版是按更早那句"Q完切人要快"设的, 现在改回来。
+    #
+    # 【两条要求不冲突】: wait_con_for_intro 是"一满就返回" —— 圈本来就满的轮次
+    # 这一步的开销接近 0, 快的还是快; 只有【没满】的轮次才花时间, 而那正是要保的东西
+    # (满协奏离场, 达尼娅才有变奏入场)。
+    # 【等的期间继续点普攻】: 圈是靠打中涨的, 干站着等只会等到超时。
+    MOR_CON_WAIT = 2.0
+    # 读数一动不动这么久就别等满超时了 —— 真不涨的时候(打空了)多等的那一秒纯亏。
+    # 【不能太小】: 协奏会在 0.99 上卡一下再跳满, 0.15 那种量级会在跳满前就放弃
+    MOR_CON_STALL = 1.00
+
+    # ==================== 循环轴: 莫 A123+E+强化重击+R+Q ====================
+    # 【A 是按住自己打出来的】: 见 mor_hold_heavy —— 她是变奏入场的, 入场那一下
+    # 算不算 A1 无所谓, 反正条满了重击就自动出手
+    # 【按住多久之后发 E】: 对应轴上 "aaa e z" 里那三下 A —— 它们是按住
+    # 自己打出来的, 不用点。给短了 E 会插在 A1 前面; 给长了条可能先满、
+    # 重击抢在 E 前面出手(日志里 morHeavyE@ 的时刻会晚于 morHeavy_up)
+    # 1.20 -> 2.20 (用户 2026-08-22: "循环轴莫宁A3的时间再延长1s, 确保A3时间走够
+    # 再接E")。1.20 那一版 E 落在 A3 还没打完的时候, 画面上就是他说的"不流畅"
+    L_MOR_HOLD_TO_E = 2.20
+    L_MOR_INTRO_ANIM = 0.0       # 变奏入场动画期间先点多久(v1 不等, 直接进 A123)
+    # 【强化重击 -> R 之间必须留出"伤害结算"的时间】(用户 2026-08-22: "强化重击 ->
+    # 立刻接R 这个也要确保重击伤害打到才行, 这点我们之前做爱琳莫时候就有提到")。
+    # 爱琳莫 Mornye.py 的 M_MOR_R_SPAM_START 那段原话:
+    #   "【连发起点也决定出手时刻】: 早发的会被重击动画吃掉不假, 但一旦动画放行,
+    #    第一个合法帧就吃到 —— 所以起点太早 = 重击的伤害还没结算完就被 R 打断"
+    # 那边为此把连发起点从 2.20 调到 2.50(用户: "循环轴的R还是放早了, 慢0.3")。
+    # 【所以 0 是错的】: fire_lib 第一发立刻就出去, 重击动画一放行 R 就被吃到,
+    # 伤害还没结算就被打断。
+    # 【这里必须是定时, 不能加判据】—— 爱琳莫那边三种都试过并否掉了:
+    # 回路条(空中读不到)、协奏涨幅(±0.04 噪声, E 之后 0.03 秒就误判)、
+    # 大招可用(比重击出伤更早)。我这边又试了一版"协奏涨够 delta 才算打中"
+    # (mor_wait_hit), 同样有死角: 协奏快满时涨不出阈值、打空时要白等满上限。
+    # 【0.35 -> 1.60: 用户 2026-08-22 直接给了实测值】
+    # ("循环轴还是重击接R太快了, 给你个固定值吧, 重击打出以后1.6s后接R")。
+    # 锚点是 morHeavy_up(长按松手)那一刻 —— 日志里 morHeavy_up 到 morR_fired 的
+    # 间隔就该是这个数
+    L_MOR_HEAVY_TO_R = 1.60
+    # 【三步的顺序是硬的: 重击放出去 -> R 放出去 -> 协奏满】
+    # (用户 2026-08-22: "首先要确保重击释放了再释放R; 就算在此之前协奏值满了也不能
+    # 切人, 先确保重击和R, 此后再确保协奏值")。
+    # 前两步各自带重试, 协奏那道门排在最后(在 mor_finish 里) —— 前两步没做完
+    # 根本走不到它, 所以"协奏早满了"不会变成提前离场的理由
+    # 【R 之前要确认重击打到了】(用户 2026-08-22: "莫宁强化重击还没等打到怪身上
+    # 就放R了, 你要确保重击打到再放R")。判据是协奏涨了多少 —— 协奏【必须打中才涨】,
+    # 是这条轴上唯一能区分"打出去了"和"打中了"的读数。
+    # delta 要明显大于读数噪声(爱琳莫那边量到 ±0.04), 又要小于一发重击的涨幅
+    L_MOR_HIT_CON_DELTA = 0.08
+    L_MOR_HIT_CAP = 1.20         # 等不到就按定时走, 别把整条轴卡在这
+    L_MOR_HEAVY_TRIES = 2        # 重击没确认放出去就再来一次(条不会因为失败清掉)
+    L_MOR_R_TRIES = 3            # R 没放出去就接着打再试
+    L_MOR_R_RETRY_A = 0.50       # 每次重试之间接着打多久
+    L_MOR_R_TAIL = 0.15
+    L_MOR_R_TO_Q = 0.0
+
+    # ==================== 达尼娅段(启动/循环共用) ====================
+    # 轴: [A1] [E(仅循环)] [R1] [A1A2] [跳] [空中A1A2] [EE] [R2] [Q]
+    # (R1 会把连段清掉, 所以它后面那两下是 A1 A2, 不是 A2 A3 —— 用户 2026-08-21 的
+    #  说法就是 "R1A12跳接A12", 日志 tag 跟着改成 denA12 / denAirA12 好对帧)
+    # 变奏入场动画: 这一段的点击全被吞, 先把它点掉, 那一下 A 才落在动画【之后】
+    # (用户 2026-08-21: "达尼娅要在变奏动画后A一下")。
+    # 0.80 -> 0.40 (用户 2026-08-21: "达尼娅变奏入场后A太久了")
+    # -> 0.28 (用户 2026-08-22: "这里A的时间可以了, 但是R按晚了, 快0.2s")。
+    # 【A 本身不动, 动的是它前后的空档】: 这 0.12 从入场动画那段扣, 另外 0.07 从
+    # A 窗口的【尾巴】扣(见 S_DEN_A1_LEAD), 合起来 R 提前约 0.19 秒, 而那一下 A
+    # 该什么时候递出去还是什么时候递出去。
+    # 【给短了的症状】: 那一下 A 被入场动画吞掉, 回路条迟迟不涨, 下面 denForte 会跑满
+    S_DEN_INTRO_ANIM = 0.28
+    # 【A 窗口的尾巴】: spam_segments 的窗口 = (n-1)*段长 + lead, 一段的话就只有 lead。
+    # 全局 A_LEAD=0.20 里, 点击在 0.12 就发完了, 剩下 0.08 是纯等待 —— 那一段是白给
+    # 下一个动作(R)的延迟。0.13 只留一点余量, 点击照发, 尾巴基本不剩
+    S_DEN_A1_LEAD = 0.13
+    S_DEN_E_WINDOW = KEY_WINDOW
+    S_DEN_E_TO_R = 0.10
+    # 【开 R1 之前等回路条满】(用户 2026-08-21: "回路条满了再开R1")。
+    # 没满就接着打(等的期间在输出), 到上限也往下走。
+    # 2.5 -> 1.0 (用户 2026-08-21: "达尼娅变奏入场后A太久了")。实机两轮分得很开:
+    #   23:17 denForte(full,A x0,0.01s)  —— 一读就满, 这一步几乎不花时间
+    #   23:15 denForte(CAP,A x19,2.51s)  —— 一直读不到满, 白等了 2.5 秒
+    # 【这一格的读数本身可疑】: 两轮里"读到满"和"R1 放没放出来"完全不相关
+    # (读满那轮反而 denR1_NOFIRE)。所以上限压到 1.0 —— 读得准时不影响,
+    # 读不准时最多亏 1 秒。真要治得先从日志里那行 trace 确认判据挑对没有
+    S_DEN_FORTE_CAP = 1.0
+    S_DEN_R1_TAIL = 0.15         # R1 演出结束之后继续点多久才算"她能出招了"
+    # R1 之后的地面 A1A2。
+    # 【这里原来有个 max_clicks=2, 是它把这一格毁了】(用户 2026-08-21 实机:
+    # "A12没打出来就跳了"): macro_spam 的循环条件是 `窗口没到 and n < max_clicks`,
+    # 封顶 2 下 + 间隔 0.12 => 【0.12 秒就退出了】, 窗口写多少都没用。
+    # 而 R1 演出结束之后她还有一段收招期(爱达千那条轴上量到约 0.47 秒), 那两下全被吞掉,
+    # 于是紧接着就跳了。
+    # 【解法是让点击一直发到她真能出招为止】—— 跟爱达千那条轴上同一格的结论一样:
+    # 这一格量的是"什么时候可以做下一个动作", 不是"打几段", 段数模型在这里是错的。
+    # 所以取消封顶, 窗口 0.70 -> 1.20 (≈ 收招 0.47 + 两段 0.7)
+    S_DEN_A12_WINDOW = 1.20
+    S_DEN_JUMP_SETTLE = 0.15     # 跳起来到能出手
+    # 空中 A1A2。【这里的封顶要保留】: 多出来的点击会变成下落攻击, 她会提前落地。
+    # 但两下【不能贴着发】(同上, 会在 0.12 秒里发完然后被起跳过程吞掉), 所以把
+    # 允许的下数均匀铺在窗口里: 间隔 = 窗口 / 下数
+    S_DEN_AIR_A_WINDOW = 0.70
+    S_DEN_AIR_A_MAX_CLICKS = 2
+    # EE。【改成一直高频点按, 不再是"发两下、中间等 0.20 秒"】
+    # (用户 2026-08-21: "达尼娅EE中间停顿太长了, 一直持续高频点按就行")。
+    # 原来 presses=2 + interval=0.20 的写法是怕"两发挤成一发", 实机反过来了:
+    # 那 0.20 秒的停顿把第二发推到了她已经能接下一个动作之后。
+    # 【多按不花钱】: E 是充能技能, 充能用完之后多出来的按键是空操作。
+    # 间隔 0.06 -> 0.12 (用户 2026-08-21: "达尼娅的EE要不不要点太快, 感觉会有bug")。
+    # 0.06 那一版一个窗口塞了 10 下, 两发挤在同一个动画窗口里, 第二发多半被吞;
+    # 而最早那版 0.20 又被判"停顿太长"。0.12 是中间值, 也是本文件的连点地板。
+    # 【要调就在 0.10~0.15 之间动】: 再快回到"挤成一发", 再慢就是他说的那个停顿
+    # 0.60 -> 1.10 (用户 2026-08-22: "达尼娅EE持续时间延长0.5s")。
+    # 0.12 的间隔下, 从 5 下变成 9 下 —— E 是充能技能, 充能用完之后多出来的按键
+    # 是空操作, 所以拉长只是多给它几次"没被动画吞掉"的机会
+    S_DEN_EE_WINDOW = 1.10
+    S_DEN_EE_INTERVAL = 0.12
+    S_DEN_EE_TO_R = 0.10
+    # 【开 R2 之前先确认协奏圈过了这条线】(用户 2026-08-21: "达尼娅有时候被打断,
+    # 能不能确保协奏圈超过75%才开R2Q切人")。没到就接着打, 到上限也往下走。
+    # 【门槛不是"满"】: R2 和 Q 自己会把圈再推上去一截, 起手 75% 就够离场时是满的;
+    # 等满再开 R2 等于把那一截白等掉
+    S_DEN_R2_CON_MIN = 0.75
+    S_DEN_R2_CON_CAP = 2.0       # 等它的上限。被打断得太狠时别把整条轴卡在这
+    # 【R2 放出去了才准 Q 切人】(用户 2026-08-21: "达尼娅要确保R2放了再Q切清霄")。
+    # 实机 denR2_NOFIRE(x25) 出现过好几轮, 而原来那版不管放没放都接着 Q + 切人。
+    # 每次重试之间打一小段: 没放出来最常见的原因是能量差一点 / 键被动画吞了,
+    # 打几下对两者都有帮助。【别调太大】: 真没能量的轮次每多一次就是一秒多的空转
+    # 【退出条件是"R2 真的放出去了", 不是试几次】(用户 2026-08-22: "有时候达尼娅EE
+    # 打完R能量不够, 那么就继续A有E放E, 一定要确保两件事: R放了和协奏值满了才切清霄")。
+    # 下面这个是【兜底上限】: 吃到它说明能量真的攒不起来, 日志里有 warning
+    # 6.0 -> 10.0: 实机 6 秒里有 3.6 秒白花在"对着没能量的大招按 25 下 R"上,
+    # 真正攒能量的只剩两秒多。现在先读能量环再发(见下面), 省下来的时间全给攒能量,
+    # 上限也放宽 —— 用户要的是【R 放了才走】, 不是"试够次数就走"
+    S_DEN_R2_CAP = 10.0
+    # 每次重试之间接着打多久。【这是上限不是定长】: attack_until_lib 边打边盯能量环,
+    # 亮了当场退出去发 R(用户 2026-08-22: "达尼娅在循环轴里有次R亮了没及时按")
+    S_DEN_R2_RETRY_A = 0.60
+    # 重试时补的那一发 E 只铺这么短。【不能用正轴那个 S_DEN_EE_WINDOW】——
+    # 它被拉长到 1.10 之后, 这一格会在发 E 上耗掉一秒多, 期间能量亮了也发现不了
+    S_DEN_R2_RETRY_E = 0.30
+    # 离场前确认协奏满 —— 清宵要靠这个变奏入场(她的剑韵也吃变奏入场那一份)
+    S_DEN_OUT_CON_WAIT = 2.0
+    S_DEN_OUT_CON_STALL = 1.00   # 读数一动不动这么久就别等了(那是打空了, 多等纯亏)
+    S_DEN_R2_TAIL = 0.15         # R2 演出结束(HUD 回来)之后再点多久, 她才收得完招
+    # 【Q 是离场前的最后一个动作】(用户 2026-08-21: "达尼娅的步骤改成切人前放Q技能,
+    # 也就是Q了切人, 因为声骸套装不一样, 统一设定最后放")。
+    # 原来是把 Q 铺在 R2 的演出里(spam_key_through_lib), 演出一放行 Q 就出手 ——
+    # 那时离场还差一整段, 声骸的增益有一截落在她自己身上而不是接棒的人身上。
+    # 现在三个角色统一: Q 放完立刻切人。
+    # 【连发三下、铺开一点】: 大招收招期间的按键照样被吞, 单发很容易整个丢掉
+    S_DEN_Q_WINDOW = 0.24
+    S_DEN_Q_PRESSES = 3
+    # 【Q 递出去之后留一点时间被消费掉】: 贴着发数字键有可能把 Q 顶掉
+    S_DEN_Q_TO_SWITCH = 0.10
+
+    # ==================== 清宵段(启动/循环共用) ====================
+    # 【她的机制见 qing_rotation 的文档】(2026-08-22 查攻略才搞清楚):
+    #   常态点普攻攒 琴心 + 剑韵 -> 两条都满 -> 长按普攻 = 重击·弦剑 -> 进入曇体仙身
+    #   -> 仙身里【继续点普攻】攒心剑意 -> 满 -> 长按普攻 = 终结重击·天钧荡煞 -> 退出仙身
+    # 所以两发重击都是"先点满资源、再长按放出去", 长按本身不攒资源。
+    # 文字轴里的 "aaa aa" / "aaaa" 就是这两段【要点出来的】普攻。
+
+    # 循环轴在强化E【之前】那一次处决。触发信号是"强化E 亮起"(见 qing_rotation)。
+    # 【只盲发 F, 一下都不点】(用户 2026-08-22: "循环轴F的时候就可以不用A了,
+    # 因为清霄这个强化E很敏感, 一旦多A了一下可能就没了") —— 所以这里【不能】用
+    # f_break_persist: 它每轮 click(), 框架的 f_break() 内部也是 F 和左键交替发。
+    # 1.60 -> 0.15 (用户 2026-08-22: "清霄如果F的时候没F到就会愣一下才按强化E,
+    # 这样太打断节奏了。强化E亮起按0.15sF没接上就直接按强化E, 过了就好,
+    # 后续清霄打出F了再按也行")。
+    # 【所以这一步是"顺手试一下", 不是"一定要打到"】: 打到了赚, 没打到 0.15 秒就走,
+    # 强化E 的节奏不能为它让路 —— 真正保底的是变身重击之后那一次(S_QING_F_SPAM)
+    S_QING_F1_SPAM = 0.15
+    # 按 E 的同时按住普攻【预输入重击】, 等标记亮起的上限。等不到就松手回去接着点 ——
+    # 那说明琴心/剑韵还没凑齐, 硬按着只会卡在出不来的蓄力里(莫宁那边栽过)
+    S_QING_E_PREHOLD = 1.20
+    # R 之后那一下 A 的窗口。【不是段数模型】: HUD 回来之后她还要约 0.47 秒才能出招,
+    # 所以这里量的是"什么时候能出招" —— 给短了那一下 A 直接不存在, Q 会紧跟着就发。
+    # 0.75 -> 0.55 (用户 2026-08-22: "R完A接Q, Q的有点晚了, 快一点")。
+    # 【0.47 是那个下界】, 所以只剩 0.08 的余量, 再短那一下 A 就要开始丢了
+    S_QING_A_AFTER_R_WINDOW = 0.55
+
+    # ---- qing_rotation 的参数 ----
+    # 【这个上限是兜底, 不是判据】(用户 2026-08-22: "要保证两个强化重击的释放,
+    # 因为实战有时候会被打断, 不能靠时间来判断")。
+    # 正常退出的唯一条件是【终结重击确认放出去了】—— 被打断的那几发不计数, 回去接着
+    # 打普攻重新攒, 攒好了再放。所以这里给得比"顺利跑完一遍"宽得多:
+    # 顺利的一轮实测 12 秒出头, 留出被打断两三次重来的余量。
+    # 【吃到这个上限就是异常】, 日志里会有一行 warning 说明是哪一步没成
+    S_QING_ROTATION_MAX = 25.0
+    # 【终结重击没打出来就整段重跑】(用户 2026-08-22: "被打断太多, 第二段强化重击
+    # 没打、R没放就切人了")。重跑不是"从头再攒一次" —— 琴心/剑韵/心剑意都不会因为
+    # 函数返回就清掉, 所以第二遍等于接着攒。
+    # 【2 遍就够】: 两遍加起来 50 秒还凑不齐, 那不是时序问题, 是这一场站不住
+    S_QING_ROTATION_TRIES = 2
+    S_QING_A_INTERVAL = 0.12     # 攒资源时的连点间隔(本文件的连点地板)
+    S_QING_SAMPLE = 0.25         # 把 h1/h2 两个标记采样进日志的间隔
+    # 找强化E高亮标记的阈值, 跟原版 cast_enhanced_resonance 一致。
+    # 实机匹配度稳定在 0.97(阈值 0.70), 所以【按的确实是高亮的强化E, 不是普通E】——
+    # 用户 2026-08-21 问过这个。匹配度会记进日志, 哪天贴着 0.70 了再往上调
+    QING_E_THRESHOLD = 0.7
+    S_QING_E_MIN_GAP = 1.0       # 两次发 E 之间的最小间隔, 防止标记还亮着就连按好几发
+    # 【一直重发到强化E的标记灭掉】(用户 2026-08-22: "放处决的时候就开始一直尝试放E
+    # 就好了嘛")。
+    # 【判据不能用 CD】: 实机 qingE1(NOCD,x12) —— 发了 12 次 get_cd('resonance') 一直
+    # 是 0, 说明【强化E 不进普通 CD】。标记 qingxiao_e 灭掉才是"被消耗掉了"。
+    # 间隔别调太密: 用户说这一发"很敏感, 多按一下可能就没了"
+    S_QING_E_RESEND = 0.15
+    S_QING_E_FIRE_TIME_OUT = 1.80
+    QING_H2_THRESHOLD = 0.7      # 找 h1/h2 的阈值, 跟原版 heavy_available 一致
+    # ---- 一发重击按住多久 ----
+    # 【标记灭了不等于放出来了】: 这两发都是长按蓄力施放的, 标记在按下那一刻就被
+    # 消耗掉, 动作还没走完。原版 handle_heavy "标记一灭就松手"会把蓄力掐掉 ——
+    # 实机表现是同一发被记两次(第一次没放出来标记又亮回来), 以及"读到h2之后1秒就按R"
+    S_QING_HEAVY_MIN = 0.40      # 最短按住时长(标记抖一帧也不会松)
+    # 标记消失之后还要再按住多久。
+    # 【这一段属于"重击本身", 不是"重击到R的间隔"】(用户 2026-08-22 指出我调错了地方)。
+    # 它是让蓄力走完的 —— 砍它会退回"终结重击不出手"那个老问题, 而不是让 R 提前。
+    # 要压 h2->R 的间隔看 S_QING_F_GIVEUP / S_QING_F_INTERVAL, 那两个才在间隔里
+    S_QING_HEAVY_TAIL = 0.50
+    S_QING_HEAVY_MAX = 3.0       # 一发重击按住的上限
+    # 松手之后盯这么久确认它真放出去了(标记要【灭着并保持灭着】)。
+    # 还亮着 = 被打断/蓄力没起来 -> 这一发不计数, 回去接着打再试
+    # 0.30 -> 0.20 (用户 2026-08-22: "检测时间不能太慢")。
+    # 而且这一小段现在是边确认边点普攻的, 不再是纯延迟
+    S_QING_HEAVY_CONFIRM = 0.20
+    S_QING_HEAVY_RETRY_GAP = 0.60  # 两次尝试之间至少隔这么久(期间在打普攻)
+
+    # ---- 处决 -> R -> A -> Q ----
+    # 【终结重击(h2)放完就追处决】(用户 2026-08-21: "在释放强化重击的同时就开始F
+    # 准备接处决, 处决完了接R")。原版 do_perform 读到 h2 之后也是接大招, 对得上
+    # 终结重击一松手就【盲发 F 盖住整段演出】, 见 spam_f。
+    # 2.00 -> 1.60 (用户 2026-08-22: "第二个强化重击接R慢了, 快0.4s试试")。
+    # 这一段 + 下面那个窗口就是重击和 R 之间的全部间隔, 0.4 从这里扣最安全 ——
+    # 它是"没处决可打时也照发"的盲发段, 短一点只是少几下空按
+    S_QING_F_SPAM = 1.60
+    # 【这么久还没见到处决提示就直接走】(用户 2026-08-22: "有处决你放处决了, 当然
+    # 处决没事, 但是有一次没处决你也慢了好久才放R")。
+    # 有处决的轮次照打(那点时间值), 没处决的轮次 0.70 秒就放弃 —— 这一段每多一秒,
+    # 后面的 R 就晚一秒
+    # 【这两个才是"重击之后接R"那段间隔】(用户 2026-08-22: "我要调的是重击之后
+    # 接R的时间")。实机上那一段是这么跑的:
+    #   qingZ2(h2,2.85s)@42.18   <- 长按松手(以上都属于"重击本身")
+    #   qingF_skip(x2,0.16s)@42.34  <- 这里
+    #   qingR_fired(x2)@42.40    <- R 发出去
+    # 也就是 h2 松手 -> R = 0.22 秒, 其中 0.16 是这个 F 窗口, 剩下 0.06 是
+    # rotation 收尾(打两行日志)+ fire_lib 进函数, 那 0.06 没得调。
+    # 0.16 = giveup(0.10) + 一次 F_SPAM_INTERVAL(0.08) 的粒度。
+    # 现在这一处单独给更细的间隔 + 更早的放弃线, 并且【第一轮就查提示】(check_every=1):
+    # 一次查提示 + 一次发 F, 约 0.04~0.09 秒就走 —— 再往下压就只剩那 0.06 的固定开销了
+    S_QING_F_GIVEUP = 0.06
+    S_QING_F_INTERVAL = 0.04
+    # 【启动轴的 H2 -> F -> R 跟循环轴走同一条逻辑】(用户 2026-08-22: "清霄启动轴
+    # 最后H2 F R能不能参考下循环轴的逻辑")。
+    # True = 上一版的行为: 第一次没识别到处决就补一段 A 再查一次(多花约 0.4 秒);
+    # False = 跟循环轴一致, 查一次(约 0.05 秒)没有就直接接 R。
+    # 【改成 False 是按"两条轴一致"来的】—— 那一版的补 A 重试是 8-22 早些时候
+    # 单独给启动轴加的, 现在收回
+    S_QING_OPENER_F_RETRY = False
+    S_QING_R_TAIL = 0.15
+    S_QING_Q_TO_CON = 0.0
+
+    # ==================== 防重入 ====================
+    # 启动轴跑过之后, 这么久之内不再跑第二次。防的是"爆发打完战斗判定抖一下就重跑"。
+    # 【玩家按物理 F 键可以立刻解锁】, 见 opener_blocked_by
+    OPENER_MIN_GAP = 60.0
+
+    # 【启动轴跑完直接接一轮循环轴】。关着的时候: 启动轴末尾变奏莫宁 -> 返回框架 ->
+    # 框架下一轮 do_perform 才进循环, 中间要白花约 0.7 秒(重读当前角色 + check_outro)。
+    # 打开的代价是一次 do_perform 要跑四十来秒不还控制权, 调试时不好中断 ——
+    # v1 先关着, 时间轴对上了再开
+    CHAIN_LOOP_AFTER_OPENER = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.opener_armed = True
+        self.last_opener = -1
+        self.macro_t0 = 0.0
+        self.macro_marks = []
+        self.cur = None              # 宏执行期间"现在场上是谁", 交接记账要用
+        self.mor_hold_con0 = None    # 莫宁按下重击那一刻的协奏, mor_wait_hit 拿它当基线
+        self.holding_attack = False  # 长按要跨过切人, 按下和松开不在同一个方法里
+        self.poking = False          # 【持续普攻】总开关, 见类文档
+
+    def reset_state(self):
+        super().reset_state()
+        self.opener_armed = True
+        # 物理 F 键监视, 说明见文件顶部 start_f_watch。挂在 task 上, 每个 task 只启一次;
+        # 放这里是因为 reset_state 每次重读队伍都会跑, 而 __init__ 里设的字段会被
+        # apply_team_char_classes 的 __dict__.update 打回内置值(线程是副作用, 不受影响,
+        # 但顺手保证"只要队伍加载过就一定在监视")
+        start_f_watch(self.task, self.logger)
+
+    # ==================== 队伍判定 ====================
+
+    @property
+    def is_in_qing_cycle(self) -> bool:
+        team_members = 0
+        for char in self.task.chars:
+            if char and char.name in {'Mornye', 'Qingxiao'}:
+                team_members += 1
+        return team_members == 2
+
+    def teammate(self, name):
+        for char in self.task.chars:
+            if char is not None and char.name == name:
+                return char
+        return None
+
+    def opener_pending(self):
+        return self.opener_blocked_by() is None
+
+    def opener_blocked_by(self):
+        """启动轴不跑的原因; 返回 None 表示该跑。
+
+        【这里不查任何"某个技能可用"】(爱琳莫那条轴上的教训): BaseChar.available()
+        对场上/场下用的是两套机制 —— 场上读屏幕图标, 场下读该角色【上次在场时
+        OCR 到的 CD 记录】。而大招是能量门控、图标上没有 CD 数字, 场下那条路读的
+        是残值。于是"莫宁在场时判清霄的大招"会得到一个假答案, 表现出来就是
+        "开场愣一下, 切个人再切回来才开始"。
+        防重入靠 opener_armed + OPENER_MIN_GAP 就够。
+        """
+        if not self.is_in_qing_cycle:
+            return 'team is not qingxiao/denia/mornye'
+        if not self.opener_armed:
+            return 'already armed-down (ran once this combat)'
+        # 【玩家按过 F 就当成"真的重开了一局", 直接放行】: 60 秒门槛分不清
+        # "战斗判定抖动"和"玩家重开副本", 而物理 F 键正好能分 —— 抖动不会有人按 F。
+        # (宏自己按的 F 走 PostMessage, GetAsyncKeyState 读不到, 不会误判)
+        f_press = getattr(self.task, '_f_last_press', -1)
+        if f_press > self.last_opener:
+            # 【F 之后等一会儿再起手】: 界面上那个"时间", 用来等怪刷出来。等的期间照常
+            # 返回一个 reason(=挡住), 框架先按常规打, 时间到了下一次判定自然就放行
+            waited = time.time() - f_press
+            delay = f_settings(self.task)[1]
+            if waited < delay:
+                return f'F pressed {waited:.2f}s ago, waiting {delay:.2f}s for the mobs'
+            return None
+        if self.last_opener >= 0 and time.time() - self.last_opener < self.OPENER_MIN_GAP:
+            return f'ran {time.time() - self.last_opener:.1f}s ago (< {self.OPENER_MIN_GAP:.0f}s)'
+        if not self.task.use_liberation:
+            return 'task.use_liberation is off'
+        return None
+
+    # ==================== 宏原语 ====================
+    # 【这一整块是从爱达千那队的 Denia.py 逐字搬过来的引擎】(2026-08-21)。
+    # 里面的注释引用的实机数据、日志片段、"用户说" 全都出自【那条轴】——
+    # 留着是因为那些结论(动画吞按键、切人边界、HUD 判据…)跟队伍无关, 是框架的性质;
+    # 凡是提到千咲/爱弥斯/琳奈的地方都是【历史标定记录】, 不是这条轴的参数。
+    # 【改这里要同步改那边】: 同一个引擎现在有两份拷贝, 这是新目录结构的代价。
+
+    def macro_wait(self, sec):
+        """精确等待, 【不点击】。
+
+        不走 executor.sleep —— 它每 0.4 秒无条件插一次 next_frame 截图, 插入位置
+        不可控, 而这条轴的容错在 ±0.1 秒级。切成 0.1 秒一片, 片间检查任务是否被停用。
+        """
+        if sec <= 0:
+            self.task.executor.check_enabled(check_pause=False)
+            return
+        end = time.time() + sec
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                return
+            time.sleep(min(0.1, left))
+            self.task.executor.check_enabled(check_pause=False)
+
+    def macro_gap(self, sec, tag=None):
+        """间隙。【持续普攻打开时自动变成连点】—— 这就是"我没说停就一直A"。"""
+        if sec <= 0:
+            return 0
+        if not self.poking:
+            self.macro_wait(sec)
+            return 0
+        return self.macro_spam(sec, self.A_INTERVAL, tag=tag or 'gapA')
+
+    def macro_start(self):
+        self.macro_t0 = time.time()
+        self.macro_marks = []
+
+    def macro_mark(self, name):
+        self.macro_marks.append(f'{name}@{time.time() - self.macro_t0:.2f}')
+
+    def macro_timeline(self, since=0):
+        return ' '.join(self.macro_marks[since:])
+
+    def macro_spam(self, window, interval=None, tag='A', sample=None, sample_every=2,
+                   max_clicks=None):
+        """连点一个窗口。
+
+        打出几段由 window 决定, 不由单次点击的时机决定 —— 动画期间的点击会被丢掉,
+        连点保证总有一下落在动画刚结束的瞬间。时间轴上记首尾和点了几下, 对着录像
+        能反推一段动画多长: 窗口里打出 n 段, 一段就约等于 window/n。
+        """
+        interval = self.A_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        # 次数上限: 光靠时间兜底的话, interval 被调成 0 或者机器卡一下就会瞬间
+        # 灌进去几千次点击
+        cap = int(window / max(interval, 0.01)) + 2
+        # 【可以再封一层】: 用在【空中】那几格 —— 多余的点击会变成下落攻击,
+        # 落地会打断/改变后面的动作。封顶【不缩短窗口】, 所以不花时间
+        max_clicks = cap if max_clicks is None else min(cap, max_clicks)
+        self.macro_mark(f'{tag}_start')
+        self.spam_samples = []
+        while time.time() - start < window and n < max_clicks:
+            self.click()
+            n += 1
+            if sample is not None and n % sample_every == 0:
+                self.spam_samples.append(f'{time.time() - start:.2f}:{1 if sample() else 0}')
+            # 最后一段等待按剩余时间裁剪, 别整个 interval 等下去 —— 那是白送的延迟
+            remaining = window - (time.time() - start)
+            if remaining <= 0:
+                break
+            self.macro_wait(min(interval, remaining))
+        self.macro_mark(f'{tag}_end(x{n})')
+        return n
+
+    def segment_window(self, seg, n=1, lead=None):
+        """n 段普攻要给多长的连点窗口。见 spam_segments 的说明。
+
+        Args:
+            lead: 覆盖 A_LEAD。【只给个别格子用】—— 某一格要"更早切人"就调它,
+                不要去动全局的 A_LEAD(那会把二十来格一起改慢/改快)。
+        """
+        return max(0.0, (n - 1) * seg) + (self.A_LEAD if lead is None else lead)
+
+    def spam_segments(self, seg, n=1, tag='A', lead=None, interval=None, max_clicks=None):
+        """打出 n 段普攻。【调用点写的是段数, 不是秒数】。
+
+        窗口 = (n-1) * 一段 + A_LEAD:
+          - 前 n-1 段各要等自己的动画走完, 所以按段长累加;
+          - 最后一段只要【递出去】就行 —— 它的动画会在切人之后继续演(合轴),
+            所以不给它留时长, 只留 A_LEAD 保证有一下落在能出招的第一帧。
+
+        【为什么还是连点, 不是点 n 下】: 动画期间的点击是被丢掉的、不排队,
+        离散点击 + 固定间隔猜错一次那一段就没了。连点打出几段只由窗口长度决定,
+        多出来的点击落在动画里, 丢掉不花钱。
+        """
+        return self.macro_spam(self.segment_window(seg, n, lead),
+                               self.A_INTERVAL if interval is None else interval,
+                               tag=f'{tag}[{n}seg]', max_clicks=max_clicks)
+
+    # 【这里曾经有一个 spam_until_hit(): 连点到协奏涨了(=打中了)再走】——
+    # 已删除, 用户 2026-08-16 明确否掉。原因见 O_DEN_R1_A_LEAD 那段:
+    # 这条轴要等的是这一下【被接受】, 不是这一下【打中】; 而协奏必须打中才涨,
+    # 在刚抬手的那一刻判据永远不成立, 每轮都会跑满上限。
+    # 【别再往这类地方加读屏判据】: 抬手即算数是整条轴合轴的前提, 没有可读信号。
+
+    def macro_key(self, key, settle=0.0, tag=None):
+        self.task.send_key(key)
+        self.macro_mark(tag or str(key))
+        self.macro_gap(settle)
+
+    def spam_key(self, send, window, interval=None, tag='key', poke=None, presses=None,
+                 click_interval=None, stop_when=None):
+        """在一个窗口里反复发同一个技能键, 用来盖住动画那一段。
+
+        动画期间的按键是被丢掉的、不排队, 所以单发必丢 —— 这个形状在爱琳莫那条轴上
+        踩到过六次, 症状统一是"那一步慢了"(要等整个动画演完才有第二次机会)。
+
+        【必须在这个角色自己的回合里跑完, 不要跟切人并行】: 切人期间发出去的键会被
+        游戏带过换人边界落在新角色身上。点击可以并行(quick_switch 的 click_during),
+        技能键不行。唯一的例外是 switch_into_lib()。
+
+        Args:
+            poke: 发键期间要不要照常点普攻。默认跟随全局的持续普攻开关。
+            click_interval: 点普攻的间隔, 默认 A_INTERVAL。给 A_INTERVAL_FAST
+                就是"技能键按自己的节奏、普攻按加密节奏", 两条流互不影响。
+            stop_when: 每发一次键之后调一次, 返回 True 就停。用在【多按一下会
+                烧掉后面要用的充能】的地方 —— 一旦读到技能已经不可用就立刻收手。
+                【会读屏, 别配太密的 interval】。
+            presses: 只发这么多次, 均匀铺在窗口里。用在"连续点按两次E"那种
+                【次数本身有意义】的地方 —— 连发会把两发挤成一发。
+                【给了 presses 就由它说了算, window 只用来推间隔】: 否则
+                window=0(要求两发贴着发)会在第一发之后就把循环停掉, 变成单发。
+        """
+        interval = self.KEY_INTERVAL if interval is None else interval
+        poke = self.poking if poke is None else poke
+        click_interval = self.A_INTERVAL if click_interval is None else click_interval
+        if presses is not None and presses > 0:
+            interval = max(interval, window / presses)
+        start = time.time()
+        n = 0
+        clicks = 0
+        next_click = 0.0
+        while True:
+            send()
+            n += 1
+            if stop_when is not None and stop_when():
+                break
+            if presses is not None:
+                if n >= presses:
+                    break
+                left = interval
+            else:
+                left = window - (time.time() - start)
+                if left <= 0:
+                    break
+            step_end = time.time() + min(interval, left)
+            # 发键的节奏和点击的节奏各走各的 —— 挂在一起的话点击会被技能键的
+            # 间隔卡住(爱琳莫那边 R 被 E2_POLL 卡住就是这个)
+            while True:
+                now = time.time()
+                if now >= step_end:
+                    break
+                if poke and now >= next_click:
+                    self.click()
+                    clicks += 1
+                    next_click = now + click_interval
+                self.macro_wait(min(0.02, step_end - time.time()))
+        # 【点击数也要打进去】: x{n} 只数了技能键, 看不出这段时间有没有在持续普攻。
+        # 用户 2026-08-16 问过一次"E的期间也要一直普攻" —— 实际一直在点,
+        # 只是日志里看不见。A x0 就是真的没点(poke=False 的那几格)
+        self.macro_mark(f'{tag}(x{n},A x{clicks})')
+        return n
+
+    def resonance_gone(self, char):
+        """这个角色的 E 是不是已经不可用了(放出去了 / 进了 CD)。
+
+        【读屏】(task.available -> has_cd), 只给 spam_key 的 stop_when 用,
+        别放进热路径。冷启动那段发机甲 E 的循环用的是同一个判据。
+        """
+        try:
+            self.task.next_frame()
+            return not char.resonance_available()
+        except Exception:
+            return False
+
+    def resend_until_fired(self, char, cd_name, key, time_out, interval=None, tag='E'):
+        """反复发同一个技能键, 直到它真的放出去了(进了 CD)。
+
+        【发出去】和【放出来】是两回事: 动画期间的按键会被丢掉, 而日志上只看得到
+        "键发过了"。进了 CD 立刻停, 不会多按掉后面还要用的那一发。
+        """
+        interval = self.KEY_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        max_presses = int(time_out / max(interval, 0.01)) + 2
+        while time.time() - start < time_out and n < max_presses:
+            if self.task.get_cd(cd_name) > 0:
+                char.record_resonance_use()
+                self.macro_mark(f'{tag}_ok(x{n})')
+                return True
+            self.task.send_key(key)
+            n += 1
+            self.macro_gap(interval)
+        self.macro_mark(f'{tag}_timeout(x{n})')
+        self.logger.warning(f'{tag} never entered cd after {n} presses '
+                            f'({time_out:.1f}s), swallowed by an animation?')
+        return False
+
+    def macro_hold_attack(self, hold, settle=0.0, tag='hold'):
+        self.task.mouse_down()
+        self.holding_attack = True
+        self.macro_mark(f'{tag}_down')
+        try:
+            self.macro_wait(hold)
+        finally:
+            self.release_attack()
+        self.macro_mark(f'{tag}_up')
+        self.macro_gap(settle)
+
+    def release_attack(self):
+        if self.holding_attack:
+            self.task.mouse_up()
+            self.holding_attack = False
+
+    # ==================== 直切 ====================
+
+    def quick_switch(self, target, click=False, click_during=None, settle=None, time_out=None,
+                     read_con=False, assume_con=False, click_interval=None,
+                     click_first=False):
+        """按数字键直切给指定角色。
+
+        不走 switch_next_char(): 那个要先跑 _choose_switch_target 选人, 顺序是框架
+        说了算; 而且它每次发数字键都跟一次左键, 想不要那下 A 就没法不要。
+
+        Args:
+            click: 到场之后补一下普攻(复刻框架 BaseCombatTask.py:644 的行为)。
+                这条轴上一般不用 —— 持续普攻本身就在点, 再补就是多推一段连段。
+            click_during: 等换人生效的这段时间里继续点。默认跟随持续普攻开关。
+                这就是用户说的"狂点普攻切人": 换人不是瞬间的, 这几下落在上一个
+                角色身上, 正好把他最后那一段打出来。
+            read_con: 按键之前读一次协奏, 决定要不要按"带变奏"记账。
+                【不便宜】(能量环连通域分析), 只有真的要变奏的那两三处才传 True。
+            assume_con: 不读屏, 直接按满协奏记。用在【刚放完大招】之后 ——
+                那时协奏必满, 而演出期间能量环读数不可信。
+
+        Returns: 是否真的切过去了。
+        """
+        if target is None:
+            return False
+        if target is self.cur:
+            # 目标已经在场。【这里必须早退】: 不早退的话到场判据立刻成立,
+            # 整步 50 毫秒走完, 后面那些"给他的"按键其实发在了别人身上
+            self.macro_mark(f'>{target.name[:3]}(already)')
+            return True
+        entry = time.time()
+        time_out = self.SWITCH_TIME_OUT if time_out is None else time_out
+        settle = self.SWITCH_SETTLE if settle is None else settle
+        click_during = self.poking if click_during is None else click_during
+        click_interval = self.A_INTERVAL if click_interval is None else click_interval
+        source = self.cur if self.cur is not None else self
+        # 【第一个数字键要抢在读协奏之前发】: 读协奏是能量环的连通域分析, 少则
+        # 二三十毫秒、睡完之后的第一次读屏能到 0.86 秒 —— 夹在"上一个动作"和
+        # "数字键"之间就是白白的延迟。切人本身要 0.06~0.11 才落地, 来得及读完
+        slot = target.index + 1
+        # 【记下第一个数字键的时刻】: 有几格是靠它当锚点的。
+        # 用户逐帧量的都是"从切人到 A 出手", 而窗口默认从【检测到到场】算起 ——
+        # 中间隔着切人生效 + 读屏确认, 两者差好几十毫秒
+        self.switch_press_at = time.time()
+        # 【先点几下再发第一个数字键】(click_first = 点几下)。用在"边打A边不停切人"
+        # 的格子上: 游戏在角色动作期间会拒绝切人 —— 这正是那种写法不会掐掉 A 的原因。
+        # 但如果这一刻场上角色【刚到场、还没起手】, 切人键就没有东西挡着, 会当场生效,
+        # 她一下都不打就走。
+        # 【一下不够】(用户 2026-08-16: "这里千咲又没A出来了"): 那一下要是没被接受
+        # 就白给了。所以改成可以指定点几下 —— 每多一下只把切人键推迟一个
+        # click_interval(0.06), 但多一次撞上"能出招的那一帧"的机会
+        for i in range(int(click_first)):
+            self.click()
+            if i + 1 < int(click_first):
+                self.macro_wait(click_interval)
+        self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
+        if assume_con:
+            con_full = True
+        elif read_con:
+            con_full = bool(source.is_con_full())
+        else:
+            con_full = False
+        con_cost = time.time() - entry
+
+        start = time.time()
+        last = start   # 第一个数字键已经在上面发过了
+        next_click = 0.0
+        trace = [] if self.TRACE_SWITCH else None
+        team_size = len([c for c in self.task.chars if c is not None])
+        untrusted_hits = 0
+        clicks = 0
+        while time.time() - start < time_out:
+            now = time.time()
+            if now - last >= self.SWITCH_KEY_INTERVAL:
+                self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
+                last = now
+            # 点击的节奏跟切人键解耦: 切人键 0.03 秒一发, 点击照旧 A_INTERVAL,
+            # 否则这段时间会以 0.03 的密度灌点击, 远低于安全下限
+            if click_during and now >= next_click:
+                self.click()
+                clicks += 1
+                next_click = now + click_interval
+            self.task.next_frame()
+            in_team, index, count = self.task.in_team()
+            # 【count 不达标的 index 打折扣, 但不能一票否决】: in_team() 在只找到
+            # 一个槽位文本时照样返回 True 和一个 index(那是渲染顺序的产物);
+            # 但一票否决会造成假失败 —— 有槽位被特效盖住时 count 就是不达标,
+            # 切人明明成功了也判不出来, 卡满超时, 整条轴从这里崩
+            hit = in_team and index == target.index
+            trusted = in_team and count >= team_size
+            untrusted_hits = untrusted_hits + 1 if (hit and not trusted) else 0
+            if trace is not None:
+                trace.append(f'{time.time() - start:.2f}:'
+                             f'{(index if trusted else f"?{index}") if in_team else "x"}')
+            if hit and (trusted or untrusted_hits >= self.UNTRUSTED_CONFIRM):
+                self.handoff(source, target, con_full)
+                self.macro_mark(f'>{target.name[:3]}{"^" if con_full else ""}'
+                                f'({time.time() - entry:.2f}|con{con_cost:.2f}|A x{clicks})')
+                if trace:
+                    self.logger.info(f'switch trace -> {target.name}: {" ".join(trace)}')
+                if click:
+                    self.click()
+                    self.macro_mark(f'{target.name[:3]}A')
+                self.macro_gap(settle)
+                return True
+        # 【失败时更要打 trace】:
+        #   一直是旧角色的 index  -> 游戏真的在拒绝切人(上一个动作还没演完)
+        #   带 ? 的都是目标 index -> 切过去了, 是 count 判据把它挡住了
+        #   全是 x               -> HUD 整个不在(演出/时停里)
+        self.logger.warning(f'switch to {target.name} slot {slot} timed out '
+                            f'after {time_out:.1f}s (stuck in an animation?)'
+                            + (f' trace: {" ".join(trace)}' if trace else ''))
+        self.macro_mark(f'>{target.name[:3]}FAIL')
+        return False
+
+    def handoff(self, from_char, to_char, con_full):
+        """复刻 switch_next_char() 尾部那套交接记账 (BaseCombatTask.py:663-672)。
+
+        直接按数字键绕开了框架逻辑, 不补的话没人的 is_current_char 是 True,
+        get_current_char() 返回 None, AutoCombatTask 主循环当场崩。
+        """
+        self.task.in_liberation = False
+        from_char.switch_out(con_full=con_full)
+        to_char.is_current_char = True
+        to_char.has_intro = con_full
+        to_char.has_sub_dps_intro = con_full and from_char.is_sub_dps
+        to_char.last_switch_in_time = time.time()
+        if con_full:
+            now = time.time()
+            self.task.add_freeze_duration(now, to_char.intro_motion_freeze_duration, -100)
+            from_char.last_outro_time = now
+        self.cur = to_char
+
+    def switch_cd_left(self, char):
+        """某个角色的换人 CD 还剩多久 —— 【只算不等】。
+
+        【不读屏】: 头像上那个小数字是 OCR, 不便宜也不稳; 而 last_switch_time 是
+        我们自己在 handoff -> switch_out 里落的笔, 免费且精确(框架自己判换人 CD
+        用的也是它, BaseCombatTask.py:451)。
+        """
+        last = getattr(char, 'last_switch_time', -1)
+        if last is None or last < 0:
+            return 0.0
+        return max(0.0, self.SWITCH_CD - (time.time() - last))
+
+    def wait_switch_ready(self, char, tag='swCD', lead=0.0):
+        """等某个角色的换人 CD 转好。
+
+        用户在启动轴上明写: "要等千咲切人CD转好后立刻E1切千咲"。
+
+        Args:
+            lead: 【提前这么多就返回】, 把剩下这段留给调用方拿去跟切人并行。
+                用在"等CD -> 发技能 -> 切人"这种串行链上 —— quick_switch 本来
+                就会按 SWITCH_KEY_INTERVAL 一直重发数字键, 所以让它压着 CD 尾巴
+                开始按, 游戏 CD 一到那一帧就生效, 而不是"CD到了才开始按、再花
+                0.13 秒确认到场"。
+                【实测值】(2026-08-19 日志, 连续两轮一致): 这一格切千耗时 0.13,
+                整条链 denA12结束@14.36 -> 等CD 0.44 -> denE1@14.81 -> 千到场@14.94。
+                lead 就是从那 0.13 里省出来的。
+        Returns: 实际等了多久。
+        """
+        left = self.switch_cd_left(char)
+        wait = left - lead
+        if wait <= 0:
+            self.macro_mark(f'{tag}(0.00|left{left:.2f})')
+            return 0.0
+        self.macro_gap(wait, tag=tag)
+        self.macro_mark(f'{tag}({wait:.2f}|lead{left - wait:.2f})')
+        return wait
+
+    def switch_out_while_key(self, target, source, key_send, click=True,
+                             read_con=False, time_out=None, tag=None):
+        """一边切人, 一边给【离场角色】补技能键 —— 键只在 HUD 还读得到他时才发。
+
+        用户 2026-08-19: "E和切人同时进行, 同时持续攻击"。
+
+        【为什么要那道门】: 切人期间发出去的技能键会被游戏【带过换人边界, 落在新上场
+        的角色身上】—— 真同时发的话那发 E 很可能变成达尼娅放的, 白烧她一层充能,
+        而且小爱没变成机甲。这条在 达E1 那格已经烧过一次(所以那里改成了单发)。
+        所以判据是【HUD 还显示离场角色在场 = 这一发还会落在他身上】, 一从 HUD 上
+        消失就立刻停发。
+
+        跟 switch_into_lib 是同一个机制、相反的方向: 那边要 R 落在【新】角色身上,
+        所以【等】离场角色消失才开始发; 这边要 E 落在【老】角色身上, 所以他一消失
+        就【停】。
+
+        点击不受这道门约束 —— 点击落错人无所谓(顶多多推一段连段)。
+        """
+        if target is None:
+            return False
+        if target is self.cur:
+            self.macro_mark(f'>{target.name[:3]}(already)')
+            return True
+        entry = time.time()
+        time_out = self.SWITCH_TIME_OUT if time_out is None else time_out
+        src = source if source is not None else (self.cur or self)
+        slot = target.index + 1
+        self.switch_press_at = entry
+        # 【第一个数字键要抢在读协奏之前发】(quick_switch 里早就是这么做的, 这个新方法
+        # 漏了 —— 用户 2026-08-19 报"小爱E切达还是快0.2s")。
+        # 读协奏是能量环的连通域分析: 帧是热的时候二三十毫秒, 但【睡完之后的第一次
+        # 读屏要等一张新截图, 实测能到 0.86 秒】。夹在"上一个动作"和"数字键"之间
+        # 就是纯延迟, 而切人本身要 0.06~0.11 才落地, 完全来得及在换人之前读完
+        self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
+        con_full = bool(src.is_con_full()) if read_con else False
+        team_size = len([c for c in self.task.chars if c is not None])
+        n_key = n_click = 0
+        untrusted_hits = 0
+        arrived = False
+        next_click = 0.0
+        while time.time() - entry < time_out:
+            now = time.time()
+            self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
+            self.task.next_frame()
+            in_team, index, count = self.task.in_team()
+            # 只要 HUD 还认为离场角色在场, 这一发技能键就还落在他身上
+            if in_team and index == src.index:
+                key_send()
+                n_key += 1
+            if click and now >= next_click:
+                self.click()
+                n_click += 1
+                next_click = now + self.A_INTERVAL
+            hit = in_team and index == target.index
+            trusted = in_team and count >= team_size
+            untrusted_hits = untrusted_hits + 1 if (hit and not trusted) else 0
+            if hit and (trusted or untrusted_hits >= self.UNTRUSTED_CONFIRM):
+                arrived = True
+                break
+        label = tag or f'>{target.name[:3]}+key'
+        if arrived:
+            self.handoff(src, target, con_full)
+            self.macro_mark(f'{label}{"^" if con_full else ""}'
+                            f'({time.time() - entry:.2f}|key x{n_key},A x{n_click})')
+        else:
+            self.logger.warning(f'switch_out_while_key: {target.name} never came in '
+                                f'({n_key} keys, {n_click} clicks)')
+            self.macro_mark(f'{label}FAIL(x{n_key})')
+        return arrived
+
+    def switch_into_lib(self, target, lag_presses=1, tag='R'):
+        """一边疯狂切人一边预输入大招键 —— 【本文件里唯一允许技能键跨切人边界的地方】。
+
+        用户 2026-08-16: "疯狂切达的同时就开始预输入R, 但是R的输入要比切人慢一拍,
+        这样就不会误触小爱的R"。
+
+        【为什么要这么写】: 切人期间发出去的键会被游戏带过换人边界落在新角色身上 ——
+        平时这是灾难(白烧一个 CD), 这里正是要的机制: 演出/切人的那零点几秒里
+        R 已经递进去了, 达尼娅一落地就出手, 省掉"等她到场再发 R"的一整段。
+
+        【为什么要慢一拍】: 第一发 R 要是在切人键之前发出去, 场上还是爱弥斯 ——
+        那就是她的大招, 整条轴当场作废。所以先发 lag_presses 次数字键, 再开始
+        跟着发 R。这是这个方法唯一的安全边界, 别把 lag 调成 0。
+        """
+        if target is None:
+            return False
+        if target is self.cur:
+            self.macro_mark(f'>{target.name[:3]}(already)')
+            return True
+        entry = time.time()
+        source = self.cur if self.cur is not None else self
+        slot = target.index + 1
+        team_size = len([c for c in self.task.chars if c is not None])
+        n_key = 0
+        n_lib = 0
+        untrusted_hits = 0
+        arrived = False
+        last = 0.0
+        # 【R 的放行门】: 只要队伍 HUD 还【明确显示离场角色在场】, 就一发 R 都不发。
+        # 原来是按【按键次数】lag(lag_presses=1), 而后来 SWITCH_KEY_INTERVAL 被改成 0
+        # (每轮都发切人键), 于是“一拍”变成了几毫秒 —— 爱弥斯还在场上就开始
+        # 收到 R, 误开她的大招(用户 2026-08-17: "爱切达还是经常容易误开爱的R1")。
+        # 换成看状态就不会随发键密度漂: HUD 还读到她 = 绝对不发。
+        # 另加一道时间下界, 防的是“HUD 读不到/读错”时马上就发
+        r_open = False
+        while time.time() - entry < self.SWITCH_TIME_OUT:
+            now = time.time()
+            if now - last >= self.SWITCH_KEY_INTERVAL:
+                self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
+                n_key += 1
+                if r_open and now - entry >= self.R_PREINPUT_MIN_LAG:
+                    target.send_liberation_key()
+                    n_lib += 1
+                last = now
+            self.task.next_frame()
+            in_team, index, count = self.task.in_team()
+            # 离场角色已经不在 HUD 上了 -> 切人基本已经坐实, 可以开始预输入 R
+            if not (in_team and index == source.index):
+                r_open = True
+            hit = in_team and index == target.index
+            trusted = in_team and count >= team_size
+            untrusted_hits = untrusted_hits + 1 if (hit and not trusted) else 0
+            if hit and (trusted or untrusted_hits >= self.UNTRUSTED_CONFIRM):
+                arrived = True
+                break
+        if arrived:
+            self.handoff(source, target, False)
+            self.macro_mark(f'>{target.name[:3]}+R({time.time() - entry:.2f}|'
+                            f'key x{n_key},R x{n_lib})')
+            if n_lib == 0:
+                # 一发 R 都没递进去: 预输入没生效, 后面那句 fire_lib 会补上,
+                # 只是慢一点。比误开爱弥斯的 R1 强得多
+                self.logger.info('switch_into_lib: R never sent before arrival '
+                                 '(HUD still showed the outgoing char) — R will be sent after')
+        else:
+            self.logger.warning(f'switch_into_lib: {target.name} never came in '
+                                f'({n_key} keys, {n_lib} R)')
+            self.macro_mark(f'>{target.name[:3]}+RFAIL(x{n_key})')
+        return arrived
+
+    # ==================== 大招 ====================
+
+    def fire_lib(self, char, tag='R', window=None):
+        """把大招发出去。判据是【队伍 HUD 掉下去 = 演出开始】。
+
+        不用 click_liberation(): 它一路阻塞到演出结束才返回, 而这条轴上好几处要在
+        演出【期间】继续做事(预输入普攻 / 连发 E / 疯狂切人)。
+
+        【发键之前不读屏确认可放】: 那次读屏是纯延迟, 夹在"上一个动作"和"R键"之间;
+        而且它并不能替我们做决定 —— 读到不可用我们照样要发(读数会抖, "没放出来"
+        的代价远大于"多按一下")。可用性只在失败分支里读一次, 用来分辨
+        "能量不够" 和 "键被动画吞了"。
+
+        【窗口给短】: 正常一两发就进去了。给长的话万一 HUD 判据失灵, 这里会一直
+        按 R —— 把后面轮到的那一发大招白按掉。宁可这一次没放出来, 也不要乱放。
+        """
+        window = self.LIB_FIRE_WINDOW if window is None else window
+        start = time.time()
+        # 【记下按 R 的时刻】: 后面几格拿它当锚点, 不拿"HUD 回来"。
+        # 按键时刻是我们自己发的、精确; HUD 要读屏, 每轮抖几十毫秒。
+        # 用户 2026-08-16 逐帧: 达按 R -> A 抬手 = 7s22~12s01 = 4.65 秒,
+        # 同一格 HUD 消失 4.18 秒 —— 【HUD 回来之后她还要 0.47 秒才能出招】
+        self.lib_press_at = start
+        n = 0
+        while time.time() - start < window:
+            # 【先发键再读屏】(用户 2026-08-16: "QR的还是慢了一点点")。
+            # 原来是"读一帧 -> 判HUD -> 才发R", 于是【每次放大招前都白读一次屏】——
+            # 实机 denQ@4.49 -> denR1_fired@4.59, 那 0.10 秒全是这次读屏。
+            # 而第一轮那次判断本来就没意义: 刚按完 Q, 不可能已经在演出里。
+            # 多发的那一下不会有副作用 —— 演出期间的按键被丢掉、不排队
+            char.send_liberation_key()
+            n += 1
+            # 【发键的节奏和读屏的节奏各走各的】(同 spam_key 里那条):
+            # 读屏要 0.04, 挂在一起就等于把重试周期翻倍, 而 R 被接受的时刻
+            # 只跟【按键什么时候落下】有关
+            if n % self.LIB_READ_EVERY == 0:
+                self.task.next_frame()
+                if not self.task.in_team()[0]:
+                    char.record_liberation_use()
+                    self.macro_mark(f'{tag}_fired(x{n})')
+                    return True
+            self.sleep(self.LIB_KEY_INTERVAL, check_combat=False)
+        # 最后再确认一次: 键刚发出去、演出还差一帧才开始的情况很常见
+        self.task.next_frame()
+        if not self.task.in_team()[0]:
+            char.record_liberation_use()
+            self.macro_mark(f'{tag}_fired(x{n})')
+            return True
+        self.macro_mark(f'{tag}_NOFIRE(x{n})')
+        # 失败了才去读一次能量环: lit=False 是"能量不够/大招还没转好",
+        # lit=True 是"键被上一个动作的动画吞了" —— 两种要改的地方完全不同
+        try:
+            lit = bool(char.liberation_available())
+        except Exception:
+            lit = 'err'
+        self.logger.warning(f'{tag}: {char.name} liberation never started an animation '
+                            f'after {n} presses (icon lit={lit})')
+        return False
+
+    def spam_key_through_lib(self, send, tag='key', time_out=None, tail=None, poke=None):
+        """演出期间一直发某个技能键, 发到【演出真的结束】(HUD 回来)再补一小段。
+
+        【为什么不能按固定时长】(爱琳莫那条轴上标定出来的): 大招哪一刻出手是浮动的 ——
+        早出手时演出早结束, 固定窗口的尾巴白发; 晚出手时演出还没完窗口就停了,
+        那些键一发都没进去(症状是"R完不接E")。盯 HUD 就没有这个问题。
+        【tail 不能省】: HUD 回来那一刻角色多半还在收招里, 那几下照样被吞。
+
+        【"HUD 回来"要先确认它消失过】: 上一句 fire_lib 是"HUD 一掉下去就返回"的,
+        进到这里时画面正在渐变, 读一帧很可能读回 True —— 那就会在演出刚开头
+        就判成"演出结束了"。所以要么先看到它真的消失过, 要么连着 NO_ANIM_GRACE
+        秒都读到在场(说明这一次压根没有演出, 多半是大招没放出来)。
+
+        Returns: 演出有没有正常结束(False 说明跑满了上限, 后面多半也不对)。
+        """
+        time_out = self.LIB_ANIM_TIME_OUT if time_out is None else time_out
+        tail = self.LIB_ANIM_TAIL if tail is None else tail
+        poke = self.poking if poke is None else poke
+        start = time.time()
+        n = 0
+        gone_seen = False
+        back_at = None
+        next_click = 0.0
+        while time.time() - start < time_out:
+            send()
+            n += 1
+            now = time.time()
+            if poke and now >= next_click:
+                self.click()
+                next_click = now + self.A_INTERVAL
+            self.task.next_frame()
+            on_hud = self.task.in_team()[0]
+            if not on_hud:
+                gone_seen = True
+                back_at = None
+            elif back_at is None:
+                if gone_seen or time.time() - start >= self.HUD_NO_ANIM_GRACE:
+                    back_at = time.time()
+            elif time.time() - back_at >= tail:
+                break
+            # 【必须 check_combat=False】: 演出期间读不到目标, 默认的 sleep 会跑
+            # 战斗判定并抛异常, 整个连发在第一轮就被打断、接着判脱战
+            self.sleep(self.KEY_INTERVAL, check_combat=False)
+        self.add_freeze_duration(start, time.time() - start)
+        self.macro_mark(f'{tag}(x{n},{"ok" if back_at else "timeout"},'
+                        f'{"anim" if gone_seen else "NOANIM"},{time.time() - start:.2f}s)')
+        return back_at is not None
+
+    def poke_until(self, deadline, tag='poke', interval=None, max_clicks=None,
+                   quiet_tail=0.0):
+        """一直点普攻到某个【绝对时刻】为止, 顺路记录 HUD 什么时候回来。
+
+        【锚点是按键时刻, 不是 HUD】(用户 2026-08-16 逐帧标定):
+        达尼娅按 R 到 A 抬手是 4.65 秒, 同一格 HUD 消失 4.18 秒 ——
+        【HUD 回来之后她还要约 0.47 秒才能出招】。两个锚点差的是常量,
+        但按键时刻是我们自己发出去的、精确到毫秒, 而 HUD 要靠 in_team() 读屏,
+        每轮抖动几十毫秒 —— 所以锚在按键上。
+
+        HUD 回来的时刻照样记进日志(hud=...), 用来盯那个 0.47 稳不稳:
+        它要是每轮都在变, 说明演出长度本身有抖动, 那就得改回 HUD 锚点。
+        """
+        interval = self.A_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        hud_at = None
+        gone_seen = False
+        next_click = 0.0
+        while True:
+            now = time.time()
+            if now >= deadline:
+                break
+            # 【安静尾巴】: 截止前的最后这一段不再点。
+            # 目的是让最后一下点击有时间被消费掉, 而不是贴着切人键又起一个
+            # 新动作把切人堵住(那个现象实测过)。
+            # 【比 max_clicks 好】: 封顶次数会把“后面才能出招”的机会一并堵掉 ——
+            # 千咲 A2 那格就是这么死的: 25 轮里 23 轮的 >Den 只有 0.07,
+            # 说明根本没有动作挡着切人, 也就是 A2 压根没起手
+            if (now >= next_click and now < deadline - quiet_tail
+                    and (max_clicks is None or n < max_clicks)):
+                self.click()
+                n += 1
+                next_click = now + interval
+            self.task.next_frame()
+            if not self.task.in_team()[0]:
+                gone_seen = True
+            elif gone_seen and hud_at is None:
+                hud_at = time.time() - start
+            self.macro_wait(0.01)
+        # 这一段是大招演出, 计入 freeze, 否则框架会把它算成"这个角色磨蹭了几秒"
+        self.add_freeze_duration(start, time.time() - start)
+        self.macro_mark(f'{tag}(x{n},{time.time() - start:.2f}s,'
+                        f'hud{"%.2f" % hud_at if hud_at is not None else "-"})')
+        return hud_at
+
+    def poke_until_hud_back(self, tag='anim', time_out=None, tail=None):
+        """演出期间一直点普攻, 等队伍 HUD 回来(演出结束)再往下走。
+
+        【为什么点】: 演出结束的第一帧就要有输入落进去, 而演出期间的点击是被丢掉的、
+        不排队 —— 连点免疫被吞, 单发要么埋在演出里要么等太久。
+        【为什么还要 tail】: HUD 回来那一刻角色多半还在收招里, 那几下照样被吞。
+
+        用户在启动轴上明写了这一格: "达尼娅动画期间一直点普攻触发不了, 所以需要等
+        一点点时间等出手再切, 或者说你识别到了HUD就可以切了"。
+
+        【"HUD 回来"要先确认它消失过】: 同 spam_key_through_lib —— 进来的这一刻
+        画面还在渐变, 读一帧很可能读回 True, 那就是"演出刚开头就判成结束"。
+        """
+        time_out = self.LIB_ANIM_TIME_OUT if time_out is None else time_out
+        tail = self.LIB_ANIM_TAIL if tail is None else tail
+        start = time.time()
+        n = 0
+        gone_seen = False
+        back = False
+        next_click = 0.0
+        while time.time() - start < time_out:
+            now = time.time()
+            if now >= next_click:
+                self.click()
+                n += 1
+                next_click = now + self.A_INTERVAL
+            self.task.next_frame()
+            if not self.task.in_team()[0]:
+                gone_seen = True
+            elif gone_seen or time.time() - start >= self.HUD_NO_ANIM_GRACE:
+                back = True
+                break
+            self.macro_wait(0.01)
+        # 演出这一段计入 freeze, 否则框架的各种 time_elapsed_accounting_for_freeze
+        # 会把它算成"这个角色磨蹭了 5 秒"
+        self.add_freeze_duration(start, time.time() - start)
+        self.macro_mark(f'{tag}({"ok" if back else "timeout"},'
+                        f'{"anim" if gone_seen else "NOANIM"},x{n},'
+                        f'{time.time() - start:.2f}s)')
+        if tail > 0:
+            self.macro_spam(tail, self.A_INTERVAL, tag=f'{tag}Tail')
+        return back
+
+    # ==================== 变奏(等协奏) ====================
+
+    def wait_con_for_intro(self, char, next_name, poke=True, poke_after=0.0,
+                           time_out=None, stall_give_up=None):
+        """等协奏结算到满再交棒 —— 满协奏离场, 下一个人才有变奏入场。
+
+        伤害打中和协奏涨上去之间有延迟, 打完立刻切就没有变奏。
+        【协奏必须打中才涨】(回路条是递出去就涨, 两条规则不同的能量, 别混)。
+        所以这里等不到, 往上游找哪笔伤害打空了, 而不是加大这个超时。
+
+        Args:
+            poke: 等的期间补不补普攻。默认补 —— 干站着等在画面上就是"愣了一会才切人",
+                补普攻既填空白又能把协奏推快一点。【角色在空中时必须传 False】,
+                那时的点击会变成下落攻击。
+        """
+        start = time.time()
+        samples = []
+        full = False
+        stalled_at = None
+        stalled_since = start
+        next_click = 0.0
+        time_out = self.CON_WAIT_TIME_OUT if time_out is None else time_out
+        stall_give_up = (self.CON_STALL_GIVE_UP if stall_give_up is None
+                         else stall_give_up)
+        while time.time() - start < time_out:
+            con = char.get_current_con()
+            if len(samples) < self.CON_SAMPLE_MAX:
+                samples.append(f'{time.time() - start:.2f}:{con:.2f}')
+            if con >= self.CON_ENOUGH:
+                full = True
+                break
+            # 【读数一动不动就别等满超时了】: 真不涨的时候多等的那一秒纯亏。
+            # 阈值不能太小 —— 协奏会在 0.99 上卡一下再跳满
+            if stalled_at is None or abs(con - stalled_at) > 0.005:
+                stalled_at = con
+                stalled_since = time.time()
+            elif time.time() - stalled_since >= stall_give_up:
+                self.macro_mark(f'con(stalled@{con:.2f})')
+                self.logger.info(f'{char.name} con stuck at {con:.2f} for '
+                                 f'{self.CON_STALL_GIVE_UP:.1f}s, {next_name} gets no intro')
+                return False
+            now = time.time()
+            if poke and now - start >= poke_after and now >= next_click:
+                self.click()
+                next_click = now + self.A_INTERVAL
+            self.macro_wait(self.CON_POLL_INTERVAL)
+        self.macro_mark(f'con({"full" if full else "timeout"})')
+        # 轨迹是判断"上一下打没打中"的唯一手段:
+        #   一跳到顶(相邻两个采样 0.8 -> 1.00) = 打中了, 这段等待是伤害飞行时间
+        #   一路慢爬 = 那一下打空了, 协奏是补刀的普攻蹭上去的 —— 位置问题, 不是时机问题
+        self.logger.info(
+            f'{char.name} con {" ".join(samples)} '
+            f'{"(full, handing over)" if full else f"(never filled, {next_name} gets no intro)"}')
+        return bool(full)
+
+    # ==================== 场上是谁 ====================
+
+    FIELD_SETTLE_TIME_OUT = 1.5
+
+    def on_field_char(self, time_out=None):
+        """现在场上是谁 —— 【只在拿不到入口角色时才用】, 因为它开局会说谎。
+
+        in_team() 的判据是"哪个槽位的名字文本【找不到】, 谁就在场"(BaseWWTask.py:930)。
+        战斗刚开始时队伍 HUD 还在渐入, 三个槽位的文本不是同时出现的 —— 这时它只找到
+        一个文本, 但 exist_count == 1 那个分支【照样返回 True 和一个 index】,
+        而那个 index 只是渲染顺序的产物。可信判据是 count >= 队伍人数。
+        """
+        time_out = self.FIELD_SETTLE_TIME_OUT if time_out is None else time_out
+        expected = len([c for c in self.task.chars if c is not None])
+        end = time.time() + time_out
+        while True:
+            self.task.next_frame()   # in_team() 读的是缓存帧, 不刷就是反复读同一张图
+            in_team, index, count = self.task.in_team()
+            if in_team and count >= expected:
+                for char in self.task.chars:
+                    if char is not None and char.index == index:
+                        return char
+                return None
+            if time.time() >= end:
+                self.logger.warning(f'team HUD never settled in {time_out:.1f}s '
+                                    f'(in_team={in_team} index={index} count={count} '
+                                    f'expected={expected}), cannot tell who is on field')
+                return None
+            self.macro_wait(0.03)
+
+    def hold_into_switch(self, target, hold, tag='hold'):
+        """切人的同时按住攻击键, 到场之后再按住 hold 秒。
+
+        【按下沿必须提到切人之前】: 按住 = 先普攻、续按才变重击, 所以
+          - 切完再按住 -> 新角色多出一下平A;
+          - 按完立刻切 -> 上一个角色来不及吃掉这个按下沿, 新角色带着"按住"状态上场,
+            同样多一下平A。
+        爱琳莫那条轴上两处都栽过, 定下来的做法是"按下 -> 留一点点被离场角色消化 -> 切"。
+
+        【一次 mouse_down 就一直有效, 包括跨过切人】—— 但期间【绝对不要】再补按:
+        mouse_down 内部会投 WM_ACTIVATE, 窗口收到就把已经按住的状态打断。
+        """
+        self.task.mouse_down()
+        self.holding_attack = True
+        self.macro_mark(f'{tag}_down')
+        try:
+            self.macro_wait(self.PRECHARGE_TO_SWITCH)
+            self.quick_switch(target, click_during=False)
+            # 用户给的 2.2 秒是【从切到千咲开始】算的, 所以计时起点在这里
+            self.macro_wait(hold)
+        finally:
+            self.release_attack()
+        self.macro_mark(f'{tag}_up')
+
+    # ==================== 处决 ====================
+
+    def f_prompt_now(self):
+        """自己查一次屏幕中央的处决提示 —— 【绕开框架那 1 秒的频率限制】。
+
+        `CombatCheck.check_f_break()` 有两路判据:
+          - 顶部 `f_break_full`(threshold=0.92): 每次调用都查;
+          - 屏幕中央 `f_break` + `not is_pick_f()`: 【外面裹着
+            `time.time() - last_break_check_time > 1`】。
+        而 f_break_persist 是 0.1 秒问一次, 于是中央那一路【十次里有九次被整个跳过】。
+        更糟的是宏跑的时候 task.skip_combat_check 是开着的, 战斗判定线程也不在
+        刷新 can_break —— 两条腿一起瘸, 表现就是"处决从来不放"。
+
+        这里把被跳过的那一路自己补上, 判据跟框架逐字一致(中央找到 f_break, 且不是
+        拾取提示 —— F 同时是拾取/交互键, is_pick_f 就是为了区分这个)。
+        """
+        try:
+            box = self.task.box_of_screen(0.2, 0.2, 0.75, 0.8, hcenter=True, vcenter=True)
+            if self.task.find_one('f_break', box=box, target_height=720):
+                return not self.task.is_pick_f()
+        except Exception:
+            pass
+        return False
+
+    def spam_f(self, window, tag='Fspam', interval=None):
+        """【盲发 F, 盖住一整段演出】—— 不读屏、不判断。
+
+        用户 2026-08-22: "第二个重击放动画的时候就开始F, 跟爱弥斯那里逻辑一样,
+        确保动画结束第一时间接F再接R"。
+
+        为什么要盲发: 演出期间的按键是【被丢掉的、不排队】, 所以"等演出结束再按"
+        必然慢一拍(还要先读一次屏才知道结束了)。连发覆盖整段, 演出结束的第一个
+        合法帧就有一发落进去 —— 这是爱弥斯那条轴上验过的形状。
+        【没有处决可打时按 F 不触发别的东西】, 所以盲发是安全的。
+
+        发完之后照例再走一遍 f_break_persist: 那个才是"提示真的亮了就连按到打完"。
+        """
+        interval = self.F_SPAM_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        while time.time() - start < window:
+            self.task.send_key('f')
+            n += 1
+            self.macro_wait(interval)
+        self.macro_mark(f'{tag}(x{n},{time.time() - start:.2f}s)')
+        return n
+
+    def f_break_window(self, window, giveup=None, tag='F', check_every=2, interval=None):
+        """盲发 F 盖住演出的【同时】盯着提示: 亮了就打完, 到 giveup 还没见到就直接走。
+
+        用户 2026-08-22: "有时候那个时候有处决你放处决了, 当然处决没事, 但是有一次
+        没处决你也慢了好久才放R"。
+
+        原来这一段是【两段串起来的】: 先无条件盲发 spam_f(1.61秒), 再 f_break_persist
+        (又 1.08 秒) —— 实机 qingZ2@46.15 -> qingR_fired@49.10 = 【2.95 秒】,
+        而那一轮根本没有处决可打, 两段全是白等。
+        合成一段之后: 有处决 -> 照打(那点时间值); 没处决 -> giveup 到了就走,
+        不再把没有的东西等满。
+
+        【盲发和检测各走各的节奏】: 发键每轮都发(动画期间的按键被丢掉, 只能靠密度),
+        读屏每 check_every 轮才做一次(f_prompt_now 是一次中央找图, 不便宜)。
+        """
+        giveup = self.F_GIVEUP if giveup is None else giveup
+        interval = self.F_SPAM_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        seen = False
+        while self.time_elapsed_accounting_for_freeze(start) < window:
+            n += 1
+            if n % check_every == 0:
+                if self.f_prompt_now() or getattr(self.task, 'can_break', False):
+                    seen = True
+                    self.task.can_break = True
+                    if self.f_break():
+                        self.macro_mark(f'{tag}_ok(x{n},{time.time() - start:.2f}s)')
+                        return True
+            self.task.send_key('f')
+            if not seen and self.time_elapsed_accounting_for_freeze(start) >= giveup:
+                # 【没有处决可打就别等满】: 这一段每多一秒, R 就晚一秒
+                self.macro_mark(f'{tag}_skip(x{n},{time.time() - start:.2f}s)')
+                return False
+            self.macro_wait(interval)
+        self.macro_mark(f'{tag}_none(x{n},{time.time() - start:.2f}s)')
+        return False
+
+    def f_break_persist(self, window=None, tag='F'):
+        """在一个窗口内反复尝试处决, 而不是只赌调用那一瞬间。
+
+        【框架的 f_break() 只在"提示当下就亮着"时才动作】(CombatCheck.f_break:
+        `if self.can_break or self.check_f_break():` 不成立就直接返回 None) ——
+        提示晚出来哪怕 0.1 秒, 这一次调用就整个跳过。这是"处决经常不放"的根因。
+        提示一亮 f_break() 自己会连按到打完(它内部阻塞至少 0.5 秒), 所以这里
+        只负责【一直问到它亮】。
+
+        【别在切人附近调】: 击破动画带全局时停、队伍 HUD 会消失, 切人循环读到
+        not in_team 会直接判脱战。轴上处决的位置都离切人有一格距离, 而且三个角色的
+        check_f_on_switch 在宏开跑时就全关了(否则框架还会在切人时自己按一次)。
+        """
+        window = self.F_WINDOW if window is None else window
+        start = time.time()
+        n = 0
+        own = 0
+        while self.time_elapsed_accounting_for_freeze(start) < window:
+            # 【记一下这一发是谁判出来的】(用户 2026-08-21: "莫宁也还是没处决到" ——
+            # 日志明明是 morF_ok, 所以要分清是【真提示】还是【假阳性/残留标志】):
+            #   stale = 进这一轮时 task.can_break 就已经是 True 了。它可能是战斗判定
+            #           线程置的, 也可能是上一次没被清掉的残留 —— 后者会让 f_break()
+            #           空按半秒, 画面上什么都不会发生, 但日志照样记 _ok;
+            #   own   = 我们自己在屏幕中央找到了提示(最可信);
+            #   fw    = 前两个都不是, 那就是框架顶部那个 f_break_full 匹配上的。
+            pre_can = bool(getattr(self.task, 'can_break', False))
+            # 【先自己查一遍中央提示】: 框架那一路被 1 秒频率限制挡掉了九成,
+            # 查到就把 can_break 置上, 下一句 f_break() 会直接走"已经能击破"的分支。
+            # 置的是框架自己的字段, f_break() 打完会把它清回 False
+            own_hit = self.f_prompt_now()
+            if own_hit:
+                own += 1
+                self.task.can_break = True
+            if self.f_break():
+                why = 'stale' if pre_can else ('own' if own_hit else 'fw')
+                self.macro_mark(f'{tag}_ok({why},x{n},own{own},'
+                                f'{time.time() - start:.2f}s)')
+                return True
+            # 等提示的这段也别站着 —— 处决打不打得出来跟这几下无关, 但空白很显眼
+            self.click()
+            n += 1
+            self.sleep(self.F_RETRY_INTERVAL, check_combat=False)
+        self.macro_mark(f'{tag}_none(x{n})')
+        self.logger.info(f'{tag}: no break prompt in {window:.1f}s ({n} tries, '
+                         f'own detector hit {own} times) -- 这一轮本来就没有处决可打')
+        return False
+
+    # ==================== 莫宁: 重击 ====================
+
+    def mor_hold_heavy(self, mor, tag='morHold', e_after=None, cap=None, stop_when=None):
+        """莫宁的强化重击: 【亮之前一直点, 一亮马上长按】。
+
+        用户 2026-08-21 最终口径: "如果在地上被打断了, 不要笨的一直长按重击, 这样莫宁
+        会不连贯。在强化重击没亮之前一直持续点按就行, 亮了马上长按重击"。
+
+        所以这一格是两段:
+          1. 【点】—— 连点普攻把回路条充上去, 一直点到强化重击的标记亮起。
+             被怪打断了照样在点, 她的动作是连贯的; 而【一直按住】的话被打断之后
+             她就卡在一个出不来的蓄力上, 那正是"不连贯"的来源。
+          2. 【按】—— 标记一亮【立刻】mouse_down, 判定成立到按下之间不插任何东西
+             (不再多点一下、也不重读一次条)。这是"有强化重击就要放, 不要有了
+             过了那个点还在A"那条要求。
+
+        这一格前后改了三版, 三版各解决了一个问题, 少哪一半都不行:
+          - v1 固定窗口连点 -> 窗口打满条却不一定满(被打断补不回来) -> 退化成普通重击,
+            不起飞;
+          - v2 连点到条满再长按 -> 中间隔着一次多余的重读, "过了那个点还在A";
+          - v3 全程长按 -> 被打断时卡在蓄力里, 动作不连贯。
+        现在是 v2 的形状 + v2 漏掉的那个"立刻按下"。
+
+        【第 2 段里只有一次 mouse_down 和一次 mouse_up】: 中间【绝对不要】click()
+        (会把按住松开)或者补 mouse_down()(内部投的 WM_ACTIVATE 会把按住打断)。
+        技能键可以发 —— 爱琳莫那条轴上按住的同时发 E/R 是验过的。
+
+        Args:
+            e_after: 【点】这一段开始之后这么久发 E(None = 这一格没有 E)。
+                轴上写 "aaa e z" 的那两处就是靠它把 E 插在连点中间。
+            stop_when: 额外的提前结束判据。升天那一发传 on_air: 人已经上天了就不用
+                再等条的读数(读数滞后, 每轮都要白按满上限)。
+        Returns: 强化重击有没有确认放出去。
+        """
+        cap = self.MOR_HOLD_CAP if cap is None else cap
+        # 【这么早"读到条满"一律不算】(用户 2026-08-22: "为什么有一段莫宁变奏入场
+        # 直接就开R了")。实机那一轮: morHeavyFill(lit,A x1,0.02s) —— 她刚变奏入场,
+        # 第一帧就读到条是满的, 于是 A123 那 2.2 秒【整段跳过】, E 补在 0.03 秒,
+        # 重击 1.11 秒, R 1.62 秒 —— 画面上就是"入场直接开R"。
+        # 那个读数是【上一个角色的 HUD 还没换掉】: 变奏那一刹那屏幕上还是清宵的状态,
+        # 而回路条是按固定屏幕区域找图的。
+        # 【这一格有 E 的时候, 下界还要至少等到 E 该发的时刻】——
+        # 轴上就是"A 到 A3 再放 E 再接重击", 条再早满也不能把 A3 和 E 抢到前面去
+        min_fill = self.MOR_FILL_MIN
+        if e_after is not None:
+            min_fill = max(min_fill, e_after)
+        # ---- 1 点到强化重击亮 ----
+        fill_start = time.time()
+        clicks = 0
+        e_sent = False
+        lit = False
+        lit_streak = 0
+        next_click = 0.0
+        last_pause = fill_start
+        while self.time_elapsed_accounting_for_freeze(fill_start) < self.MOR_FILL_CAP:
+            self.task.next_frame()
+            now = time.time()
+            try:
+                lit_streak = lit_streak + 1 if mor.is_mouse_forte_full() else 0
+            except Exception:
+                lit_streak = 0
+            if lit_streak >= self.MOR_FORTE_CONFIRM and now - fill_start >= min_fill:
+                lit = True
+                break          # 【立刻退出去按住, 不再多点一下】
+            if e_after is not None and not e_sent and now - fill_start >= e_after:
+                # 【一直重发到 E 真的进了 CD】(用户 2026-08-22: "E没进CD就重新尝试放呗")。
+                # 单发/双发都赌"这一下没被动画吞掉"; 进没进 CD 是【能查的】——
+                # task.get_cd('resonance') > 0 就是放出去了。查得到就别赌
+                # 【重发 E 的期间不点普攻】(用户 2026-08-22: "变奏入场开始你就A和E
+                # 连放, 这样不行啊, 还是最好先A到A3再放E接强化重击接RQ切人,
+                # 这样最流畅, 你提前放了E会不流畅")。
+                # 原来这里每发一次 E 就补一下点击, 画面上就是 A 和 E 交替往外蹦。
+                # 现在是【A 打到 A3 -> 停手 -> 只发 E -> 接重击】, 一条线走下来
+                e_end = time.time() + self.MOR_E_FIRE_TIME_OUT
+                n_e = 0
+                while time.time() < e_end:
+                    if self.task.get_cd('resonance') > 0:
+                        break
+                    mor.send_resonance_key()
+                    n_e += 1
+                    self.macro_wait(self.MOR_E_RESEND_INTERVAL)
+                    self.task.next_frame()
+                fired_e = self.task.get_cd('resonance') > 0
+                mor.record_resonance_use()
+                e_sent = True
+                self.macro_mark(f'{tag}E({"ok" if fired_e else "NOCD"},x{n_e},'
+                                f'@{now - fill_start:.2f})')
+                if not fired_e:
+                    self.logger.warning(f'{tag}: E 发了 {n_e} 次也没进 CD —— '
+                                        f'多半被入场/普攻动画一直吞着')
+                # 【E 发完立刻转去按住, 不再回去点】(用户 2026-08-22: "E的同时就开始
+                # 长按重击准备重击")。按住是预输入 —— E 的动画一结束、条一满,
+                # 强化重击自己就出来了, 不用等我们"看到标记亮再按下去"那一整个往返。
+                # 下面那一段的 full_seen 从 False 起算(lit 还是 False), 所以它会
+                # 老老实实等"先看到条满、再看到条空", 不会一进去就假成立
+                break
+            # 【每隔一段停手让读数出来】(2026-08-22 实机): 循环轴里连点期间
+            # is_mouse_forte_full 一次都读不到(她一直在出招, 那个图标没渲染出来),
+            # 一停手长按就立刻读到满 —— 所以每 MOR_READ_EVERY 秒空出
+            # MOR_READ_PAUSE 不点, 专门给读数一个窗口。代价是每轮少点两三下
+            if now - last_pause >= self.MOR_READ_EVERY:
+                if now - last_pause < self.MOR_READ_EVERY + self.MOR_READ_PAUSE:
+                    continue          # 读数窗口: 只读不点
+                last_pause = now
+            if now >= next_click:
+                self.click()
+                clicks += 1
+                next_click = now + self.MOR_A_INTERVAL
+        # 【把"条到底亮没亮"留给调用方】: 启动轴那边要靠它区分"重击没打出来是因为
+        # 资源没到"(该重试)还是"读不到条"(重试也没用), 见 opener_seg1
+        self.mor_fill_lit = bool(lit)
+        why_fill = 'lit' if lit else ('afterE' if e_sent else 'CAP')
+        self.macro_mark(f'{tag}Fill({why_fill},A x{clicks},'
+                        f'{time.time() - fill_start:.2f}s)')
+        if not lit and not e_sent:
+            # 【afterE 不算异常】: 那是"E 发完就转去按住"的正常路径, 条会在按住期间满
+            self.logger.warning(
+                f'{tag}: forte never lit in {self.MOR_FILL_CAP:.1f}s ({clicks} clicks) — '
+                f'接下来按下去的是普通重击')
+        if e_after is not None and not e_sent:
+            # 条比预定的 E 时刻先亮: E 还是要发, 补在按住之前(轴上它在重击之前)
+            mor.send_resonance_key()
+            mor.record_resonance_use()
+            self.macro_mark(f'{tag}E@lit')
+
+        # ---- 2 按住, 等它出手 ----
+        # 【按下去这一刻的协奏读数留个底】: 后面 mor_wait_hit 靠"协奏涨了没有"判断
+        # 重击打没打中 —— 按住期间没有别的攻击, 所以涨的只可能是这一发
+        try:
+            self.mor_hold_con0 = float(mor.get_current_con())
+        except Exception:
+            self.mor_hold_con0 = None
+        self.task.mouse_down()
+        self.holding_attack = True
+        self.macro_mark(f'{tag}_down(con{self.mor_hold_con0 if self.mor_hold_con0 is None else round(self.mor_hold_con0, 2)})')
+        start = time.time()
+        full_streak = 0
+        empty_streak = 0
+        # 上一段是"点到亮"才出来的, 所以进来时条就是满的 —— 直接认, 免得读数抖一下
+        # 就要重新等它"再亮一次"
+        full_seen = bool(lit)
+        fired = False
+        why = 'CAP'
+        trace = []
+        last_sample = 0.0
+        try:
+            while self.time_elapsed_accounting_for_freeze(start) < cap:
+                self.task.next_frame()
+                now = time.time()
+                if stop_when is not None:
+                    try:
+                        if stop_when():
+                            fired, why = True, 'stop'
+                            break
+                    except Exception:
+                        pass
+                try:
+                    full = bool(mor.is_mouse_forte_full())
+                except Exception:
+                    full = False
+                if now - last_sample >= self.MOR_HOLD_SAMPLE:
+                    last_sample = now
+                    trace.append(f'{now - start:.1f}:{int(full)}')
+                # 【判据是"条从满掉到空"】。进这一段时条【已经是满的】(上一段就是
+                # 点到它亮才出来的), 所以这里其实只等它掉下去; full_seen 那一步是
+                # 兜"上一段跑满上限、条其实没亮"的情况, 免得一进来就假成立。
+                # 满和空都连着读到 MOR_FORTE_CONFIRM 帧才认 —— 清宵那边的假阳性
+                # 就是"亮去了抖、灭没去抖"造成的, 这里两边对称
+                if full:
+                    full_streak += 1
+                    empty_streak = 0
+                else:
+                    empty_streak += 1
+                    full_streak = 0
+                if full_streak >= self.MOR_FORTE_CONFIRM:
+                    full_seen = True
+                elif full_seen and empty_streak >= self.MOR_FORTE_CONFIRM:
+                    fired, why = True, 'forte'
+                    break
+                # 【读不到条的那一轮别按到上限】(用户 2026-08-22: "重击了应该马上接F,
+                # 没马上接又A了几下才接的")。
+                # 实机 morAirHeavy_up(CAP,3.04s): 空中读不到回路条(爱琳莫早就记过),
+                # 于是"先满再空"这个判据永远不成立, 一路按满 3 秒 —— 而重击早在
+                # 头一秒就出手了, 后面两秒纯粹是按着不放, 把后面的处决整个推迟。
+                # 判据读不到时就退化成【按固定时长】(跟改成读数判据之前的行为一样),
+                # 读得到的轮次不受影响
+                if not full_seen and \
+                        self.time_elapsed_accounting_for_freeze(start) >= self.MOR_HOLD_BLIND:
+                    why = 'blind'
+                    break
+                self.macro_wait(0.01)
+        finally:
+            self.release_attack()
+        self.macro_mark(f'{tag}_up({why},{time.time() - start:.2f}s)')
+        self.logger.info(f'{tag} forte trace: {" ".join(trace)}')
+        if not fired:
+            self.logger.warning(
+                f'{tag}: heavy never confirmed in {time.time() - start:.2f}s of holding '
+                f'(forte seen full={full_seen}) — 看上面那行 trace: '
+                f'条一直是 0 就是压根没充上去(被打断了?), 一直是 1 就是它没掉下来(判据要换)')
+        return fired
+
+    # ==================== 回路条 / 协奏 的等待 ====================
+
+    def wait_forte_full(self, char, tag='forte', cap=None, poke=True, interval=None):
+        """边打边等【回路条满】。到上限也往下走, 不把轴卡死。
+
+        用户 2026-08-21: "达尼娅要在变奏动画后A一下, 回路条满了再开R1"。
+
+        判据用 `is_forte_full()`(共鸣回路那条的白色占比), 不是 `is_mouse_forte_full()`
+        —— 后者是给【重击角色】用的找图判据(莫宁走那条)。日志里两路都采样,
+        读不到的那一轮能直接看出是判据挑错了还是条真没满。
+        【读数滞后动作约 0.7~0.8 秒】, 所以读到满的时候实际早就满了。
+        """
+        cap = self.FORTE_WAIT_CAP if cap is None else cap
+        interval = self.A_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        full = False
+        trace = []
+        last_sample = 0.0
+        next_click = 0.0
+        while self.time_elapsed_accounting_for_freeze(start) < cap:
+            self.task.next_frame()
+            try:
+                full = bool(char.is_forte_full())
+            except Exception:
+                full = False
+            now = time.time()
+            if now - last_sample >= self.FORTE_SAMPLE:
+                last_sample = now
+                try:
+                    mforte = bool(char.is_mouse_forte_full())
+                except Exception:
+                    mforte = False
+                trace.append(f'{now - start:.1f}:f={int(full)}mf={int(mforte)}')
+            if full:
+                break
+            if poke and now >= next_click:
+                self.click()
+                n += 1
+                next_click = now + interval
+        self.macro_mark(f'{tag}({"full" if full else "CAP"},A x{n},'
+                        f'{time.time() - start:.2f}s)')
+        if not full:
+            self.logger.info(f'{tag}: forte never read full in {cap:.1f}s ({n} clicks) '
+                             f'trace: {" ".join(trace)}')
+        return full
+
+    def mor_wait_hit(self, char, tag='morHit', delta=None, cap=None):
+        """等【协奏涨上去】= 上一发重击真的打中了, 然后才准放 R。
+
+        用户 2026-08-22: "莫宁强化重击还没等打到怪身上就放R了, 你要确保重击打到再放R"。
+
+        【为什么用协奏当判据】: 这条轴上唯一"必须打中才动"的读数就是它 ——
+        回路条是递出去就掉(打空也掉), 大招能量、动画时长都跟打没打中无关。
+        基线取在 mor_hold_heavy 按下鼠标那一刻(self.mor_hold_con0): 按住期间没有
+        别的攻击, 所以这中间涨的只可能是这一发重击。
+
+        【等的期间一下都不点】: 点了就是新的伤害源, 协奏照样涨 —— 那就等于自己
+        伪造了"打中了"的信号。这一段宁可空着。
+
+        【爱琳莫那边否掉过协奏判据, 但否的是另一种写法】: 那边是"单次采样当基线",
+        噪声 ±0.04 会在 E 之后 0.03 秒就误判。这里基线取自按下鼠标那一刻、
+        而且要求涨够 delta(远大于噪声), 不是同一回事。
+
+        【协奏本来就快满时它涨不动】—— 那种轮次直接退回定时(返回 False), 别干等。
+        """
+        delta = self.L_MOR_HIT_CON_DELTA if delta is None else delta
+        cap = self.L_MOR_HIT_CAP if cap is None else cap
+        base = self.mor_hold_con0
+        if base is None:
+            try:
+                base = float(char.get_current_con())
+            except Exception:
+                base = 0.0
+        if base >= self.CON_ENOUGH - delta:
+            # 快满了, 再打中也涨不出 delta —— 这种轮次判不了, 按定时走
+            self.macro_mark(f'{tag}(nofloor,base{base:.2f})')
+            return False
+        start = time.time()
+        con = base
+        hit = False
+        samples = []
+        while self.time_elapsed_accounting_for_freeze(start) < cap:
+            try:
+                con = float(char.get_current_con())
+            except Exception:
+                con = base
+            if len(samples) < self.CON_SAMPLE_MAX:
+                samples.append(f'{time.time() - start:.2f}:{con:.2f}')
+            if con >= base + delta:
+                hit = True
+                break
+            self.macro_wait(self.CON_POLL_INTERVAL)
+        self.macro_mark(f'{tag}({"hit" if hit else "CAP"},{base:.2f}->{con:.2f},'
+                        f'{time.time() - start:.2f}s)')
+        if not hit:
+            self.logger.info(f'{tag}: 协奏没涨够(+{delta:.2f}), 重击可能打空了 — '
+                             f'{" ".join(samples)}')
+        return hit
+
+    def attack_until_lib(self, char, window, tag='waitR', interval=None):
+        """边打边盯大招能量环, 【一亮就立刻返回】。
+
+        用户 2026-08-22: "达尼娅在循环轴里有次R亮了没及时按"。
+
+        大招重试的间隙原来是 macro_spam(固定窗口) —— 打满了才回去看一眼能量。
+        于是能量在这一段【刚打完第一下就攒够】的轮次, 要一直等到窗口跑完
+        (而这个窗口后来还跟着 E 的连发一起变长了)才发得出 R。
+        改成边打边看: 亮了当场退出去发 R, 没亮就把窗口打满 —— 打的这几下本来就是
+        在攒能量, 不是干等。
+
+        【读能量环不便宜】但比"白等一秒"便宜多了; 一轮点击一次读屏, 跟得上。
+        """
+        interval = self.A_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        lit = False
+        next_click = 0.0
+        while self.time_elapsed_accounting_for_freeze(start) < window:
+            now = time.time()
+            if now >= next_click:
+                self.click()
+                n += 1
+                next_click = now + interval
+            self.task.next_frame()
+            try:
+                if char.liberation_available():
+                    lit = True
+                    break
+            except Exception:
+                pass
+            self.macro_wait(0.01)
+        self.macro_mark(f'{tag}({"lit" if lit else "cap"},A x{n},'
+                        f'{time.time() - start:.2f}s)')
+        return lit
+
+    def wait_con_at_least(self, char, level, tag='con', cap=None, interval=None, poke=True):
+        """边打边等协奏圈涨到 level 以上(0~1)。到上限也往下走, 不把轴卡死。
+
+        跟 wait_con_for_intro 的区别: 那个是"等满(CON_ENOUGH=1.0)才交棒", 这个是
+        【等到某个门槛才做下一个动作】—— 用户 2026-08-21: "达尼娅有时候被打断,
+        能不能确保协奏圈超过75%才开R2Q切人"。
+
+        【为什么是门槛不是满】: R2 和 Q 自己还会把圈推上去一截, 所以起手时到 75%
+        就够她离场时是满的。等满再开 R2 反而是把这一截白等掉。
+
+        【读协奏不便宜】(能量环连通域分析), 所以轮询间隔别调太小。
+        【等的期间必须继续打】: 圈是靠打中涨的, 干站着等只会等到超时。
+        """
+        cap = self.CON_WAIT_TIME_OUT if cap is None else cap
+        interval = self.CON_POLL_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        con = 0.0
+        hit = False
+        samples = []
+        next_click = 0.0
+        while self.time_elapsed_accounting_for_freeze(start) < cap:
+            try:
+                con = float(char.get_current_con())
+            except Exception:
+                con = 0.0
+            if len(samples) < self.CON_SAMPLE_MAX:
+                samples.append(f'{time.time() - start:.2f}:{con:.2f}')
+            if con >= level:
+                hit = True
+                break
+            now = time.time()
+            if poke and now >= next_click:
+                self.click()
+                n += 1
+                next_click = now + self.A_INTERVAL
+            self.macro_wait(interval)
+        self.macro_mark(f'{tag}({con:.2f},{"ok" if hit else "CAP"},A x{n},'
+                        f'{time.time() - start:.2f}s)')
+        if not hit:
+            self.logger.info(f'{tag}: con only reached {con:.2f} (< {level:.2f}) in '
+                             f'{cap:.1f}s — {" ".join(samples)}')
+        return hit
+
+    def wait_hud_back(self, tag='anim', time_out=None, tail=0.0):
+        """等演出结束(队伍 HUD 回来), 【期间一下都不点】。
+
+        跟 poke_until_hud_back 的唯一差别就是不点普攻 —— 【角色在空中时必须用这个】:
+        那时候的点击会变成下落攻击, 一下就把她砸回地面, 后面整段空中戏就没了。
+
+        【"HUD 回来"要先确认它消失过】: 进来的这一刻画面可能还在渐变, 读一帧很可能
+        读回 True, 那就是"演出刚开头就判成结束"。
+        """
+        time_out = self.LIB_ANIM_TIME_OUT if time_out is None else time_out
+        start = time.time()
+        gone_seen = False
+        back = False
+        while time.time() - start < time_out:
+            self.task.next_frame()
+            if not self.task.in_team()[0]:
+                gone_seen = True
+            elif gone_seen or time.time() - start >= self.HUD_NO_ANIM_GRACE:
+                back = True
+                break
+            self.macro_wait(0.01)
+        self.add_freeze_duration(start, time.time() - start)
+        self.macro_mark(f'{tag}({"ok" if back else "timeout"},'
+                        f'{"anim" if gone_seen else "NOANIM"},{time.time() - start:.2f}s)')
+        self.macro_wait(tail)
+        return back
+
+    # ==================== 清宵: 攒资源 -> 变身重击 -> 仙身普攻 -> 终结重击 ==========
+
+    def qing_heavy(self, qing, tag='qingZ', wait_for=0.0):
+        """长按放一发重击。【标记灭了之后还要再按住一会儿】。
+
+        【不能直接用原版的 handle_heavy】: 它是"按住到标记消失就松手"。而清宵这两发
+        都是【长按蓄力】施放的 —— 标记在按下去那一刻就被消耗掉/熄灭了, 动作却还没
+        走完, 松早了那一发就没打出来。
+
+        实机 2026-08-22 那一轮的证据(用户: "第二段A完了但是最后强化重击没有打就R了"):
+            qingZ1(h1)@5.76  qingZ2(h1)@7.35  qingZ3(h2)@12.42
+            qingF_none@13.47  qingR_fired@13.54
+          - 同一发变身重击被记了两次(Z1/Z2 都是 h1): 第一次松太早、没放出来,
+            所以标记又亮回来了;
+          - 读到 h2 之后【1.05 秒就去按 R 了】: 天钧荡煞是个大收招, 真放出来不可能
+            这么快就轮到下一个动作 —— 那一发同样是松早了。
+
+        所以这里的松手条件是【标记消失之后再按住 S_QING_HEAVY_TAIL】, 另加一道
+        最短按住时长, 防止标记抖一帧就把蓄力掐掉。
+        """
+        found = None
+        try:
+            found = qing.heavy_available()
+        except Exception:
+            found = None
+        if not found and not wait_for:
+            return None
+        self.task.mouse_down()
+        self.holding_attack = True
+        start = time.time()
+        # 【预输入】: 标记还没亮就先按住, 等它亮(用户 2026-08-22: "强化E的同时就开始
+        # 预输入重击准备第二段")。按住的状态跨得过技能动画 —— 资源一满重击自己就出来,
+        # 比"等标记亮了再按下去"少一整个读屏 + 按键的往返
+        if not found and wait_for:
+            wait_end = time.time() + wait_for
+            while time.time() < wait_end:
+                self.task.next_frame()
+                try:
+                    found = qing.heavy_available()
+                except Exception:
+                    found = None
+                if found:
+                    break
+                self.macro_wait(0.01)
+            if not found:
+                self.release_attack()
+                self.macro_mark(f'{tag}(prehold_none,{time.time() - start:.2f}s)')
+                return None
+        name = getattr(found, 'name', found)
+        gone_at = None
+        try:
+            while self.time_elapsed_accounting_for_freeze(start) < self.S_QING_HEAVY_MAX:
+                self.task.next_frame()
+                try:
+                    still = bool(qing.heavy_available())
+                except Exception:
+                    still = False
+                now = time.time()
+                if still or now - start < self.S_QING_HEAVY_MIN:
+                    # 最短按住时长之内一律当"还亮着", 蓄力得先起来
+                    gone_at = None
+                elif gone_at is None:
+                    gone_at = now
+                elif now - gone_at >= self.S_QING_HEAVY_TAIL:
+                    break
+                self.macro_wait(0.01)
+        finally:
+            self.release_attack()
+        self.macro_mark(f'{tag}({name},{time.time() - start:.2f}s)')
+        return name
+
+    def qing_heavy_confirmed(self, qing, window=None):
+        """刚放的那一发重击到底出去了没有 —— 看标记【灭着并且保持灭着】。
+
+        放出去了资源就被消耗掉, 标记会灭; 被打断/蓄力没起来的话资源还在, 标记会
+        一直亮着(或者灭一下又亮回来)。所以这里盯一小段时间, 中间只要再亮起来就算没放出去。
+
+        用户 2026-08-22: "要保证两个强化重击的释放, 因为实战有时候会被打断,
+        不能靠时间来判断" —— 这就是那个"不靠时间"的判据。
+        """
+        window = self.S_QING_HEAVY_CONFIRM if window is None else window
+        end = time.time() + window
+        next_click = 0.0
+        while time.time() < end:
+            self.task.next_frame()
+            try:
+                if qing.heavy_available():
+                    return False
+            except Exception:
+                pass
+            # 【确认的这一小段照样在打】(用户 2026-08-22: "检测时间不能太慢") ——
+            # 不点的话这就是纯延迟; 点了它既是输出, 又在给下一发攒资源
+            now = time.time()
+            if now >= next_click:
+                self.click()
+                next_click = now + self.S_QING_A_INTERVAL
+            self.macro_wait(0.01)
+        return True
+
+    def qing_rotation(self, qing, tag='qing', f_before_e=False):
+        """清宵在场的这一整段, 按她真正的机制写(2026-08-22 查攻略才搞清楚)。
+
+        =============== 机制(攻略原文) ===============
+        - 常态下攒两条资源:
+            【琴心】<- 普攻第 1、4 段 / 共鸣技能 / 闪避反击
+            【剑韵】<- 普攻第 2、3 段 / 变奏入场 / 普攻第 2~3 段期间的共鸣技能
+        - 两条【同时充满】时: "长按普攻消耗耐力施放, 造成气动伤害, 同时消耗全部琴心
+          与剑韵, 进入曇体仙身状态" —— 这是第一发重击(重击·弦剑), 也是变身那一发。
+        - 进入仙身后: "透过仙身普攻与闪避反击累积【心剑意】"。
+        - 心剑意充满时: "长按普攻施放终结重击【天钧荡煞·曇体仙身】…消耗全部心剑意,
+          并退出曇体仙身状态" —— 这是第二发重击。
+
+        =============== 为什么前几版一直卡在第一发 ===============
+        我一直照用户那句"一直保持长按攻击"写成【从 E 之后一路按住不放】, 但攻略这句
+        是关键: 心剑意是靠【仙身普攻】攒的, 而【长按不是普攻】—— 按住只是在
+        "尝试放那一发还没攒好的终结重击"。所以在仙身里一直按住, 心剑意永远充不满,
+        第二发重击的标记(qingxiao_h2)自然一次都不会亮。
+        实机日志正是这样: 按住 14 秒, h1/h2/回路条【全程读 0】; 另一轮 h1 亮了
+        (那是【第一发】的标记), 我却把它当成第二发, 于是第一发一放完就去 Q 切人了。
+        用户 2026-08-22: "清霄这个问题还是的啊 要不你查一下攻略看看介绍"。
+
+        =============== 所以正确的形状是【点 -> 长按 -> 点 -> 长按】 ===============
+        两发重击【都要先点普攻把对应的资源打满】, 长按只负责"把已经攒好的那一发放出去"。
+        这正好也是轴上写的 "aaa aa ez aaaaz":
+            aaa aa  = 攒琴心+剑韵      e = 强化E(也给琴心/剑韵)
+            z       = 长按 -> 重击·弦剑 -> 变身
+            aaaa    = 【仙身普攻】攒心剑意   <- 这四下是要【点】出来的, 不是按住
+            z       = 长按 -> 天钧荡煞 -> 退出仙身
+        而原版 Qingxiao.do_perform 本来就是这个形状(标记亮就 handle_heavy, 否则
+        cast_enhanced_resonance, 再否则 click), 读到 h2 之后接大招 —— 跟轴上
+        "z 处决 r" 完全对得上。这里等于把原版那个循环拿过来, 加上处决/日志/上限。
+
+        Returns: (放出去几发重击, 最后一发是不是 h2)
+        """
+        start = time.time()
+        heavies = 0
+        aborted = 0
+        labels = []
+        clicks = 0
+        e_sent = 0
+        e_conf = 0.0
+        last_e = 0.0
+        last_heavy = 0.0
+        f_done = False
+        h2_done = False
+        trace = []
+        last_sample = 0.0
+        while self.time_elapsed_accounting_for_freeze(start) < self.S_QING_ROTATION_MAX:
+            self.task.next_frame()
+            now = time.time()
+            if now - last_sample >= self.S_QING_SAMPLE:
+                last_sample = now
+                try:
+                    h1 = 1 if self.task.find_one(Labels.qingxiao_h1,
+                                                 threshold=self.QING_H2_THRESHOLD) else 0
+                except Exception:
+                    h1 = 0
+                try:
+                    h2 = 1 if self.task.find_one(Labels.qingxiao_h2,
+                                                 threshold=self.QING_H2_THRESHOLD) else 0
+                except Exception:
+                    h2 = 0
+                trace.append(f'{now - start:.1f}:h1={h1}h2={h2}')
+            # ---- 1 重击标记亮了 = 那一发已经攒好, 长按把它放出去 ----
+            heavy = None
+            if now - last_heavy >= self.S_QING_HEAVY_RETRY_GAP:
+                try:
+                    heavy = qing.heavy_available()
+                except Exception:
+                    heavy = None
+            if heavy:
+                last_heavy = time.time()
+                label = self.qing_heavy(qing, tag=f'{tag}Z{heavies + 1}')
+                # 【终结重击一松手就开始盲发 F】(用户 2026-08-22: "第二个重击放动画的
+                # 时候就开始F…确保动画结束第一时间接F再接R")。放在确认之前 ——
+                # 确认那 0.3 秒本身就是演出的一部分, 等它跑完再发 F 就已经晚了
+                if label == Labels.qingxiao_h2:
+                    # 【盲发的同时盯提示, 没处决就早走】(用户 2026-08-22: "有处决你
+                    # 放处决了, 当然处决没事, 但是有一次没处决你也慢了好久才放R")
+                    got = self.f_break_window(
+                        self.S_QING_F_SPAM, giveup=self.S_QING_F_GIVEUP,
+                        tag=f'{tag}F', check_every=1,
+                        interval=self.S_QING_F_INTERVAL)
+                    # 【启动轴: 没识别到就补一下 A 再看一眼】(用户 2026-08-22:
+                    # "启动轴清霄H2 F R 中间有可能F没识别到, 如果没有识别到可以稍微
+                    # 在H2后继续A1一下看看能不能识别, 还是识别不到就接着R")。
+                    # 【为什么补 A 有用】: 提示是在伤害结算那一刻才亮的, 而终结重击
+                    # 松手到出伤之间还有一段 —— 补一下 A 等于把这一段用起来,
+                    # 顺便再给提示一次出现的机会。
+                    #
+                    # 【2026-08-22 又改回跟循环轴一致】(用户: "清霄启动轴最后H2 F R
+                    # 能不能参考下循环轴的逻辑") —— 默认关掉这一步, 两条轴现在
+                    # 走的是同一条快路: 查一次(约 0.05 秒), 没有就直接接 R。
+                    # 【要恢复就把 S_QING_OPENER_F_RETRY 改回 True】, 那一版的行为
+                    # 是"没识别到 -> 补一段 A -> 再查一次"
+                    if (not got and not f_before_e
+                            and self.S_QING_OPENER_F_RETRY):
+                        self.spam_segments(self.SEG_QING, 1, tag=f'{tag}FA')
+                        self.f_break_window(
+                            self.S_QING_F_SPAM, giveup=self.S_QING_F_GIVEUP,
+                            tag=f'{tag}F2', check_every=1,
+                            interval=self.S_QING_F_INTERVAL)
+                # 【放完要确认它真的出去了】(用户 2026-08-22: "要保证两个强化重击的
+                # 释放, 因为实战有时候会被打断, 不能靠时间来判断")。
+                # 判据: 放出去了资源就被消耗掉, 标记应该【灭着并且保持灭着】;
+                # 还亮着 = 这一发被打断了/没起来 —— 那就【不计数】, 回去接着打普攻,
+                # 隔 S_QING_HEAVY_RETRY_GAP 再试一次, 直到它真的放出去。
+                #
+                # 【h2 不做这个确认】(用户 2026-08-22: "第二段重击释放后接R能不能
+                # 再快0.2s") —— 那 0.20 秒正好夹在终结重击和 R 之间。
+                # 【h2 不确认也是安全的】: qing_heavy 已经在标记灭掉之后又按住了
+                # S_QING_HEAVY_TAIL(0.5秒), 蓄力必然走完了; 万一真没出去,
+                # 外面 seg_qingxiao 那层还会整段重跑一遍(S_QING_ROTATION_TRIES)。
+                # h1 保留确认 —— 它没出去的话后面整段都是错的, 那 0.2 秒省不得
+                if (label and label != Labels.qingxiao_h2
+                        and not self.qing_heavy_confirmed(qing)):
+                    aborted += 1
+                    self.macro_mark(f'{tag}Zabort{aborted}')
+                    self.logger.info(f'{tag}: 重击({label})按了但标记还亮着 —— '
+                                     f'多半被打断了, 不计数, 接着打再试')
+                    label = None
+                if label:
+                    heavies += 1
+                    labels.append(f'{label}@{time.time() - start:.2f}')
+                    if label == Labels.qingxiao_h2:
+                        h2_done = True
+                        break        # 终结重击放完了, 这一段就结束
+                continue
+            # ---- 2 强化E 亮了就放 ----
+            # 【只在标记亮着时按】: 没亮时按下去出来的是普通 E, 白烧一个 CD。
+            # 匹配度记进日志 —— 用户问过"你确定按的是高亮的强化E吗"
+            try:
+                hit = self.task.find_one(Labels.qingxiao_e, threshold=self.QING_E_THRESHOLD)
+            except Exception:
+                hit = None
+            if hit and now - last_e >= self.S_QING_E_MIN_GAP:
+                e_conf = float(getattr(hit, 'confidence', 0) or 0)
+                # 【循环轴: 看到强化E亮就先把处决打掉, 处决完成才按 E】
+                # (用户 2026-08-22: "循环轴里清霄是看到强化E亮起就一直按F处决,
+                #  处决完成才按强化E")。轴上写的 "aa 处决 ez" 就是这个顺序 ——
+                # 强化E 亮起是这一格的【触发信号】, 不是"到点了就按 F"
+                if f_before_e and not f_done:
+                    f_done = True
+                    # 【处决这一段一下都不能点】(用户 2026-08-22: "循环轴F的时候
+                    # 就可以不用A了, 因为清霄这个强化E很敏感, 一旦多A了一下可能就没了")。
+                    # 所以这里【只盲发 F】, 不走 f_break_persist —— 那个每轮都 click(),
+                    # 而框架的 f_break() 内部也是 F 和左键交替发的, 两个都会多打出普攻
+                    self.spam_f(self.S_QING_F1_SPAM, tag=f'{tag}F1spam')
+                # 【一直重发到强化E的标记灭掉】(用户 2026-08-22: "放处决的时候就开始
+                # 一直尝试放E就好了嘛")。
+                # 【判据不能用 CD】: 实机 qingE1(NOCD,x12) —— 发了 12 次
+                # get_cd('resonance') 一直是 0, 也就是【强化E 不进普通 CD】(它是消耗
+                # 资源的特殊形态, 不是一个有 CD 的技能)。拿 CD 当判据的结果是狂发十几次,
+                # 而用户明说这一发"很敏感, 多按一下可能就没了"。
+                # 【正确的判据是标记本身】: qingxiao_e 灭掉 = 这一发被消耗掉了 = 放出去了
+                e_end = time.time() + self.S_QING_E_FIRE_TIME_OUT
+                n_e = 0
+                fired_e = False
+                while time.time() < e_end:
+                    qing.send_resonance_key()
+                    n_e += 1
+                    self.macro_wait(self.S_QING_E_RESEND)
+                    self.task.next_frame()
+                    try:
+                        if not qing.enhanced_resonance_available():
+                            fired_e = True
+                            break
+                    except Exception:
+                        pass
+                qing.record_resonance_use()
+                e_sent += 1
+                last_e = time.time()
+                self.macro_mark(f'{tag}E{e_sent}({"ok" if fired_e else "STILLLIT"},'
+                                f'x{n_e},conf{e_conf:.2f},@{now - start:.2f})')
+                # 【按 E 的同时就按住普攻预输入重击】(用户 2026-08-22: "强化E的同时
+                # 就开始预输入重击准备第二段")。资源一满重击自己就出来, 比"等标记亮了
+                # 再按下去"少一整个读屏 + 按键的往返。等不到就松手, 回去接着点
+                pre = self.qing_heavy(qing, tag=f'{tag}Zpre',
+                                      wait_for=self.S_QING_E_PREHOLD)
+                if pre and self.qing_heavy_confirmed(qing):
+                    heavies += 1
+                    labels.append(f'{pre}@{time.time() - start:.2f}(pre)')
+                    last_heavy = time.time()
+                    if pre == Labels.qingxiao_h2:
+                        self.f_break_window(self.S_QING_F_SPAM,
+                                            giveup=self.S_QING_F_GIVEUP, tag=f'{tag}F')
+                        h2_done = True
+                        break
+                continue
+            # ---- 3 否则就是普攻 —— 常态攒琴心/剑韵, 仙身里攒心剑意 ----
+            self.click()
+            clicks += 1
+            self.macro_wait(self.S_QING_A_INTERVAL)
+        self.macro_mark(f'{tag}Rot(Z x{heavies}{"+h2" if h2_done else ""},'
+                        f'abort{aborted},E x{e_sent},A x{clicks},'
+                        f'{time.time() - start:.2f}s)')
+        self.logger.info(f'{tag} rotation: heavies={labels or "none"} '
+                         f'aborted={aborted} trace: {" ".join(trace)}')
+        if not h2_done:
+            # 【走到这里说明吃满了上限】—— 那个上限是【兜底, 不是判据】。
+            # 正常退出的唯一条件是"终结重击确认放出去了"
+            self.logger.warning(
+                f'{tag}: 终结重击(h2)没放出来 —— 打了 {heavies} 发重击(另有 {aborted} 发'
+                f'按了没出去)、{clicks} 下普攻、{e_sent} 次E, {time.time() - start:.2f}s '
+                f'跑满了 S_QING_ROTATION_MAX。'
+                f'trace 里 h1/h2 全 0 = 资源没攒满(点得不够/被打断); '
+                f'只有 h1 亮过 = 变身进去了但心剑意没满; '
+                f'abort 不为 0 = 重击一直被打断, 那是战斗环境问题不是时序问题')
+        return heavies, h2_done
+
+    # ==================== 启动轴 ====================
+
+    def perform_opener(self, entry_char=None):
+        """启动轴。正常由清霄的 do_perform 调进来(轴的第一个动作是她的 R)。
+
+        Args:
+            entry_char: 调用方自己 —— 【框架就是因为他在场才调的 do_perform】,
+                所以这是"现在场上是谁"最便宜也最可靠的答案。
+                【不要让它去读屏判断】: in_team() 在战斗开局的头 0.8 秒会说谎
+                (HUD 还在渐入, 三个槽位的文本不是同时出现的)。
+        """
+        qing = self.teammate('Qingxiao')
+        mor = self.teammate('Mornye')
+        if qing is None or mor is None:
+            return False
+
+        # 整段关掉脱战判定: 高频切人时 HUD 反复消失(大招演出), 战斗判定线程一误报
+        # 就抛 NotInCombatException, 宏从中间断掉比打歪严重得多
+        previous = getattr(self.task, 'skip_combat_check', False)
+        self.task.skip_combat_check = True
+        self.cur = entry_char or self.on_field_char() or self
+        self.poking = False
+        raw_in_team, raw_index, raw_count = self.task.in_team()
+        flags = ' '.join(f'{c.name}{"*" if c.is_current_char else ""}'
+                         for c in self.task.chars if c is not None)
+        self.logger.info(
+            f'qing opener entry: {self.cur.name} '
+            f'({"passed in by caller" if entry_char else "read off screen"}) | '
+            f'in_team={raw_in_team} index={raw_index} count={raw_count} | flags: {flags}')
+        try:
+            self.macro_start()
+            # 【处决全程由宏自己按】: 留着框架的自动 F 会在切人时插一发,
+            # 而击破动画带全局时停 + HUD 消失, 正好把切人循环判成脱战
+            self.check_f_on_switch = False
+            qing.check_f_on_switch = False
+            mor.check_f_on_switch = False
+
+            self.opener_seg1(qing, mor)
+            marks = len(self.macro_marks)
+            self.logger.info(f'opener SEG1 timeline: {self.macro_timeline()}')
+
+            self.seg_denia(qing, first_e=False)
+            self.logger.info(f'opener DENIA timeline: {self.macro_timeline(marks)}')
+            marks = len(self.macro_marks)
+
+            self.seg_qingxiao(qing, mor, f_early=False)
+            self.logger.info(f'opener QING timeline: {self.macro_timeline(marks)}')
+            self.logger.info(
+                f'opener total {self.time_elapsed_accounting_for_freeze(self.macro_t0):.2f}s '
+                f'(wall {time.time() - self.macro_t0:.2f}s)')
+
+            if self.CHAIN_LOOP_AFTER_OPENER:
+                # 见 CHAIN_LOOP_AFTER_OPENER: 省掉"还给框架再回来"的约 0.7 秒
+                self.logger.info('chaining straight into the loop')
+                self.run_loop_body(qing, mor)
+        finally:
+            # 长按跨了好几个方法, 中途抛异常的话鼠标会一直按着, 下一个角色上场就是
+            # 一直按住普攻。这里是唯一保证松手的地方
+            self.release_attack()
+            self.poking = False
+            self.task.skip_combat_check = previous
+        return True
+
+    def opener_seg1(self, qing, mor):
+        """清 R+A -> 达 E -> 莫 A123+重击+R+A123+E+重击+处决+Q -> 变奏达。"""
+        # ---- 1 清霄 R + A ----
+        # 【开局在场的不一定是清霄】: 战斗开始时框架不选人, 场上是探索时用的那个人。
+        # 正常路径靠 Qingxiao.get_switch_priority 返回 MUST 把她摆上来, 但两条路都要能走
+        if self.cur is not qing:
+            self.quick_switch(qing)
+        # 【从这里开始持续普攻】—— 轴上没写"停"的地方就一直点
+        self.poking = True
+        self.fire_lib(qing, tag='qingR')
+        self.poke_until_hud_back(tag='qingRanim', tail=self.O_QING_R_TAIL)
+        # R 之后那一下【就是】A1(大招把连段清了), 一段
+        self.spam_segments(self.SEG_QING, 1, tag='qingA1')
+
+        # ---- 2 达尼娅 E ----
+        # 这一格只是【把她的 E 提前放掉让充能早点转】。
+        # 【必须等 E 真的放出来再走】(用户 2026-08-21: "达要放个E再切莫宁"):
+        # 原来是发两下就切, 实机她在场上只待了 0.19 秒, E 全被入场动画吞了
+        self.quick_switch(self, click_during=True)
+        # 【到场之后停点】: 这一格只有一个技能键, 点击会把连段推起来, 反而让 E 更晚
+        self.poking = False
+        self.resend_until_fired(self, 'resonance', self.get_resonance_key(),
+                                time_out=self.O_DEN_E_FIRE_TIME_OUT, tag='denE')
+        self.macro_wait(self.O_DEN_E_TO_SWITCH)
+
+        # ---- 3 莫宁 长按 -> 升天重击(自动出手) -> 起飞 -> R ----
+        # 【一按到底, 不点】(用户 2026-08-21: "你E放了以后直接长按攻击键就行,
+        # 他能放强化重击会自动放, 你不要连续点按攻击了")。
+        # 按住期间她自己打普攻充回路条, 条一满升天重击就自动出手 —— 出手时机由游戏
+        # 决定, 我们不用去猜、也不用读那个滞后 0.7~0.8 秒的条来决定"什么时候按下去"
+        self.quick_switch(mor, click_during=True)
+        self.poking = False
+        # 【没起飞就再来一次, 别直接往下放 R】(用户 2026-08-21: "莫宁如果在地面上
+        # 被打断过就不会重击升天了直接放R了")。
+        # 被怪打断的那一轮: 条被打断没充满 / 长按被硬直吃掉 -> 打出来是普通重击 ->
+        # 人还在地上 -> 而原来的代码不管起没起飞都接着 fire_lib, 于是那一发 R
+        # 变成了地面大招, 后面整段空中戏(空中A123 + E + 强化重击)全部落空
+        airborne = False
+        for attempt in range(1, self.O_MOR_RISE_TRIES + 1):
+            # 【人上天了就不用再等条的读数】(stop_when): 读数滞后, 不然每轮都要白按满上限
+            self.mor_hold_heavy(mor, tag=f'morRise{attempt}', stop_when=mor.on_air)
+            # 【真起飞了没有: 用原版自己的判据】(Mornye.on_air -> has_long_action2)。
+            # 起飞了走空中那条线, 没起飞走地面兜底 —— 两条线的点击规则完全相反,
+            # 猜错的代价是整段作废, 所以这里花一次读屏把它读准
+            airborne = bool(self.task.wait_until(mor.on_air,
+                                                 time_out=self.O_MOR_RISE_CONFIRM))
+            self.macro_mark(f'morAir{attempt}({1 if airborne else 0})')
+            if airborne:
+                break
+            if attempt < self.O_MOR_RISE_TRIES:
+                self.logger.warning(
+                    f'mornye still on the ground after rise attempt {attempt} '
+                    f'(被打断了?), refilling the forte and trying again')
+        self.macro_wait(self.O_MOR_HEAVY_TO_R)
+        # 【重击的收招会吞掉单发的 R】: fire_lib 本来就是连发到演出开始为止,
+        # 所以不用等重击演完 —— 早发的那几下被丢掉, 不花钱
+        self.fire_lib(mor, tag='morR')
+
+        # ---- 4 空中 A123 + E + 强化重击 (没起飞就走地面兜底) ----
+        if airborne:
+            # 【空中演出期间一下都不能点】: 点击会变成下落攻击, 一下就把她砸回地面
+            self.wait_hud_back(tag='morRanim', tail=self.O_MOR_R_TAIL)
+            # 【不封点击次数】: 见 O_MOR_AIR_A_WINDOW —— 封了的话 0.40 秒就退出,
+            # 三下全落在 R 的收招里, A3 永远到不了
+            self.macro_spam(self.O_MOR_AIR_A_WINDOW, self.A_INTERVAL, tag='morAirA123')
+            self.macro_wait(self.O_MOR_AIR_A_TO_E)
+            self.spam_key(mor.send_resonance_key, self.O_MOR_E_WINDOW,
+                          tag='morAirE', poke=False)
+            mor.record_resonance_use()
+            self.macro_wait(self.O_MOR_E_TO_HEAVY)
+            # 【空中这一发也要确认放出去了才往下走】(用户 2026-08-22: "启动轴莫宁在
+            # 空中因为被打断次数过多没放强化重击, 就F处决切人了, 一定要确保强化重击
+            # 放了再F")。
+            # 原来这里是 macro_hold_attack 按固定 0.75 秒的【盲打】—— 被打断的那一轮
+            # 什么都没发生, 而代码照样往下走去按 F、Q、切人。
+            # 改成跟地面那两发同一套 mor_hold_heavy: 条没亮就接着点(空中的点击就是
+            # 空中普攻, 本来就是拿来充条的), 亮了立刻按住, 按住到条掉下去才算数。
+            # 【读不到条的那一轮会退化成盲打】(fill 跑满上限 -> 按 fallback 时长),
+            # 行为跟改之前一样, 不会更差; 日志里 morAirHeavyFill(CAP,...) 就是那一轮
+            # 【没打出来就再来一次, 别提前去处决】(用户 2026-08-22: "启动轴莫宁
+            # 因为E空了又没等到强化重击, 提前处决走人了")。
+            # 【只在"条压根没亮"的时候重试】: 那说明资源没到(E 打空了之类), 重试
+            # 就是接着打把条充上去。如果是"读不到条"(空中那种), 重试也读不到,
+            # 只会白按 —— 那种 mor_fill_lit 也是 False, 所以这里还看一眼上一次
+            # 是不是已经按满了 blind, 是的话就认了
+            for attempt in range(1, self.O_MOR_AIR_HEAVY_TRIES + 1):
+                if self.mor_hold_heavy(mor, tag='morAirHeavy' if attempt == 1
+                                       else f'morAirHeavyR{attempt}',
+                                       cap=self.O_MOR_AIR_HEAVY_CAP):
+                    break
+                if not self.mor_fill_lit and attempt < self.O_MOR_AIR_HEAVY_TRIES:
+                    self.logger.warning(f'mornye: 空中强化重击第 {attempt} 次没出来'
+                                        f'(条一直没亮, E 打空了?), 接着打再来一次')
+                    continue
+                break
+        else:
+            self.logger.warning('mornye did not take off (forte was interrupted?), '
+                                'falling back to the ground line')
+            self.poke_until_hud_back(tag='morRanim', tail=self.O_MOR_R_TAIL)
+            # 地面这一发也是【一按到底 + E 插在中间】, 不点
+            self.mor_hold_heavy(mor, tag='morHeavy2', e_after=self.O_MOR_HOLD_TO_E)
+
+        # ---- 5 (等协奏满) -> 处决 -> Q + 切人 ----
+        self.macro_wait(self.O_MOR_AFTER_HEAVY)
+        self.mor_finish(mor)
+
+    # ==================== 达尼娅段(启动/循环共用) ====================
+
+    def seg_denia(self, qing, first_e):
+        """[已变奏入场] A1 [+E(循环)] + R1 + A1A2 + 跳 + 空中A1A2 + EE + R2 + Q -> 切清霄。
+
+        Args:
+            first_e: 循环轴的这一格是 "A E R1"; 启动轴是 "A R1" —— 那边的 E
+                在开局就单独放过了(见 opener_seg1 第 2 格)。
+        """
+        self.poking = True
+        # 【先把变奏入场动画点掉, 那一下 A 要落在动画之后】(用户 2026-08-21:
+        # "达尼娅要在变奏动画后A一下")。入场动画期间的点击是被丢掉的、不排队,
+        # 所以这一段照点不误, 只是它打不出连段 —— 分成两句是为了 denA1 那个窗口
+        # 量的是"A 递出去", 而不是"动画 + A"
+        self.macro_spam(self.S_DEN_INTRO_ANIM, self.A_INTERVAL, tag='denIntroAnim')
+        self.spam_segments(self.SEG_DEN, 1, tag='denA1', lead=self.S_DEN_A1_LEAD)
+        # 【回路条那道门要在 E 之前过掉】(2026-08-22 调整)。
+        # 用户给的循环轴链条是: "变奏后A, 等A出手, 按E等0.1s按R1防止E被吞" ——
+        # E 和 R1 之间只能隔那 0.1 秒, 中间【不能再插一次读屏】。
+        # 门原来夹在 E 和 R1 中间, 读得到时白花一帧、读不到时能拖满 1 秒,
+        # 那 0.1 秒的讲究就全没了。挪到 E 前面, 两个要求都保住
+        self.poking = True
+        self.wait_forte_full(self, tag='denForte', cap=self.S_DEN_FORTE_CAP)
+        if first_e:
+            self.poking = False
+            self.spam_key(self.send_resonance_key, self.S_DEN_E_WINDOW,
+                          tag='denE', poke=False)
+            self.record_resonance_use()
+            # 【E 之后等 0.1 秒再发 R1, 防止 E 被 R 的抬手吞掉】——
+            # 爱达千那条轴上验过的同一个形状
+            self.macro_wait(self.S_DEN_E_TO_R)
+        # 【回路条满了才开 R1】(用户 2026-08-21: "回路条满了再开R1")。
+        # 【R1 期间继续持续普攻】: 演出期间的点击被丢掉, 但演出一结束就有一下
+        # 落进去, A1 立刻接上
+        self.poking = True
+        if self.fire_lib(self, tag='denR1'):
+            self.note_lib1()
+        self.poke_until_hud_back(tag='denR1anim', tail=self.S_DEN_R1_TAIL)
+
+        # ---- A1A2 -> 跳 -> 空中A1A2 ----
+        # 【地面这一格不封点击次数】: 封了的话 macro_spam 在 0.12 秒就退出, 两下全被
+        # R1 的收招吞掉, 表现就是"A12没打出来就跳了"。见 S_DEN_A12_WINDOW 的说明
+        self.poking = False
+        self.macro_spam(self.S_DEN_A12_WINDOW, self.A_INTERVAL, tag='denA12')
+        self.task.jump()
+        self.macro_mark('denJump')
+        self.macro_wait(self.S_DEN_JUMP_SETTLE)
+        # 【空中这一格保留封顶, 但把两下铺开】: 贴着发的话跟地面那一格是同一个毛病 ——
+        # 0.12 秒里发完, 全被起跳过程吞掉。间隔 = 窗口 / 下数
+        self.macro_spam(self.S_DEN_AIR_A_WINDOW,
+                        self.S_DEN_AIR_A_WINDOW / max(self.S_DEN_AIR_A_MAX_CLICKS, 1),
+                        tag='denAirA12', max_clicks=self.S_DEN_AIR_A_MAX_CLICKS)
+
+        # ---- EE -> R2 -> Q ----
+        # 【连发一整个窗口, 不再按次数发】: 见 S_DEN_EE_WINDOW 的说明
+        self.spam_key(self.send_resonance_key, self.S_DEN_EE_WINDOW, tag='denEE',
+                      interval=self.S_DEN_EE_INTERVAL, poke=False)
+        self.record_resonance_use()
+        self.macro_wait(self.S_DEN_EE_TO_R)
+        # 【协奏圈没到门槛就先接着打】(用户 2026-08-21: "达尼娅有时候被打断,
+        # 能不能确保协奏圈超过75%才开R2Q切人")。R2 和 Q 自己还会把圈推上去一截,
+        # 所以起手到 75% 就够她离场时是满的 —— 这一格保的是【下一个人的变奏入场】。
+        # 到上限也照样往下走, 不把轴卡死
+        self.wait_con_at_least(self, self.S_DEN_R2_CON_MIN, tag='denCon',
+                               cap=self.S_DEN_R2_CON_CAP)
+        # 【R2 必须真的放出去了才往下走】(用户 2026-08-21: "达尼娅要确保R2放了
+        # 再Q切清霄")。实机 denR2_NOFIRE(x25) 出现过好几轮 —— 原来那一版不管放没放
+        # 都接着 Q + 切人, 于是这一轮的收尾大招整个丢了。
+        # 【重试之间要接着打, 不能干等】: 没放出来最常见的两个原因是"大招能量还差一点"
+        # 和"键被上一个动作的动画吞了", 打几下对两者都有帮助(攒能量 + 让动画走完)
+        # 【R2 能量不够就接着打, 有 E 就放 E】(用户 2026-08-22: "有时候达尼娅EE打完
+        # R能量不够, 那么就继续A有E放E")。大招是能量门控, 而能量靠打和放技能攒 ——
+        # 所以重试的间隙【必须在输出】, 干等一秒攒不到任何东西。
+        # 【退出这个循环的条件是"R2 真的放出去了", 不是次数】: 上限只是兜底
+        fired = False
+        attempt = 0
+        retry_start = time.time()
+        while self.time_elapsed_accounting_for_freeze(retry_start) < self.S_DEN_R2_CAP:
+            # 【先看大招亮没亮, 亮了才发】(2026-08-22 实机: denR2_NOFIRE(x25) ->
+            # denR2r2_NOFIRE(x24) -> denR2r3_NOFIRE(x24), 三次尝试【每次都白按 25 下 R、
+            # 白花 1.2 秒】—— 6 秒的兜底时间有 3.6 秒是在对着没能量的大招按键,
+            # 真正用来攒能量的只剩两秒多。
+            # 大招是【能量门控】: liberation_available() 读的就是能量环亮没亮,
+            # 亮了再发, 省下来的时间全给"接着打攒能量")
+            ready = attempt == 0
+            if not ready:
+                try:
+                    ready = bool(self.liberation_available())
+                except Exception:
+                    ready = True      # 读不到就照发, 别因为读屏失败把大招丢了
+            if ready:
+                attempt += 1
+                if self.fire_lib(self, tag='denR2' if attempt == 1 else f'denR2r{attempt}'):
+                    fired = True
+                    break
+                self.logger.info(f'denia R2 did not fire (try {attempt}), '
+                                 f'attacking + using E, then retrying')
+            # 没能量: 接着打 + E 好了就放 —— 两个都攒能量, 干等攒不到。
+            # 【E 只补一小段就走】: 这一格的 E 是拿来攒能量的, 不像正轴上那发 EE
+            # 需要铺开一整个窗口; 铺太长的话能量攒够了也发现不了(用户 2026-08-22:
+            # "达尼娅在循环轴里有次R亮了没及时按")
+            if self.resonance_available():
+                self.spam_key(self.send_resonance_key, self.S_DEN_R2_RETRY_E,
+                              interval=self.S_DEN_EE_INTERVAL,
+                              tag=f'denR2retryE{attempt}', poke=False)
+                self.record_resonance_use()
+            # 【边打边盯能量环, 亮了就立刻退出去发 R】—— 原来是打满固定窗口才回去
+            # 看一眼, 中间亮起来的那一秒多就白等了
+            self.attack_until_lib(self, self.S_DEN_R2_RETRY_A,
+                                  tag=f'denR2waitR{attempt}')
+        if fired:
+            self.note_lib2()
+        else:
+            self.logger.warning(
+                f'denia R2 never fired in {self.S_DEN_R2_CAP:.1f}s ({attempt} tries) — '
+                f'这一轮的收尾大招丢了; 先看 denCon 那行(协奏够不够)和 fire_lib 记的 '
+                f'icon lit=(能量够不够), 两个都够就是被动画吞了')
+        # 【R2 的演出期间不碰 Q】: Q 要当离场前的【最后一个动作】, 见 S_DEN_Q_WINDOW
+        self.poke_until_hud_back(tag='denR2anim', tail=self.S_DEN_R2_TAIL)
+        self.send_echo_now(self, tag='denQ',
+                           presses=self.S_DEN_Q_PRESSES, window=self.S_DEN_Q_WINDOW)
+        self.macro_wait(self.S_DEN_Q_TO_SWITCH)
+
+        # ---- 切清霄 ----
+        # 【走之前要确认两件事】(用户 2026-08-22: "一定要确保两件事, R放了和协奏值
+        # 满了才切清霄"): R2 上面那个循环保了, 协奏这道门在这里。
+        # 【等的期间继续打】—— 圈靠打中涨, 干等涨不了; 一满就返回, 所以圈本来就满的
+        # 轮次这一步几乎不花时间。到上限也往下走, 不把轴卡死
+        self.poking = True
+        if not self.wait_con_for_intro(self, 'qingxiao', poke=True,
+                                       time_out=self.S_DEN_OUT_CON_WAIT,
+                                       stall_give_up=self.S_DEN_OUT_CON_STALL):
+            self.logger.warning('denia: con not full on leaving — 清宵没有变奏入场, '
+                                '她那一段开头的剑韵也会少一份')
+        self.quick_switch(qing, read_con=True, click_during=True,
+                          time_out=self.SWITCH_THROUGH_LIB_TIME_OUT)
+
+    # ==================== 清霄段(启动/循环共用) ====================
+
+    def seg_qingxiao(self, qing, mor, f_early):
+        """变奏进场 -> 持续普攻到【强化E亮】-> E + 长按 -> 强化重击 -> 变身形态
+        -> 保持长按到能量打完、自动放出变身的强化重击 -> 处决 -> R -> A -> Q -> 变奏莫。
+
+        【轴上那两串 A 都不是"点几下"点出来的】(用户 2026-08-21):
+          "aaa aa" = 打到强化E亮为止(打几段取决于条涨多快);
+          "aaaa"   = 变身形态里【长按】自己打出来的, 我们一下都不点。
+        所以这一段里没有 spam_segments —— 段数模型在这里是错的。
+
+        Args:
+            f_early: 循环轴的文字轴把处决写在【强化E 之前】。
+                【它的触发信号是"强化E 亮起", 不是"到点了"】(用户 2026-08-22:
+                "循环轴里清霄是看到强化E亮起就一直按F处决, 处决完成才按强化E") ——
+                所以这一次处决在 qing_rotation 里面做, 不在这儿。
+                变身重击之后那次处决两条轴都有, 在 rotation 里紧跟着 h2 发。
+        """
+        self.poking = True
+        # 攒资源 -> 变身重击 -> 仙身普攻 -> 终结重击, 全在这一个方法里。
+        # 循环轴多一条: 强化E 一亮先把处决打掉, 打完才按 E
+        #
+        # 【终结重击没打出来就【整段再来一遍】, 不要直接往下放 R 切人】
+        # (用户 2026-08-22: "清霄启动轴那里也是, 被打断太多, 第二段强化重击没打、
+        #  R没放就切人了")。
+        # 被怪打断得厉害的那一轮, 一遍 25 秒可能都凑不齐资源 —— 但"凑不齐"和
+        # "该放弃了"是两回事: 重跑一遍等于接着攒, 而不是从头再攒一次
+        # (琴心/剑韵/心剑意都不会因为函数返回就清掉)。
+        # 第二遍还不行才认了 —— 那多半不是时序问题, 是这一场根本站不住
+        for rot in range(1, self.S_QING_ROTATION_TRIES + 1):
+            _, h2_done = self.qing_rotation(qing, f_before_e=f_early and rot == 1)
+            if h2_done:
+                break
+            if rot < self.S_QING_ROTATION_TRIES:
+                self.logger.warning(f'qing: 终结重击第 {rot} 遍没打出来, 整段重跑一遍 '
+                                    f'(资源不会清, 等于接着攒)')
+
+        # 【这里不再补一次处决】(2026-08-22)。
+        # rotation 里 h2 一松手就已经"盲发 F + 盯提示"过一遍了(f_break_window),
+        # 再串一个 f_break_persist 就是把没有的东西又等一遍 ——
+        # 实机 qingZ2@46.15 -> qingFspam 1.61s -> qingF_none 1.08s -> qingR_fired@49.10,
+        # 那一轮根本没有处决, 【2.95 秒全是白等】(用户: "没处决你也慢了好久才放R")
+        self.poking = True
+        self.fire_lib(qing, tag='qingR')
+        self.poke_until_hud_back(tag='qingRanim', tail=self.S_QING_R_TAIL)
+        # 【R 之后那一下 A 一定要打出来才轮到 Q】(用户 2026-08-22: "启动轴最后清霄R完了
+        # 要A一下才按Q变奏莫宁进入循环轴")。
+        # 【不能用 spam_segments 的段数模型】: 大招演出结束(HUD 回来)之后角色还要
+        # 约 0.47 秒才能出招 —— 一个 0.20 的 lead 窗口里的点击全落在收招里被吞掉,
+        # 于是 Q 紧跟着就发了, 那一下 A 从来没出现过。这一格量的是"什么时候能出招",
+        # 跟达尼娅 R1 之后那一格是同一类
+        self.macro_spam(self.S_QING_A_AFTER_R_WINDOW, self.A_INTERVAL, tag='qingA')
+        self.send_echo_now(qing, tag='qingQ')
+        self.macro_wait(self.S_QING_Q_TO_CON)
+
+        # ---- 变奏莫 ---- (循环轴的下一轮从莫宁开始)
+        self.wait_con_for_intro(qing, 'mornye', poke=True)
+        self.poking = False
+        self.quick_switch(mor, read_con=True, click_during=True)
+
+    # ==================== 循环轴 ====================
+
+    def perform_loop(self, entry_char=None):
+        """循环轴。由莫宁的 do_perform 调进来 —— 上一轮(或启动轴)的末尾是"变奏莫",
+        所以她刚变奏入场、就在场上。每次调用跑【一整轮】然后还给框架。
+        """
+        qing = self.teammate('Qingxiao')
+        mor = self.teammate('Mornye')
+        if qing is None or mor is None:
+            return False
+        previous = getattr(self.task, 'skip_combat_check', False)
+        self.task.skip_combat_check = True
+        self.cur = entry_char or self.on_field_char() or mor
+        self.poking = False
+        self.logger.info(f'qing loop entry: {self.cur.name} '
+                         f'({"passed in by caller" if entry_char else "read off screen"})')
+        try:
+            self.macro_start()
+            self.check_f_on_switch = False
+            qing.check_f_on_switch = False
+            mor.check_f_on_switch = False
+            self.run_loop_body(qing, mor)
+        finally:
+            self.release_attack()
+            self.poking = False
+            self.task.skip_combat_check = previous
+        return True
+
+    def run_loop_body(self, qing, mor):
+        """一整轮循环轴。单独拆出来是为了让启动轴能直接接上去(CHAIN_LOOP_AFTER_OPENER)。"""
+        if self.cur is not mor:
+            # 【兜底】: 正常路径进来时莫宁就在场(上一段末尾变奏切给她的)。
+            # 走到这里说明宏散过一次, 补一次切人比从错的人身上起跑强
+            self.logger.info(f'loop: on field is {self.cur.name}, switching to mornye first')
+            self.quick_switch(mor, read_con=True)
+        marks = len(self.macro_marks)
+        self.loop_seg_mornye(mor)
+        self.logger.info(f'loop MORNYE timeline: {self.macro_timeline(marks)}')
+        marks = len(self.macro_marks)
+
+        self.seg_denia(qing, first_e=True)
+        self.logger.info(f'loop DENIA timeline: {self.macro_timeline(marks)}')
+        marks = len(self.macro_marks)
+
+        self.seg_qingxiao(qing, mor, f_early=True)
+        self.logger.info(f'loop QING timeline: {self.macro_timeline(marks)}')
+        self.logger.info(
+            f'loop total {self.time_elapsed_accounting_for_freeze(self.macro_t0):.2f}s '
+            f'(wall {time.time() - self.macro_t0:.2f}s)')
+
+    def loop_seg_mornye(self, mor):
+        """莫 A123 + E + 强化重击 + R + Q -> 变奏达。她是变奏入场的, 已经在场上。
+
+        【跟启动轴那一段的差别只在顺序】: 那边是 A -> 重击 -> R -> A -> E -> 重击
+        (两发重击), 这边是 A -> E -> 重击 -> R(一发)。两边都在地面。
+        """
+        self.poking = True
+        if self.L_MOR_INTRO_ANIM > 0:
+            # 变奏入场动画期间的点击全被吞。要不要先点掉这一段, 等用户给帧数再定
+            self.macro_spam(self.L_MOR_INTRO_ANIM, self.A_INTERVAL, tag='morIntroAnim')
+        # 【一按到底, 不点】(用户 2026-08-21: "你E放了以后直接长按攻击键就行,
+        # 他能放强化重击会自动放, 你不要连续点按攻击了")。
+        # 轴上的 "aaa" 是按住自己打出来的; E 靠 e_after 插在长按中间(对应 "aaa e z");
+        # 条充满之后强化重击自动出手, 我们只负责按着别松
+        self.poking = False
+        # ---- 1 先确保【强化重击真的放出去了】----
+        # (用户 2026-08-22: "循环轴莫宁首先要确保重击释放了再释放R")。
+        # 原来这里把 mor_hold_heavy 的返回值丢掉了 —— 没打出来照样往下放 R,
+        # 于是那一轮既没重击也没吃到重击的加成
+        fired_heavy = False
+        for attempt in range(1, self.L_MOR_HEAVY_TRIES + 1):
+            # 【重试时不再发 E】: 第一次已经发过了, 这会儿它在 CD 上, 再发是空操作;
+            # 而且轴上 E 就一发
+            fired_heavy = self.mor_hold_heavy(
+                mor, tag='morHeavy' if attempt == 1 else f'morHeavyR{attempt}',
+                e_after=self.L_MOR_HOLD_TO_E if attempt == 1 else None)
+            if fired_heavy:
+                break
+            if attempt < self.L_MOR_HEAVY_TRIES:
+                self.logger.warning(f'mornye: 强化重击第 {attempt} 次没确认放出去, '
+                                    f'接着打再来一次(条不会因为这次失败清掉)')
+
+        # ---- 2 再确保【R 放出去了】----
+        # 【重击打出之后固定等 1.6 秒再放 R】(用户 2026-08-22: "循环轴还是重击接R
+        # 太快了, 给你个固定值吧, 重击打出以后1.6s后接R")。
+        # 【协奏判据(mor_wait_hit)那一版撤了】: 思路是"协奏涨了=打中了", 但它有两个
+        # 死角 —— 协奏本来就快满时涨不出阈值(直接退回定时), 而打空的轮次要白等满
+        # 上限。用户给了实测值, 定时比判据简单也准。方法留着没删, 哪天要恢复直接调
+        self.macro_wait(self.L_MOR_HEAVY_TO_R)
+        fired_r = False
+        for attempt in range(1, self.L_MOR_R_TRIES + 1):
+            if self.fire_lib(mor, tag='morR' if attempt == 1 else f'morRr{attempt}'):
+                fired_r = True
+                break
+            if attempt < self.L_MOR_R_TRIES:
+                self.logger.info(f'mornye R did not fire (try {attempt}), '
+                                 f'attacking and retrying')
+                # 同达尼娅那边: 边打边盯能量环, 亮了当场退出去发 R
+                self.attack_until_lib(mor, self.L_MOR_R_RETRY_A,
+                                      tag=f'morRwaitR{attempt}')
+        if not fired_r:
+            self.logger.warning('mornye R never fired — 这一轮的大招丢了')
+        self.poke_until_hud_back(tag='morRanim', tail=self.L_MOR_R_TAIL)
+        self.macro_wait(self.L_MOR_R_TO_Q)
+        # ---- 3 最后才轮到协奏 ----
+        # 【协奏满不是提前走的理由】(用户 2026-08-22: "就算在此之前协奏值满了也不能
+        # 切人, 先确保重击和R, 此后再确保协奏值")。所以这道门排在最后 ——
+        # 上面两步没做完之前, 这个函数根本走不到这里。
+        # 【循环轴这一段不打处决】(用户: "不要在循环轴的达尼娅和莫宁期间F按")
+        self.mor_finish(mor, do_f=False)
+
+    # ==================== 声骸(Q) ====================
+
+    def send_echo_now(self, char, tag='Q', presses=2, window=0.0):
+        """立刻放 Q。【三个角色统一走这里, 而且都放在离场前的最后一步】
+        (用户 2026-08-21: "因为声骸套装不一样, 统一设定最后放")。
+
+        【不读屏】: `click_echo(time_out=0)` 的第一件事是读屏 `echo_available()`,
+        读到 False 就掉进慢路径 —— 那条路要 OCR 一次 echo 的 CD, 再轮询最多 1 秒。
+        而 Q 的位置个个都在处决/大招刚结束那一带, 那几帧的读数正是最不可信的时候。
+        发键不读屏: 落在 CD 上是空操作, 不花钱。
+
+        【默认连发两下、贴着发】(window=0 -> 间隔 0, 几乎不花时间): 收招期间的按键
+        照样被吞, 单发很容易整个丢掉。大招收招那种长尾巴要多铺几下, 就把
+        presses/window 调大(达尼娅的 R2 之后就是 3 下 / 0.24 秒)。
+        """
+        self.spam_key(char.send_echo_key, window, interval=0.0, tag=tag,
+                      presses=presses, poke=False)
+        char.record_echo_use()
+
+    # ==================== 莫宁的收尾: Q -> 变奏达 (两条轴共用) ====================
+
+    def mor_finish(self, mor, do_f=True):
+        """莫宁收尾: 【等协奏满】-> (处决) -> Q + 切达尼娅(尽快离场)。
+
+        Args:
+            do_f: 这一段要不要打处决。
+                【循环轴传 False】(用户 2026-08-22: "不要在循环轴的达尼娅和莫宁期间
+                F按")—— 循环轴的莫宁段轴上本来就没有处决(`莫aaaezrq`), 而处决那一下
+                会把"强化重击 -> 马上接R -> 协奏补满就走"这条线整个拖慢。
+                启动轴传 True: 那边轴上写着 `处决q`。
+
+        用户 2026-08-21: "处决前一定要确保协奏值是满的, 再处决; 处决的同时就按Q和切人,
+        尽快放完技能离场换人"。
+
+        【顺序是"协奏 -> 处决 -> Q -> 切人", 这三步的先后是有原因的】:
+          - 等协奏放在【处决之前】: 等的期间在点普攻, 那既是输出又在涨协奏;
+            放在处决后面就只剩干等, 而【干等是涨不了协奏的】(圈靠打中涨)。
+          - Q 和切人紧跟在处决后面, 【中间不留任何等待】: 处决自带全局时停,
+            这段时间里递出去的键会被游戏记下来, 演出一结束就按输入先后解开 ——
+            所以"尽快放完技能离场"靠的是把键塞进去, 不是等它演完再按。
+
+        协奏这道门【一满就返回】, 所以圈本来就满的轮次几乎不花时间;
+        读数一直不动就提前放弃(MOR_CON_STALL) —— 那说明这几下打空了, 多等纯亏,
+        要治得往上游找哪一下没打中, 不是加大这里的超时。
+        门没过也照样往下走, 不把轴卡死; 日志里会留 con(timeout)/con(stalled@x)。
+        """
+        # 【重击一放完就盲发 F 盖住演出】(用户 2026-08-22: "启动轴莫宁又没接上F")。
+        # 处决提示是在重击【打中】那一刻才亮的, 而下面等协奏那一段可能要花一两秒 ——
+        # 提示很可能在那段时间里亮起又消失, 等协奏等完再去问就已经错过了。
+        # 演出期间的按键被丢掉不排队, 所以只能连发覆盖; 没处决可打时按 F 不触发别的东西
+        if do_f:
+            self.spam_f(self.O_MOR_F_SPAM, tag='morFspam')
+        full = True
+        if self.MOR_CON_WAIT > 0:
+            full = bool(self.wait_con_for_intro(mor, 'denia', poke=True,
+                                                time_out=self.MOR_CON_WAIT,
+                                                stall_give_up=self.MOR_CON_STALL))
+        if not full:
+            self.logger.warning('mornye: con still not full, breaking + leaving anyway — '
+                                'denia will come in without an intro')
+        if do_f:
+            self.f_break_persist(window=self.O_MOR_F_WINDOW, tag='morF')
+        # 【处决之后立刻 Q + 切人, 中间一格等待都不留】
+        self.send_echo_now(mor, tag='morQ')
+        self.poking = True
+        self.quick_switch(self, read_con=True, click_during=True)
+
+    # ==================== 大招记账 ====================
+
+    def note_lib1(self):
+        """原版 Denia.do_perform 用 lib_1_casted / lib_2 决定下一发大招是不是收尾的
+        那一发(Labels.denia_end_lib)。我们绕开了 click_liberation, 记账要自己补,
+        否则宏一旦中断、控制权交回原版轮换, 她会拿着错的状态乱放。"""
+        self.lib_1_casted = True
+
+    def note_lib2(self):
+        self.lib_2 = time.time()
+        self.lib_1_casted = False
+
+    # ==================== 框架接口 ====================
+
+    def do_perform(self):
+        """本队里达尼娅【不驱动任何一段轴】—— 启动轴由清霄驱动, 循环轴由莫宁驱动。
+
+        走到这里说明宏散了(切人失败/脱战重进), 那就打一小段普攻把场子交出去,
+        让清霄或莫宁重新拿到入口。【不要在这里跑循环轴】: 循环轴的第一步假设
+        莫宁刚变奏入场且在场上, 从达尼娅这里起跑一定错位。
+        """
+        if self.is_in_qing_cycle:
+            self.logger.info(f'denia do_perform in qing cycle '
+                             f'(opener pending={self.opener_pending()}) -> yielding the field')
+            self.continues_normal_attack(0.6)
+            return self.switch_next_char()
+        return super().do_perform()
+
+    def get_switch_priority(self, current_char=None, has_intro=False, target_low_con=False):
+        """本队里由宏直接按数字键切人, 框架的选人只在宏散掉之后才起作用。
+
+        启动轴待跑时返回 NO —— 轴的第一个动作是清霄的 R, 达尼娅不该抢先上场。
+        (框架至少还有清霄一个 MUST 候选, 不会因为这里返回 NO 就原地打转)
+        """
+        if self.is_in_qing_cycle and self.opener_pending():
+            return SwitchPriority.NO
+        return super().get_switch_priority(current_char, has_intro, target_low_con)
+
+    def on_combat_end(self, chars):
+        self.release_attack()
+        self.poking = False
+        return super().on_combat_end(chars)

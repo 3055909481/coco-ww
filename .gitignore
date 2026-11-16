@@ -1,0 +1,21 @@
+# 运行环境(约 590 MB, 不进版本库; 丢了从旧安装版或上游 requirements.txt 重建)
+/python/
+
+# 运行时产物
+/logs/
+/cache/
+/screenshots/
+__pycache__/
+*.pyc
+configs/custom_teams/*/cache/
+configs/custom_teams/.*/
+configs/custom_teams/*.backup/
+
+# 界面状态和本机信息, 每次运行都会变
+/configs/main_window.json
+/configs/log_window.json
+/configs/tasks_page.json
+/configs/ui_config.json
+/configs/devices.json
+/configs/_ok.json
+/configs/Notification.json

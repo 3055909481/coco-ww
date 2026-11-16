@@ -1,0 +1,10 @@
+{
+    "_enabled": false,
+    "Auto Target": true,
+    "Use Liberation": true,
+    "Check Levitator": true,
+    "Switch to Healer before and after Combat": false,
+    "按 F 开始战斗": true,
+    "F 之后等待(秒)": 0.4,
+    "没锁到目标最多撑(秒)": 10.0
+}

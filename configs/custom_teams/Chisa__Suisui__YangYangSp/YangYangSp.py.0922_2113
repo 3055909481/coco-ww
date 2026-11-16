@@ -1,0 +1,2319 @@
+import ctypes
+import threading
+import time
+
+from src.Labels import Labels
+from src.char.BaseChar import SwitchPriority
+from src.char.YangYangSp import YangYangSp as NativeYangYangSp
+
+# ==================== 物理 F 键监视 ====================
+# 跟 Changli__Jinhsi__Verina/Changli.py 里那份逐字相同, 说明见那边。
+# 几个队伍文件都能启动这个线程, 但每个 task 只启一次(_f_watch_started) —— 所以宏在跑时
+# 两个标志都要置上, 不管是哪个文件先启的线程都认得出"这是手动处决, 不是重开副本"。
+F_VK = 0x46              # 'F'
+F_POLL_INTERVAL = 0.05   # 一次按键按住的时间远大于这个, 不会漏采
+F_LOG_DEBOUNCE = 1.0     # 按住不放时别刷日志
+# 界面上那张设置卡片, 在 ok_tasks/FStartCombatTask.py。放 ok_tasks/ 是因为选项必须由
+# 代码声明(json 里多出来的键会被 verify_config 丢掉), 而 config.py/src 每次更新都会被
+# 盖回官方版 —— 上一版的开关和时间就是这么没的。ok_tasks/ 不在仓库里, 更新不碰。
+F_TASK_NAME = 'FStartCombatTask'
+
+
+def f_settings(task):
+    """读界面上的(开关, F 之后等待秒数)。
+
+    【没装那张卡片就返回默认值(开, 0 秒)】—— 把队伍导给别人时对方没有 ok_tasks/
+    里的那个任务, 功能照常, 只是他那边没有界面可调。
+    """
+    executor = getattr(task, 'executor', None)
+    for group in ('trigger_tasks', 'onetime_tasks'):
+        for other in getattr(executor, group, None) or ():
+            if type(other).__name__ == F_TASK_NAME:
+                try:
+                    return bool(other.enabled), float(getattr(other, 'f_start_delay', 0) or 0)
+                except Exception:
+                    return True, 0.0
+    return True, 0.0
+
+
+# ==================== 自动战斗开关监视 ====================
+# 【玩家手动开关自动战斗, 必须从启动轴重跑】(2026-09-22 用户明确要求:
+# "以后做的轴, 都要确保不管什么时候开关自动战斗, 都要从一开始启动")。
+#
+# 为什么不会自己重跑: 手动停任务是【任务停止把战斗循环打断】, 异常一路往上抛,
+# `AutoCombatTask` 的 combat_end() 整个跳过 -> `on_combat_end()` 不执行 ->
+# 角色实例上的标记全部留着, 其中就有 `opener_armed=False`。重开时【队伍识别没变化的话
+# load_chars() 也不会跑】(角色对象被粘性复用), 于是 reset_state() 里那句
+# `opener_armed = True` 根本轮不到执行 —— 直接跳到循环轴。
+# 实机日志的形状: 一连串 `opener not pending (already armed-down (ran once this combat))`。
+#
+# 【为什么用线程而不是在 do_perform 里判】: do_perform 只在任务【已经启用】时才会被调到,
+# 站在里面永远看不到"刚才关过"。只有独立线程能观察到 enabled 的 True->False->True。
+# 判据跟物理 F 键那条路完全一致: 记一个时间戳, 调用方比 `> last_opener` 就放行。
+ENABLE_POLL_INTERVAL = 0.2
+
+
+def start_enable_watch(task, logger=None):
+    """盯 task.enabled 的 False->True 跳变, 把时刻记到 task._ww_task_restarted_at。
+
+    daemon 线程, 跟着进程退出。每个 task 只启一次。
+    """
+    if getattr(task, '_ww_enable_watch_started', False):
+        return
+    task._ww_enable_watch_started = True
+    if not hasattr(task, '_ww_task_restarted_at'):
+        # -1 = "从没重启过", 跟 last_opener 的"没跑过"对齐
+        task._ww_task_restarted_at = -1
+
+    def watch():
+        was_on = None
+        while True:
+            try:
+                now_on = bool(getattr(task, 'enabled', False))
+                if was_on is False and now_on:
+                    task._ww_task_restarted_at = time.time()
+                    if logger:
+                        logger.info('auto combat re-enabled -> opener re-armed')
+                was_on = now_on
+                time.sleep(ENABLE_POLL_INTERVAL)
+            except Exception:
+                return          # 进程收尾时安静退出
+
+    threading.Thread(target=watch, name='ok_ww_enable_watch', daemon=True).start()
+
+
+def start_f_watch(task, logger=None):
+    """把【物理】F 键按下的墙钟时间记到 task._f_last_press。每个 task 只启一次。
+
+    线程是 daemon, 跟着进程退出, 不用管回收。
+    """
+    if getattr(task, '_f_watch_started', False):
+        return
+    task._f_watch_started = True
+    if not hasattr(task, '_f_last_press'):
+        # 【初值取 -1 而不是 0】: 读取方是 `if f_press > self.last_opener`, 而
+        # last_opener 的"没跑过"也是 -1。给 0 的话开局第一次判定就恒成立(0 > -1),
+        # 会连 use_liberation 那道检查一起跳过 —— 两边都用 -1 表示"从没发生过"才对得上
+        task._f_last_press = -1
+
+    def watch():
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetAsyncKeyState.restype = ctypes.c_short
+        except Exception as e:
+            task._f_watch_started = False
+            if logger:
+                logger.error(f'f watch: GetAsyncKeyState unavailable ({e}), '
+                             f'the "press F to re-arm the opener" shortcut stays off')
+            return
+        last_log = 0
+        was_down = False
+        while True:
+            try:
+                down = bool(user32.GetAsyncKeyState(F_VK) & 0x8000)
+                if down and not was_down and f_settings(task)[0]:
+                    # 【上升沿才算一次按下】。原来是"只要按着就每轮记一次",
+                    # 对 _f_last_press(取最新时刻)无所谓, 但下面 _f_pressed_at 是
+                    # 给框架消费的, 按住不放时反复刷新会让它永远"刚刚才按"
+                    now = time.time()
+                    # 【宏正在跑 = 正在战斗, 这下 F 是玩家手动处决, 不是重开副本】(2026-09-11 日志:
+                    # 06:17:40 手动处决的那一下 F 打出了 "opener re-armed" —— 下一次进长离就会从头
+                    # 跑启动轴)。只在宏空闲时才把 F 当成"重开了一局"
+                    if (getattr(task, '_three_fire_macro_busy', False)
+                            or getattr(task, '_ww_macro_busy', False)):
+                        if logger and now - last_log >= F_LOG_DEBOUNCE:
+                            last_log = now
+                            logger.info('physical F pressed while the macro is running '
+                                        '(manual execution) - opener NOT re-armed')
+                        was_down = down
+                        time.sleep(F_POLL_INTERVAL)
+                        continue
+                    task._f_last_press = now
+                    # 【这里是本线程和框架的唯一交接点】(2026-08-19):
+                    # 框架 CombatCheck.note_f_key() 原本自己调 GetAsyncKeyState,
+                    # 判据是【低位】—— 那一位的语义是"距上次调用之间被按过",
+                    # 【读一次就清, 而且整个进程共享】。本线程 20 毫秒轮询一次,
+                    # 每次调用都会把低位清掉, 框架那边就永远读到 0 ——
+                    # 结果是 watcher 一直在打日志, 而"按 F 直接进战斗"从来不触发。
+                    # 现在改成【一个读者】: 本线程读键, 顺手把框架要的时间戳也写了,
+                    # 框架不再自己读(见 CombatCheck.note_f_key 里的 watcher 分支)。
+                    task._f_pressed_at = now
+                    if logger and now - last_log >= F_LOG_DEBOUNCE:
+                        last_log = now
+                        logger.info('physical F pressed, opener re-armed')
+                was_down = down
+                time.sleep(F_POLL_INTERVAL)
+            except Exception:
+                return          # 进程收尾时 ctypes/解释器可能已经拆掉了, 安静退出
+
+    threading.Thread(target=watch, name='ok_ww_f_watch', daemon=True).start()
+
+
+
+
+class YangYangSp(NativeYangYangSp):
+    """秧秧·玄翎。秧千穗(千咲/穗穗/秧秧·玄翎)里她兼任【整条轴的持宏者】。
+
+    ================= 轴的出处 =================
+    B 站 Sy1is 的秧千穗实录 + 两张宏面板截图, 本地 E:/轴视频/9月22日.mp4
+    (1920x1080 / 30fps / 206.9s, 【混了 1~3 倍慢放和冻结帧, 不能当墙钟】——
+    对表要读画面里的游戏倒计时)。作者队伍编成 1 穗穗 / 2 千咲 / 3 秧秧·玄翎,
+    跟本目录原来的 NEXT_SLOT 一致。实录里一局 120 秒跑满 4 轮循环。
+
+    ================= 一大轮的形状 =================
+        启动宏(23.3s) -> 手动段(秧秧 2羽1苍) -> 循环宏(21.5s) -> 手动段 -> ...
+    【两条宏都在同一个位置结束】: 千咲一下 A 之后变奏切秧秧入场 —— 所以手动段只写一份,
+    启动宏跑完和每条循环宏跑完接的是同一段。启动宏第 30 格(穗穗 Q)往后到倒数第二格,
+    跟循环宏第 26 格往后【逐格相同】, 只差收尾那一下 A 的间隔(300 / 400ms)。
+
+    ================= 手动段: 为什么叫"2羽1苍" =================
+    秧秧·玄翎有【苍剑式】和【羽剑式】两种形态, 按 E 切换; 重击要【苍翎】满 2 点才放得出来,
+    而且两种形态的重击是两个不同技能、各自带一个 25 秒 CD 的暴伤 buff:
+      · 重击·苍剑式 -> 巨大气旋, 获得【绝息】, 本次重击暴伤 +160%
+      · 重击·羽剑式 -> 命中后自动接空中攻击·释羽风落, 获得【流岚】15 秒,
+        并进入【聆风祀声】12 秒 —— 这期间羽剑式普攻替换成普攻·湮象风华(3 段, 算重击伤害)
+    苍翎上限 2, 变奏入场 +1 / 共鸣解放 +1 / 剑式流转(流响耗尽时按 E)+1, 重击消耗全部。
+    所以一轮的苍翎账是:
+        变奏入场+1 -> E 流转+1(满2) -> 重击·苍剑式(1苍, 清空)
+        -> R 共鸣解放+1 -> E 流转+1(满2) -> 重击·羽剑式 -> 释羽风落(1羽, 清空, 进聆风祀声)
+        -> 聆风祀声里接普攻·湮象风华(第2羽, 不吃苍翎; 第2、3段在低空施放, 实录里就是贴地连挥)
+    【第2羽不是可打可不打的收尾】: 重击·羽剑式给的【流岚】(160% 暴伤)要到
+    "普攻·湮象风华第3段结束"才移除 —— 少打这几下等于把 buff 剩下的部分扔了。
+    字幕原话:
+        "启动宏结束, 秧秧变奏入场, 直接按一次 e 切形态然后重击打出1苍, 接着开大"
+        "开大后, 接 e 技能切形态, e 按下的一瞬间普攻预输入重击, 这时候秧秧会升空然后直接打出1羽"
+        "然后继续长按接点按普攻打出第二个羽"
+        "2羽打完之后, 有处决打处决强制取消后摇, 然后按循环宏;
+         没处决就要等后摇结束才能按循环宏, 自己多打几次看看手感"
+    手动段【逐帧量出来的墙钟】(第3轮, 那段视频是原速, 游戏内倒计时≈墙钟):
+        b73.1 宏最后一格变奏入场
+        b74.0 按 E              (入场锁 0.9s, 对上 M_INTRO_LOCK)
+        b74.0~74.8 长按 -> 1苍打出, 重击就绪图标熄灭   (0.8s)
+        b74.8~76.2 重击收招, 然后按 R                  (1.4s)
+        b76.2~76.4 R 演出(倒计时冻住); 【HUD v140.7 就回来了, 但收招还要 0.8s】
+        b76.4 按 E 切羽剑式 (v141.5, 比 HUD 回来晚 0.8s —— 见 M_R_TO_E)
+        b76.4~80.7 【一路长按】普攻连段 -> 重击·羽剑式 -> 释羽风落 -> 聆风祀声  (4.3s)
+        b80.9~82.9 松手【点按】, 低空湮象风华连段 = 第2羽                      (2.0s)
+        b82.9 循环宏起点
+
+    ================= 两条宏怎么读出来的 =================
+    宏面板三列(按键 / 动作 / 延时ms)。动作那一列【矮的图标 = 按下, 高的 = 抬起】, 所以
+    【按下那行的延时 = 按住多久, 抬起那行的延时 = 松开到下一次按下的间隔】; 末行 9999 = 结束。
+    启动宏 49 对键(8 页 x 6 对 + 末尾单独放大的一对), 循环宏 45 对(7 页 x 6 对 + 3 对)。
+    【转录做过对表】: 把宏表的切人时刻跟实录里读出来的出战角色时间线对齐, 开局 9 秒内的
+    8 次切人全部落在 0.1 秒以内(中间穗穗只在场 0.35 秒的那一下被最短段过滤掉了, 不是错)。
+    9 秒往后对不上是因为【穗穗大招演出会把游戏内倒计时冻住约 4.2 秒】, 跟转录无关。
+    【剑式的奇偶也对得上】, 这是第二重验证: 秧秧默认苍剑式, 按一次 E 换一次形态。
+    启动宏里她只有 1 个 E(第23格) -> 进手动段时是羽剑式 -> 手动段第一个 E 换成苍剑式,
+    正好对上字幕的"重击打出1苍"; 手动段第二个 E 换回羽剑式, 对上"打出1羽"。
+    循环宏里她有 2 个 E(第2、23格), 加手动段的 2 个 = 一轮 4 次, 偶数 —— 每轮回到羽剑式,
+    下一轮的手动段照样是"先苍后羽"。【宏表要是抄错一个 E, 这个奇偶就崩了】。
+
+    ================= 每一格为什么在那(改表之前先读这一节) =================
+    【穗穗】两个形态, 两条【不同】的资源条:
+      · 浣尘时(初始): 普攻命中回【水云息】(上限120), E(共鸣技能·浣尘时)向前突进 +40。
+        水云息【满】时 E 会换成【醒春潮】—— 放出去就进濯雨时。
+      · 带协奏满切进来(变奏技能·泠泠漱玉声)也直接进濯雨时, 同样消耗所有水云息。
+      · 濯雨时(15 秒): 普攻·濯雨时/重击命中回【芳菲信】(上限600),
+        E(共鸣技能·濯雨时)突进回 100 点。15 秒后自动退出。
+      · R(康衢之谣) = 在场上铺【山河水境】30 秒, 【它不消耗芳菲信】。
+      · 【芳菲信是"切走"那一下结算的】: 延奏技能·渌水盈盈 退出濯雨时、消耗所有芳菲信,
+        按消耗量解锁 200/400/600 三档 —— 【600 才有第3次翾舞和烟岚】。
+        所以"三段回路满"这道闸的真正位置是【切走之前】; 宏里 R 之后紧接着就切秧秧,
+        卡在 R 前面是等价的。
+    【千咲】核心资源是【锯环残响】(上限100), 普攻和共鸣技能命中时攒:
+      · R(即刻·归无) 回 40 点残响, 并进入【万缕·汇终】15 秒 —— 锯环·疾攻/终结 +120% 倍率。
+      · 残响【满】且【在地面】时, E 换成【齿轨轮回】, 放出去【进入电锯模式】。
+        这就是"强化E" —— 没放出来, 后面那串长按全是普通普攻, 整轮千咲的输出作废。
+      · 电锯模式里: 【长按】普攻从锯环·疾攻【第2段】起手(短按是第1段), 按住会自动接第3段;
+        残响被消耗到 0 之后, 下一次按普攻 = 【锯环·终结】(清空残响, 全队护盾)。
+      · 所以宏里那一串读起来是: Q -> R(开 15 秒窗口) -> E(进电锯) -> 切走让别人打
+        -> 切回来 长按A 1150ms(疾攻 2->3 段) -> 短按A(锯环·终结) -> 切走。
+        【1150 不是随手写的数】: 它要盖住疾攻第2段到第3段那一整段。
+    【秧秧·玄翎】见上面"2羽1苍"那一节的苍翎账。
+
+    ================= 保底的边界(2026-09-22 实机教训, 加保底之前先读这一节) =================
+    【宏表本身是作者实机验证过的, 保底的职责是"别让打断把整轮废掉", 不是"纠正宏"】。
+    分界线只有一条: **这个保底会不会改变游戏状态**。
+      · 只花时间的 -> 安全, 可以默认开:
+        切人确认(补按数字键)、等入场、等收招、大招连发(R 在 CD/演出里按是空操作)、
+        纯读屏的判据(等图标灭)。最坏的后果是这一轮慢一点。
+      · 会改状态的 -> 【默认关掉】, 出问题时再按需打开:
+        补按 E(秧秧每按一次 E 就翻一次剑式!)、额外点普攻(耗流响/推连段/攒资源)、
+        多放一次技能(吃 CD、吃资源)。这类保底一旦判据误判, 【就把本来对的流程搞坏了】,
+        而且外表看不出来。
+    【踩过的那次】: 给 1苍 加了"没打出来就再走一轮 E+长按"的重试, 看起来很合理 ——
+    可秧秧的剑式是有奇偶性的(启动宏 1 个 E + 手动段 2 个, 一轮正好翻回原位),
+    多按那一次 E 直接把形态翻掉, 于是后面那个"1羽"打出来的其实是【苍剑式重击】,
+    绝息/流岚全错位。**少打一发, 远好过打错一发。**
+
+    ================= 打断了怎么办(每一格的判据和兜底) =================
+    总开关 SAFETY 关掉 = 全部退化成纯照宏打, 下面这些判据一个都不跑。
+      格子                判据                          没成立怎么办
+      切人                in_team() 读到目标 index      补按数字键, 最多多等 SWITCH_EXTRA;
+                                                        累计 MACRO_ABORT_DESYNC 次【放弃整轮】
+      穗穗 R (R3)         suisui_forte3 (芳菲信 600)    没满就接着点普攻攒, 到 FORTE3_WAIT 照放
+      任何大招 (R!/R3)    HUD 消失 = 演出开始            连发到出手, 还不出再补救一轮
+      千咲 E* (齿轨轮回)  E 图标白像素 >= 0.13          等不到就照按一次(落在普通E 上也是攒残响);
+                                                        按完再确认图标暗下去, 没暗就重按
+      千咲长按A           上一格 E* 有没有进电锯         没进就先补一发 E, 再长按
+      秧秧 1苍            重击就绪图标【熄灭】           到 HEAVY_CAP 照走(压到 1.30 就是为了这个)
+      秧秧 1羽            【没有可用判据】—— 聆风祀声   固定 M_YU_HOLD; M_YU_TRACE 把图标读数
+                          会让图标一直亮着               打进日志, 打歪了靠它调
+    【切人之后紧跟着长按的格子要额外等一下】: 见 HOLD_AFTER_SWITCH。
+
+    ================= 宏里的 1/2/3 =================
+    是【作者的队伍槽位】(从实录右侧头像栏读的: 1 穗穗 / 2 千咲 / 3 秧秧·玄翎)。
+    这里【按角色翻译回槽位】(char.index + 1), 用户自己的队伍顺序不一样也能跑。
+
+    ================= 这一版的判断都在哪 =================
+    两条宏【逐格按时间回放】, 保底挂在格子里(切人确认、大招盯 HUD 补按), 关掉 SAFETY
+    就是纯照宏打。手动段全程读屏: 苍翎满不满看重击就绪图标(is_mouse_forte_full),
+    重击放没放看它暗没暗, 交接等协奏真满。
+    【别把返回点挪进任何演出里】—— 演出期间读不到目标, 框架会判脱战、重进战斗、重跑启动轴。
+    """
+
+    # ==================== 全局节奏 ====================
+    A_INTERVAL = 0.12            # 0.12 是实测的地板, 更密会让空中角色打出下落攻击
+    KEY_INTERVAL = 0.10
+    # 【普攻必须真的按住几十毫秒才打得出来】: task.click() 那条路按不住 ——
+    # BaseWWTask.click 会把不带坐标的调用的 down_time 【无条件覆盖成 0.01】, 底层
+    # genshin.do_click 又是"按下-立刻抬起-再睡 down_time"。所以这个文件里所有的"点一下"
+    # 都走 tap(), 那是 mouse_down -> 等 -> mouse_up
+    A_TAP = 0.06
+
+    # ---- 切人 ----
+    SWITCH_TIME_OUT = 2.5
+    SWITCH_KEY_DOWN_TIME = 0.02
+    SWITCH_KEY_INTERVAL = 0.0
+    SWITCH_SETTLE = 0.0
+    UNTRUSTED_CONFIRM = 3
+    TRACE_SWITCH = True
+
+    # ---- 大招 ----
+    LIB_FIRE_WINDOW = 1.20
+    LIB_KEY_INTERVAL = 0.03
+    LIB_READ_EVERY = 2
+    LIB_ANIM_TIME_OUT = 8.0
+    LIB_ANIM_TAIL = 0.15
+    HUD_NO_ANIM_GRACE = 0.35
+    LIB_GONE_CONFIRM = 3         # HUD 连续这么多帧不在 = 演出真的开始了
+    HUD_UP_CAP = 1.0             # 按 R 之前等 HUD 在场的上限(防 fire_lib 假成功)
+
+    # ---- 协奏 ----
+    CON_WAIT_TIME_OUT = 2.0
+    CON_POLL_INTERVAL = 0.05
+    CON_FULL_LEVEL = 1.0
+    CON_SAMPLE_MAX = 24
+
+    FIELD_SETTLE_TIME_OUT = 1.5
+    E_RESEND_STEP = 0.06
+    SKILL_BAR_SETTLE = 0.40
+
+    # ==================== 重击就绪图标(= 秧秧的苍翎满) ====================
+    # 判据跟长离那条轴用的是同一个: 回路条右边那个重击就绪指示。对秧秧来说它亮 = 苍翎满 2 点,
+    # 暗 = 重击已经放出去(消耗了全部苍翎)。【先要读到过"满"才认"清空"】, 见 hold_until_forte_cleared
+    FORTE_CONFIRM = 2            # 连续亮这么多帧才算(特效扫过去会闪一下)
+    # 长按重击的上限。【只给 1苍 那一段用】(R 之后那段走 hold_yu_blind, 不读图标)。
+    # 【从 2.50 压到 1.30】: 实测 1苍 只要 0.8s(b74.0 按住 -> b74.8 图标熄灭), 给到 2.5
+    # 是在赌判据一定成立。万一哪轮剑式漂了、这一格打出来的是羽剑式重击, 图标就会因为
+    # 聆风祀声继续亮着(见 M_YU_HOLD 上面那段), "等它灭"当场失效、白按满上限 ——
+    # 干跑里复现过(L31苍重击(CAP,repress2,2.53s))。压到 1.30 的话这种情况只亏 0.5 秒
+    HEAVY_CAP = 1.30
+    # 【0.90 -> 0 (关掉)】。2026-09-22 实机数据: 12 轮 1苍 里
+    #   repress0 -> cleared (0.52s / 0.78s)      <- 成功的两轮
+    #   repress1 -> CAP     (1.30~1.33s)         <- 失败的十轮
+    # 这一段是从长离那条轴逐字抄来的: 她的焚身以火是"按住到条件满足", 中途松开再按
+    # 只是补一个按下沿, 没坏处。**但秧秧的重击要连续按住才派生** —— 0.9 秒那一下松手
+    # 直接把蓄力打断, 重新计时又撞上 HEAVY_CAP, 于是必然 CAP。1羽 那边同理
+    # (L41羽出手(CAP,2.01s))。
+    # 这正是"长按期间绝对不要再 mouse_down"那条的变体: 松开重按比单纯补按更狠
+    HEAVY_REPRESS = 0.0          # 0 = 不重按, 一路按到底
+    HEAVY_SEE_GRACE = 0.50       # 这么久一次都没读到亮 -> 判据读不到, 改盲按
+    HEAVY_BLIND_HOLD = 0.90
+
+    # ==================== 防重入 ====================
+    OPENER_MIN_GAP = 60.0
+
+    # ==================== 手动段(2羽1苍) ====================
+    # 宏最后一格是变奏切秧秧, 返回时【入场动作还在演】。这段按键会被游戏吃掉,
+    # 所以第一个 E 要等它演完。框架的 intro_motion_freeze_duration 是 0.9,
+    # 实录里羽挟苍空的攻击动作到能接 E 大约 0.85s。
+    # 【0.85 是卡在锁边上的】: 干跑(它没有预输入, 锁期间的键直接丢)里这一下 E 经常被吞,
+    # 靠 ensure_forte_ready 的补按救回来。真机有预输入, 锁里按的键会在能出招的第一帧触发,
+    # 所以这里不往上加 —— 字幕就是"直接按一次 e"。实机要是日志里天天出现"E 多半被吃了",
+    # 再往 0.95 抬
+    M_INTRO_LOCK = 0.85
+    # 【E 一次只能发一下】: 剑式切换每按一次换一个形态, 连发两下等于换回去了。
+    # 所以补按由"看图标还不亮"驱动, 不是拿窗口连发盖 —— 见 send_e_once / ensure_forte_ready
+    M_USE_FORTE_ICON = True      # 关掉 = 不读重击就绪图标, E 发一下就按固定节奏往下走
+    M_FORTE_CAP = 0.80           # 发完 E 等图标亮的上限(秒)
+    # 到点没亮再补几次 E。【补按不是白补的】: 要是那一下 E 其实放出去了、只是图标没读到,
+    # 补的这一下就把形态又换回去了(而且流响是满的, 换回去的那次是"剑式切换", 不给苍翎)。
+    # 所以这个数别往上加; 判据要是实机不靠谱, 是关 M_USE_FORTE_ICON 而不是多补几次
+    # 【默认 0 = 不补按】。同上: 补按 E 会翻剑式。而且这个判据(mouse_forte)读的是
+    # "苍翎 >= 1"而不是"满 2", 本来就分不出"E 到底生效没有" —— 拿它驱动补按等于瞎猜
+    M_E_RETRIES = 0
+    # E 之后到按住普攻的间隔。重击从 E 派生, 太早按会被 E 的动作吃掉
+    M_E_TO_HEAVY = 0.10
+    # 【1苍 没打出来就再来一轮】(2026-09-22 实机: 8 轮里 7 轮 CAP, 重击根本没出手)。
+    # 根因: 手动段那一下 E 是【剑式切换】而不是【剑式流转】。只有【流响耗尽】时按下去的
+    # 才是流转(回 100 流响 + 1 点苍翎), 没耗尽时按的只换形态、不给苍翎 —— 苍翎停在
+    # 变奏入场给的那 1 点, 而重击要满 2 点。
+    # 【重击就绪图标区分不了这两种】: 实测 苍翎满(0.04s) 是在按 E 之前就亮着的,
+    # 说明它代表的是"苍翎 >= 1"而不是"满 2", 所以判据只能告诉你【重击有没有出手】,
+    # 告诉不了你【为什么没出手】。
+    # 补救之所以成立: 【第一轮那 1.3 秒长按打的普攻本身就在耗流响】—— 所以第二次按 E
+    # 很可能正好落在"流响耗尽"上, 变成剑式流转, 苍翎补到 2 点, 第二次长按就打得出来了。
+    # 代价是失败那轮多花约 1.5 秒
+    # 【默认 0 = 不重试】。重试会多按一次 E, 而秧秧【每按一次 E 就翻一次剑式】——
+    # 一轮的剑式奇偶(启动宏 1 个 E + 手动段 2 个)被打乱之后, 后面那个"1羽"打出来的
+    # 是苍剑式重击, 绝息/流岚全错位, 比"1苍 少打一发"坏得多。
+    # 真要开, 先确认判据能区分"苍翎满2"和"苍翎>=1" —— 现在的 mouse_forte 区分不了
+    M_CANG_RETRIES = 0
+    # 1苍(重击·苍剑式)打完到按 R 的间隔。
+    # 【0.25 -> 0.85, 用户 2026-09-22 实机: "秧秧的R开的太快了, 把前面那个重击伤害给吞了"】。
+    # 原来按"早按没坏处, fire_r 会重试"写的 —— 那个想法只对"按键被游戏拒绝"成立,
+    # 这里是【R 真的放出去了, 但把还没结算完的重击打断了】, 重试兜不住, 伤害直接没了。
+    # 实录里这个间隔是 1.4s(b74.8 图标熄灭 -> b76.2 大招出手); 先按用户说的加 0.6 试,
+    # 还吞就继续往 1.4 加
+    M_CANG_TO_R = 0.85
+    M_R_WINDOW = 2.00            # 传给 fire_lib 的窗口
+    # 【R 演出结束到按 E 的间隔 —— 这一格丢了整个 R 之后就全错】(2026-09-22 实机)。
+    # fire_r + wait_hud_back 等的是【过场演出】(HUD 消失再回来), 返回那一刻演出确实结束了,
+    # 但【收招动作还在演】, E 按在这段里会被游戏整个吃掉。E 又不像 R 那样会重试,
+    # 被吞就是彻底丢 —— 剑式没切成羽, 后面那一路长按打出来的是苍剑式的普攻, 全歪。
+    # 0.80 有两处独立来源对上: ① 这个文件的判据驱动旧版里实机标定的 LIB_TO_E = 0.8;
+    # ② 实录逐帧 —— HUD 在 v140.7 就回来了, E 是 v141.5 才按的, 正好 0.8 秒
+    M_R_TO_E = 0.80
+    # 【等落地再按 E】。也是从判据驱动旧版搬过来的(它叫 WAIT_DOWN_BEFORE_E):
+    # 大招收尾人可能还在空中, 空中按 E 跟地面不是一回事, 而且重击·羽剑式的条件里
+    # 明写着"并且处于地面时"。wait_down() 期间会点普攻 —— 【这是想要的】:
+    # 普攻消耗【流响】, 只有流响耗尽时按下去的那一次 E 才是"剑式流转"(回 100 流响
+    # + 1 点苍翎), 没耗尽的话按出来的是"剑式切换", 只换形态不给苍翎, 苍翎就凑不够 2 点
+    M_WAIT_DOWN_BEFORE_E = True
+    # 按 E 的按下时长(秒)。【别用框架默认的 0.01】: 旧版注释写着"收招那一下可能吃不到",
+    # 它自己用的是 E_KEY_DOWN = 0.05
+    M_E_KEY_DOWN = 0.05
+    # 大招演完之后的第二个 E 到按住左键的间隔。字幕说【e 按下的一瞬间普攻预输入重击】,
+    # 所以这个数要小; 反过来先按住左键会先打出一段普攻, 把形态切换的派生窗口顶掉
+    M_E2_TO_HEAVY = 0.05
+    # ================= R 之后这一段【不能用重击就绪图标当判据】 =================
+    # 【这是 2026-09-22 第一次实机栽的地方】(用户: "秧秧R之后的操作完全不对")。
+    # 原来这里跟 1苍 一样调 hold_until_forte_cleared(按到图标熄灭), 可羽剑式这一路
+    # 打完重击【图标根本不会灭】: 重击·羽剑式 -> 释羽风落 -> 进【聆风祀声】12 秒,
+    # 羽剑式普攻被替换成普攻·湮象风华, 左键图标【继续保持高亮】, 只是里面的图案换了。
+    # 而框架的 find_mouse_forte() 是把图标二值化之后匹配 'mouse_forte' 模板
+    # (threshold 0.6), 认的是外圈那个亮环, 【分不出里面的图案】—— 于是"等它灭"
+    # 永远不成立, 一路按满 HEAVY_CAP 再走, 后面整段节奏跟着歪。
+    # 逐帧量出来的(第3轮, 这段视频是原速, 战斗时间≈墙钟):
+    #   b76.4 按 E -> b76.4~80.7 一路长按(普攻连段 -> 重击·羽剑式 -> 释羽风落 -> 聆风祀声)
+    #   -> b80.9~82.9 松手点按, 低空湮象风华连段 -> b82.9 循环宏起点
+    # 对照 1苍 那段: b74.0 按 E -> b74.8 图标熄灭, 【那一段判据是好的】, 所以只改这里。
+    M_YU_HOLD = 4.30             # E 之后一路按住的【总】时间(秒)。实测 b76.4->80.7
+    # 【判据其实是有效的 —— 2026-09-22 实机 trace 推翻了之前看视频得出的结论】。
+    # 原先以为"聆风祀声会让图标一直亮着, 这一段没判据可用", 那是看视频截图得出的:
+    # 画面上那个粉环确实一直亮。但【框架认的不是粉环, 是 mouse_forte 这张图】——
+    # 湮象风华换了图案, 模板就匹配不上, 实测 trace:
+    #   L11羽: 0.02:1 0.33:1 0.65:1 0.97:0 1.29:0 ... 4.13:0   <- 0.97s 就灭了
+    # 所以现在两件事都做: 判据负责【确认重击真的出手了】, 按满时间负责
+    # 【让释羽风落/聆风祀声那几段接上】。等待判据的时间算在 M_YU_HOLD 里面
+    M_YU_HEAVY_CAP = 2.00        # 等重击打出去的上限(秒), 实测 0.97
+    M_YU2_TAPS = 4               # 松手之后点几下(低空湮象风华连段)
+    M_YU2_INTERVAL = 0.45        # 点按的间隔(秒)。4 x 0.45 = 1.8s, 实测那段 2.0s
+    # 【最后一下点按之后还要等它打完再按处决】(2026-09-22 用户: "秧秧的处决快了,
+    # 第二个羽没打完就开了")。点按只是"发出去", 那一段湮象风华还要演;
+    # 处决带全局时停, 抢在里面按就把没结算完的那一段掐了 —— 跟 1苍 抢 R 是同一个毛病。
+    # 实录里第2羽打到 b82.9 才接循环宏, 而 4 x 0.45 = 1.8s 只到 b82.7
+    M_YU2_TAIL = 0.45
+    # 【没处决的时候要自己等后摇演完再接循环宏】。字幕原话:
+    #   "2羽打完之后, 有处决打处决强制取消后摇, 然后按循环宏;
+    #    没处决就要等后摇结束才能按循环宏, 自己多打几次看看手感"
+    # 处决的作用就是【取消后摇】—— 没打成的话后摇还在, 这时候直接进循环宏,
+    # 循环宏第一格的 W/E 会被后摇吞掉, 一路错下去
+    M_YU2_NO_BREAK_TAIL = 0.60
+    # 长按期间每隔一会儿读一次重击就绪图标, 【只打日志不打断】。留着是因为这一段
+    # 现在完全靠固定时长, 实机要是打歪了, trace 是唯一能看出"图标什么时候变的"的东西
+    M_YU_TRACE = True
+    M_YU_TRACE_EVERY = 0.30
+
+    # ==================== 保底 ====================
+    # 总开关。关掉 = 两条宏纯照表回放(切人不确认、大招不补按), 跟人按宏一模一样
+    SAFETY = True
+    # 【切人一格错, 后面每一格都发在错的人身上】—— 这是整条轴最该有的一道保底。
+    # 剩下的 gap 照等, 时序一点不变; 被游戏拒绝(上一个动作/入场动画没演完)就一直补按,
+    # 最多再等 SWITCH_EXTRA(游戏的换人 CD 约 1 秒)
+    SWITCH_EXTRA = 1.50
+    SWITCH_REPRESS = 0.05        # 没到场时补按数字键的间隔
+    # 连续读到目标 index 这么多帧才算到场(特效会盖住槽位)。
+    # 【这道确认是有代价的】: 宏表给切人格的 gap 多数只有 50ms, 而"按下 -> 游戏换人 -> 连读
+    # 两帧确认"比这长, 所以每个切人格都会晚一点。干跑量到的是【每格晚 0.13s, 一轮 16 个切人格
+    # 累计 1.7s】(启动宏 24.96s vs 表 23.29s, 循环宏 23.27s vs 表 21.48s)。
+    # 一轮 28 秒里多出来的 1.7 秒会挤占绝息/流岚那两个 25 秒 CD 的 buff 窗口, 实机要盯。
+    # 嫌慢有三条路, 按代价从小到大: 压成 1(特效误判的概率上去一点) / MACRO_SPEED 调到
+    # 0.93 左右把整条表按比例缩回去 / 直接关 SAFETY 纯照宏打
+    SWITCH_CONFIRM = 2
+    # 【切人没确认就别假装切过去了】: 累计这么多次就放弃这一轮宏交回框架 ——
+    # 乱着打完一整轮不如早点重来
+    MACRO_ABORT_DESYNC = 2
+    E_CD_CAP = 1.60              # 'E#'(按到进 CD)那类格子的上限
+    # 'E#' 的"先见亮才认暗"那道门等多久。【默认的 0.15 太短】: 切人后技能栏要过几帧
+    # 才换成新角色, 那几帧读到的是【上一个人】的 CD —— 0.15 秒内没见过"可用"就会被
+    # 当成"本来就在 CD 上"直接跳过, E 一次都不发。而穗穗的 E 恰好紧跟在切人后 100ms。
+    # 干跑里复现过: SuE_没见过亮(x5,0.45s)
+    E_READY_GRACE = 0.40
+    E_SPAM_INTERVAL = 0.06
+    R_EXTRA_CAP = 2.00           # 大招没出手时补救的上限
+
+    # ---- 切人之后紧跟着的长按, 要多等一下 ----
+    # 【用户 2026-09-22 实机: "切千咲的时候会愣一下再打"】。
+    # macro_switch 确认的是"in_team() 读到目标 index"= 人已经在场了, 但【在场 != 能出招】:
+    # 入场动作还要演几百毫秒。宏表里切人格的 gap 只有 50ms, 紧跟着的 1150ms 长按,
+    # 【按下沿正好落在入场动作里被丢掉】 —— 而长按又不能补按(PostMessage 重发会把
+    # 已经按住的状态打断, 见 tap/A_TAP 那段), 所以只能等游戏先把入场演完再按下去。
+    # 对千咲尤其要命: 锯环·疾攻【长按才从第2段起手】, 按下沿丢了就退化成第1段。
+    # 只对"上一格是切人 + 这一格按住时间 >= HOLD_SETTLE_MIN"的格子生效, 短按不受影响
+    HOLD_AFTER_SWITCH = 0.20     # 等多久(秒)
+    HOLD_SETTLE_MIN = 0.30       # 按住多久才算"长按", 短于这个的不等
+
+    # ---- 千咲: 大招之后那发强化E ----
+    # 【用户 2026-09-22 实机: "千咲的流程也不对, 没放出强化E"】。两个原因叠在一起:
+    #  ① 宏表里千咲 R 那格后面紧跟着 E(gap=0), 而大招演出刚结束时【收招还在演】,
+    #     E 按在这段里被整个吃掉 —— 跟秧秧的 M_R_TO_E 是同一个坑;
+    #  ② 强化E 要【回路能量满】才放得出来, 满没满是打出来的, 表给不了保证。
+    # 判据用 E 图标的白像素占比, 阈值是判据驱动旧版标定的: 亮起前基线 0.0000,
+    # 亮起后持续在 0.158~0.211, 噪声见过 0.0942 —— 所以 0.13 卡在噪声和信号中间。
+    # 【到点没亮也照按一次】: 按了不亏, 落在普通E 上也是在攒回路
+    CHI_E_STAR = True
+    # 【0.60 -> 0.15】(2026-09-22 实机, 用户: "为什么每次千咲放强化E都要卡一下才放")。
+    # 实录里 R 演完之后 E 图标【0.12 秒就读到亮了】—— 残响早就满了, 那 0.6 秒纯粹是干站着。
+    # 而且 0.6 还不保险: 18:23 那轮按下去照样被吞("强化E 按了但图标一直亮着")。
+    # 【改成连发盖住收招】之后这个数就不需要大了, 留一点只是别在 HUD 刚回来那一帧就发
+    # 【0.35 -> 0.20】(2026-09-22 用户第三次提: "正常流程千咲都是R完后按强化E,
+    # 实机跑下来感觉还是不流畅")。实测 R 演出结束到按下 E 的间隔是 0.49~0.67 秒,
+    # 拆开= 这个等待 + fill_saw_resonance 读一次屏(0.05) + cast_enhanced_e 又读一遍(0.12)。
+    # 后面那一遍已经去掉了(见 'E*' 分支), 这里再压一点。
+    # 【别压到 0】: R 演出结束(HUD 回来)之后收招还在演, 发出去的键会被丢掉 ——
+    # 而这一下是单发, 丢了这一轮就没电锯了。日志里 `强化E(没亮` 变多就往上加
+    CHI_R_TO_E = 0.20
+    # 连发窗口: 发一次 -> 读图标 -> 没暗就再发。收招期间发的会被游戏丢掉, 单发必丢,
+    # 只有连发盖得住(跟 fire_r 是同一个道理)
+    # 【连发窗口默认 0 = 只发一次】。连发能盖住收招, 但齿轨轮回一放出去 E 就换回
+    # 解弦之眼(有 CD), 多按的那几下会真的放出去、吃掉残响 —— 又是"改状态"那一类。
+    # 收招靠 CHI_R_TO_E 等过去就够了; 真被吞了这一轮少一次电锯, 下一轮照常
+    CHI_E_FIRE_WINDOW = 0.0
+    CHI_E_FIRE_INTERVAL = 0.10
+    CHI_E_LIT_BOX = 'box_resonance'
+    CHI_E_LIT_COLOR = {'r': (200, 255), 'g': (200, 255), 'b': (200, 255)}
+    CHI_E_LIT_THRESHOLD = 0.13
+    CHI_E_LIT_CONFIRM = 2        # 连续这么多次过阈值才认, 挡单点噪声
+    CHI_E_LIT_POLL = 0.03
+    CHI_E_LIT_MAX_WAIT = 1.20    # 等图标亮的上限(秒)
+    # 按完之后回头确认: 齿轨轮回放出去了, 强化态就被消耗掉, 图标应该暗下去。
+    # 【还亮着 = 那一下被吞了】(入场锁/收招/硬直), 重按一次。
+    # 【别用 has_cd 判】: 强化段很可能只消耗强化态、不进基础冷却 —— 旧版注释里写着
+    # 秧秧那边实测 7/7 都判错就是这个原因
+    CHI_E_CONFIRM = True         # 关掉 = 发一次就走, 不读图标确认
+    # 【长按锯环·疾攻之前, 确认人真的在电锯模式里】。E*(齿轨轮回)要是被吞了, 这一下
+    # 1150ms 长按打出来的是【普通普攻】, 整轮千咲的输出作废, 而且外表看不出区别 ——
+    # 所以宁可在这里多花一点时间补一发 E
+    # 【默认关】: 补那一发 E 同样是"改状态"(多吃一次 CD/残响)。
+    # 没进电锯这一轮千咲输出就少, 但不会把别的东西带歪
+    CHI_SAW_GATE = False
+    # ---- 残响不够就先点普攻攒够再开强化E ----
+    # 【用户 2026-09-22 实机要求】: "实战情况多样, 千咲在本该开强化E的时候回路能量不够,
+    # 开不了强化E, 需要多A几下打够能量开强化E"。
+    # 【这一条属于"改状态"里的例外】: 多点几下普攻攒的就是【锯环残响】—— 那正是这一格
+    # 需要的资源, 不像补按 E 那样会翻形态/吃CD。跟穗穗的回路闸是同一类。
+    # 判据还是 E 图标的白像素占比(亮 = 残响满, 齿轨轮回就绪)
+    CHI_FILL_SAW = 2.50          # 点普攻攒残响的上限(秒), 0 = 关掉
+    CHI_FILL_INTERVAL = 0.12
+    # 【补救那一发等得短一些】: E* 那一格已经等过 CHI_E_LIT_MAX_WAIT(1.2s) 都没亮,
+    # 说明多半是【残响真的没攒满】而不是那一下被吞了 —— 补按救不回来, 等满一样白等。
+    # 给 0.4s: 够覆盖"被吞"那种(图标本来就亮着, 一读就中), 不够的那种也不拖太久
+    CHI_SAW_RETRY_WAIT = 0.40
+
+    # ---- 大招前的能量闸(所有 R!/R3 那类格子共用) ----
+    # 【用户 2026-09-22 实机: "每次千咲的R能量都不够, 肯定是前面少打了什么"】。
+    # 把两条宏里千咲到自己 R 为止的动作拉出来对比, 差别是实打实的:
+    #   启动宏: E + A x7   (1.95 / 3.55 / 3.80 / 4.10 / 4.50长按 / 7.50 / 8.25空中A)
+    #   循环宏: E + A x5   (2.20 / 3.65 / 5.56 / 5.81 / 6.11)
+    # 循环轮本来就少两下, 而且那 5 下【全都紧跟在切人后】(切人格 gap 只有 50ms),
+    # 入场动画还要再吞掉一部分 —— 所以启动轴的 R 放得出来, 循环轴放不出来。
+    # 实机日志: ChR补救_NOFIRE(x40/x41) 出现 5 次 —— 连按 40 下都放不出来, 就是能量没满。
+    # 【大招是能量门控不是 CD 门控】: 判据用 liberation_available()(读图标亮不亮),
+    # 不是 has_cd。能量靠普攻/技能命中攒, 【干等等不来, 必须动手点】——
+    # 跟穗穗的回路闸、千咲的攒残响是同一类"攒的正是这一格要用的资源", 安全
+    LIB_FILL = 2.50              # 图标不亮时点普攻攒能量的上限(秒), 0 = 关掉
+    LIB_FILL_INTERVAL = 0.12
+
+    # ---- 穗穗大招前的回路闸 ----
+    # 【用户 2026-09-22 实机报的】: "穗穗在启动轴里没有打满回路就开R了"。
+    # 宏是照表按时间走的, 表里给穗穗攒回路的那几下 A 够不够, 取决于打没打中、有没有被
+    # 怪打断 —— 宏本身给不了任何保证。满不满读 suisui_forte3 这张图(芳菲信 600 那一档),
+    # 阈值和确认帧数都是从判据驱动旧版搬过来的(它那边叫 FORTE3_THRESHOLD/FORTE3_CONFIRM)。
+    # 【等的时候必须点普攻】: 回路就是普攻攒出来的, 干等永远等不满。
+    # 【这一格会把后面整条宏往后推】—— 等多久推多久, 跟切人确认是一个性质
+    FORTE3_GATE = True
+    FORTE3_WAIT = 3.0            # 等的上限(秒), 超了照放不误: 少一档好过把整轮宏卡死
+    FORTE3_THRESHOLD = 0.75      # 旧版标定的值, 注释写着"原来 0.6 太松会误判"
+    FORTE3_CONFIRM = 2           # 连读这么多帧都命中才认, 单帧误判不算
+    # 一下普攻都没点就读到"满", 而且快于这个秒数 -> 打一条警告(只报不拦)。
+    # 见 wait_forte3 里那段: 这种读数多半是穗穗没进濯雨时、读到水云息条了
+    FORTE3_SUSPECT = 0.30
+
+    # 处决。字幕: "2羽打完之后, 有处决打处决强制取消后摇, 然后按循环宏"。
+    # 【只在手动段末尾按这一次】—— 处决带全局时停、动画期间 HUD 整个不在,
+    # 按在别处会骗过大招/重击的 HUD 判据
+    F_BREAK = True
+    F_BREAK_ANIM = 5.00          # 按完等 HUD 回来的上限(处决动画时长因角色而异)
+
+    MACRO_SPEED = 1.00           # 整条宏的速度系数, 1.0 = 照表
+
+    # ==================== 两条宏(逐条从宏面板截图抄下来的) ====================
+    # 每行 = (动作, 按住ms, 松开后等ms, 注释)。动作:
+    #   'A'      左键(普攻)。按住 ms 就是宏里那个按住时长, 1150/650/600 那几格是长按
+    #   'W'      向前走一下(循环宏第一格, 调位置用)
+    #   'E'/'R'/'Q'   共鸣技能 / 共鸣解放 / 声骸技能, 【发给当时在场的那个人】
+    #   'R!'     大招: 【连发到 HUD 消失为止】, 再等演出结束。不是"发一次然后盯着",
+    #            原因见 macro_key 里那段注释(宏表里 Q 那格的 gap 是 0)
+    #   'R3'     穗穗大招: 先等三段回路满(没满就接着点普攻), 再走 'R!' 那一套
+    #   'E*'     千咲的强化E(齿轨轮回): 先等大招收招演完, 再等 E 图标亮, 按完确认进了电锯
+    #   'A~'     千咲的电锯长按(锯环·疾攻 第2段起手 -> 自动接第3段): 长按前先确认在电锯模式,
+    #            不在就补一发 E。其余跟 'A' 一样(含切人后的入场等待)
+    #   'SPACE'  跳(走框架配置的跳跃键)
+    #   '>SUI'/'>CHI'/'>YY'  切人; 结尾带 '^' = 这一下是变奏入场(协奏满), 【只影响框架记账】
+    # 末行的 9999 在表里写成 0: 那是宏自己的结束标志, 不是真要等 10 秒
+    OPENER_MACRO = (
+        # 开局场上就是穗穗(1 号位), 字幕: "流程从穗穗3a到秧秧最后的变奏入场结束"
+        ('A',      50,  250, '穗A1'),
+        ('A',      50,  600, '穗A2'),
+        ('A',      50,  200, '穗A3'),
+        ('>YY',    50,  150, '切秧秧'),
+        ('A',      50,  100, '秧A'),
+        ('>CHI',   50,   50, '切千咲'),
+        ('E',      50,  250, '千E'),
+        ('A',      50,  250, '千A'),
+        ('>SUI',   50,   50, '切穗穗'),
+        ('E#',     50,  200, '穗E(按到进CD —— 切人后 100ms 就按, 会被入场动画吞)'),
+        ('>YY',    50,   50, '切秧秧'),
+        ('A',      50,  400, '秧A'),
+        ('A',     100,  200, '秧A'),
+        ('>CHI',   50,   50, '切千咲'),
+        ('A',      50,  200, '千A'),
+        ('A',      50,  250, '千A'),
+        ('A',      50,  350, '千A'),
+        ('A',     100,  450, '千A'),
+        ('>SUI',   50,  600, '切穗穗'),
+        ('A',      50,  800, '穗A'),
+        ('A',      50,  250, '穗A'),
+        ('>YY',    50,   50, '切秧秧'),
+        ('E',      50,  250, '秧E(剑式切换)'),
+        ('>CHI',   50,  200, '切千咲'),
+        ('A',      50,  550, '千A'),
+        ('SPACE',  50,  100, '跳'),
+        ('A',      50,   10, '空中A'),
+        ('>SUI',   50,   50, '切穗穗'),
+        ('A',      50,  850, '穗A'),
+        ('Q',      25,    0, '穗声骸'),
+        ('R3',     50, 4350, '穗大招(先等三段回路满, 再连发到出手)'),
+        ('>YY',    50,  800, '切秧秧'),
+        ('A',      50,  250, '秧A'),
+        ('A',      50,  200, '秧A'),
+        ('>CHI',   50,    0, '切千咲'),
+        ('Q',      50,    0, '千声骸'),
+        ('R!',     50, 3700, '千大招(连发到出手)'),
+        ('E*',     50,    0, '千强化E(等收招 + 等图标亮再按, 见 CHI_*)'),
+        ('>YY',    50,   50, '切秧秧'),
+        ('A',      50,  400, '秧A'),
+        ('A',      50,  450, '秧A'),
+        ('>CHI',   50,   50, '切千咲'),
+        ('A~',   1150,   50, '千电锯长按A(锯环·疾攻2->3段)'),
+        ('A',      50,    0, '千A(锯环·终结)'),
+        ('>YY',    50,   50, '切秧秧'),
+        ('A',     600,  650, '秧长按A'),
+        ('>CHI',   50,   50, '切千咲'),
+        ('A',      50,  300, '千A'),
+        ('>YY^',   50,    0, '变奏切秧秧(宏结束, 表里 9999)'),
+    )
+
+    # 跟启动宏的差: 开头三格是秧秧自己的收尾(W/E/A, 启动宏那边是穗穗 3A), 中段的穿插顺序
+    # 不一样; 从穗穗 Q 那一格往后【逐格相同】, 只差穗穗那下 A 的间隔(650 / 850)和
+    # 收尾千咲那下 A 的间隔(400 / 300)
+    LOOP_MACRO = (
+        # 开头这三格还在秧秧身上: 手动段(2羽)刚打完, 人还是她
+        ('W',      50,    0, '向前走(调位置)'),
+        ('E',      50,  150, '秧E(剑式切换)'),
+        ('A',      50,  100, '秧A'),
+        ('>SUI',   50, 1000, '切穗穗'),
+        ('A',     650,    0, '穗长按A'),
+        ('>CHI',   50,   50, '切千咲'),
+        ('A',      50,    0, '千A'),
+        ('>YY',    50,   50, '切秧秧'),
+        ('A',      50,  400, '秧A'),
+        ('A',      50,  450, '秧A'),
+        ('>CHI',   50,   50, '切千咲'),
+        ('E',      50,  200, '千E'),
+        ('A',      80,   55, '千A'),
+        ('>SUI',   50,   50, '切穗穗'),
+        ('E#',     50,  575, '穗E(按到进CD —— 同上)'),
+        ('A',      50,  600, '穗A'),
+        ('A',      50,  250, '穗A'),
+        ('>CHI',   50,   50, '切千咲'),
+        ('A',      50,  200, '千A'),
+        ('A',      50,  250, '千A'),
+        ('A',      50,   50, '千A'),
+        ('>YY',    50,   50, '切秧秧'),
+        ('E',      50,  250, '秧E(剑式切换)'),
+        ('>SUI',   50,   50, '切穗穗'),
+        ('A',      50,  650, '穗A'),
+        ('Q',      25,    0, '穗声骸'),
+        ('R3',     50, 4350, '穗大招(先等三段回路满, 再连发到出手)'),
+        ('>YY',    50,  800, '切秧秧'),
+        ('A',      50,  250, '秧A'),
+        ('A',      50,  200, '秧A'),
+        ('>CHI',   50,    0, '切千咲'),
+        ('Q',      50,    0, '千声骸'),
+        ('R!',     50, 3700, '千大招(连发到出手)'),
+        ('E*',     50,    0, '千强化E(等收招 + 等图标亮再按, 见 CHI_*)'),
+        ('>YY',    50,   50, '切秧秧'),
+        ('A',      50,  400, '秧A'),
+        ('A',      50,  450, '秧A'),
+        ('>CHI',   50,   50, '切千咲'),
+        ('A~',   1150,   50, '千电锯长按A(锯环·疾攻2->3段)'),
+        ('A',      50,    0, '千A(锯环·终结)'),
+        ('>YY',    50,   50, '切秧秧'),
+        ('A',     600,  650, '秧长按A'),
+        ('>CHI',   50,   50, '切千咲'),
+        ('A',      50,  400, '千A'),
+        ('>YY^',   50,    0, '变奏切秧秧(宏结束, 表里 9999)'),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.opener_armed = True
+        self.last_opener = -1
+        self.macro_t0 = 0.0
+        self.macro_marks = []
+        self.cur = None
+        self.holding_attack = False
+        self.poking = False
+        self.switch_press_at = 0.0
+        self.lib_press_at = 0.0
+        self.loop_count = 0
+        self.macro_desync = 0
+        self.last_was_switch = False
+        self.chi_in_saw = False        # 千咲进没进电锯模式(E* 那一格的结果)
+        # 【这里也要启一次】: reset_state() 只在 load_chars() 时跑, 而角色对象会被
+        # 粘性复用 —— 开关自动战斗时很可能一次都不跑到
+        try:
+            start_enable_watch(self.task, self.logger)
+        except Exception:
+            pass
+
+    def reset_state(self):
+        super().reset_state()
+        self.opener_armed = True
+        start_f_watch(self.task, self.logger)
+        start_enable_watch(self.task, self.logger)
+
+    # ==================== 队伍判定 ====================
+
+    @property
+    def is_in_yangqiansui(self) -> bool:
+        """本队 = 千咲 + 穗穗 + 秧秧·玄翎。【按类名判】。"""
+        team_members = 0
+        for char in self.task.chars:
+            if char and char.name in {'Chisa', 'Suisui'}:
+                team_members += 1
+        return team_members == 2
+
+    def teammate(self, name):
+        for char in self.task.chars:
+            if char is not None and char.name == name:
+                return char
+        return None
+
+    def opener_pending(self):
+        return self.opener_blocked_by() is None
+
+    def opener_blocked_by(self):
+        """启动轴不跑的原因; 返回 None 表示该跑。
+
+        【这里不查任何"某个技能可用"】: 场下角色的可用性读的是上次在场时 OCR 到的 CD 残值,
+        拿它当门会开场愣一下。防重入靠 opener_armed + OPENER_MIN_GAP。
+        """
+        if not self.is_in_yangqiansui:
+            return 'team is not chisa/suisui/yangyangsp'
+        if not self.opener_armed:
+            # 【玩家开关过自动战斗就放行】。手动停任务不走 combat_end(), 这个标记会跨局
+            # 留在 False; 重开时角色对象又常常被粘性复用, reset_state() 根本不跑。
+            # 见文件顶部 start_enable_watch 那段
+            restarted = getattr(self.task, '_ww_task_restarted_at', -1)
+            if restarted > self.last_opener:
+                self.logger.info('auto combat 重开过 — 启动轴重新武装, 从头跑')
+                self.opener_armed = True
+                return None
+            return 'already armed-down (ran once this combat)'
+        # 玩家按过 F = 真的重开了一局, 直接放行(战斗判定抖动不会有人按 F)
+        f_press = getattr(self.task, '_f_last_press', -1)
+        if f_press > self.last_opener:
+            waited = time.time() - f_press
+            delay = f_settings(self.task)[1]
+            if waited < delay:
+                return f'F pressed {waited:.2f}s ago, waiting {delay:.2f}s for the mobs'
+            return None
+        if self.last_opener >= 0 and time.time() - self.last_opener < self.OPENER_MIN_GAP:
+            return f'ran {time.time() - self.last_opener:.1f}s ago (< {self.OPENER_MIN_GAP:.0f}s)'
+        if not self.task.use_liberation:
+            return 'task.use_liberation is off'
+        return None
+
+    # ==================== 宏原语(引擎) ====================
+    # 从 Changli__Jinhsi__Verina/Changli.py 逐字抽出来的(它那份又源自 Brant__Changli__Lupa),
+    # 【注释里的实机数据是那几条轴的标定记录, 不是秧千穗的】。
+    # 这里是整套引擎, 所以有几个这条轴当前没用上的备件(pass_intro / lib_ready_now /
+    # poke_until_hud_back / press_e_then_switch / press_echo_until_cd / send_echo_now /
+    # switch_out_while_key) —— 调轴时要"等协奏满再切走""能量不满就跳过大招"这类保底,
+    # 直接拿来用, 不用再从别的队伍抄一遍
+    def macro_wait(self, sec):
+        """精确等待, 【不点击】。
+
+        不走 executor.sleep —— 它每 0.4 秒无条件插一次 next_frame 截图, 插入位置
+        不可控, 而这条轴的容错在 ±0.1 秒级。切成 0.1 秒一片, 片间检查任务是否被停用。
+        """
+        if sec <= 0:
+            self.task.executor.check_enabled(check_pause=False)
+            return
+        end = time.time() + sec
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                return
+            time.sleep(min(0.1, left))
+            self.task.executor.check_enabled(check_pause=False)
+
+    def macro_gap(self, sec, tag=None):
+        """间隙。【持续普攻打开时自动变成连点】—— 这就是"我没说停就一直A"。"""
+        if sec <= 0:
+            return 0
+        if not self.poking:
+            self.macro_wait(sec)
+            return 0
+        return self.macro_spam(sec, self.A_INTERVAL, tag=tag or 'gapA')
+
+    def macro_start(self):
+        self.macro_t0 = time.time()
+        self.macro_marks = []
+
+    def macro_mark(self, name):
+        self.macro_marks.append(f'{name}@{time.time() - self.macro_t0:.2f}')
+
+    def macro_timeline(self, since=0):
+        return ' '.join(self.macro_marks[since:])
+
+    def macro_spam(self, window, interval=None, tag='A', sample=None, sample_every=2,
+                   max_clicks=None):
+        """连点一个窗口。
+
+        打出几段由 window 决定, 不由单次点击的时机决定 —— 动画期间的点击会被丢掉,
+        连点保证总有一下落在动画刚结束的瞬间。时间轴上记首尾和点了几下, 对着录像
+        能反推一段动画多长: 窗口里打出 n 段, 一段就约等于 window/n。
+        """
+        interval = self.A_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        # 次数上限: 光靠时间兜底的话, interval 被调成 0 或者机器卡一下就会瞬间
+        # 灌进去几千次点击
+        cap = int(window / max(interval, 0.01)) + 2
+        # 【可以再封一层】: 用在【空中】那几格 —— 多余的点击会变成下落攻击,
+        # 落地会打断/改变后面的动作。封顶【不缩短窗口】, 所以不花时间
+        max_clicks = cap if max_clicks is None else min(cap, max_clicks)
+        self.macro_mark(f'{tag}_start')
+        self.spam_samples = []
+        while time.time() - start < window and n < max_clicks:
+            self.click()
+            n += 1
+            if sample is not None and n % sample_every == 0:
+                self.spam_samples.append(f'{time.time() - start:.2f}:{1 if sample() else 0}')
+            # 最后一段等待按剩余时间裁剪, 别整个 interval 等下去 —— 那是白送的延迟
+            remaining = window - (time.time() - start)
+            if remaining <= 0:
+                break
+            # 【减掉 A_TAP】: click 现在自己按住 A_TAP 秒, 不扣的话这段连点的周期
+            # 从 interval 变成 interval + A_TAP, 一个窗口里少点三分之一下
+            self.macro_wait(min(max(0.0, interval - self.A_TAP), remaining))
+        self.macro_mark(f'{tag}_end(x{n})')
+        return n
+
+    def spam_key(self, send, window, interval=None, tag='key', poke=None, presses=None,
+                 click_interval=None, stop_when=None):
+        """在一个窗口里反复发同一个技能键, 用来盖住动画那一段。
+
+        动画期间的按键是被丢掉的、不排队, 所以单发必丢 —— 这个形状在爱琳莫那条轴上
+        踩到过六次, 症状统一是"那一步慢了"(要等整个动画演完才有第二次机会)。
+
+        【必须在这个角色自己的回合里跑完, 不要跟切人并行】: 切人期间发出去的键会被
+        游戏带过换人边界落在新角色身上。点击可以并行(quick_switch 的 click_during),
+        技能键不行。唯一的例外是 switch_into_lib()。
+
+        Args:
+            poke: 发键期间要不要照常点普攻。默认跟随全局的持续普攻开关。
+            click_interval: 点普攻的间隔, 默认 A_INTERVAL。给 A_INTERVAL_FAST
+                就是"技能键按自己的节奏、普攻按加密节奏", 两条流互不影响。
+            stop_when: 每发一次键之后调一次, 返回 True 就停。用在【多按一下会
+                烧掉后面要用的充能】的地方 —— 一旦读到技能已经不可用就立刻收手。
+                【会读屏, 别配太密的 interval】。
+            presses: 只发这么多次, 均匀铺在窗口里。用在"连续点按两次E"那种
+                【次数本身有意义】的地方 —— 连发会把两发挤成一发。
+                【给了 presses 就由它说了算, window 只用来推间隔】: 否则
+                window=0(要求两发贴着发)会在第一发之后就把循环停掉, 变成单发。
+        """
+        interval = self.KEY_INTERVAL if interval is None else interval
+        poke = self.poking if poke is None else poke
+        click_interval = self.A_INTERVAL if click_interval is None else click_interval
+        if presses is not None and presses > 0:
+            interval = max(interval, window / presses)
+        start = time.time()
+        n = 0
+        clicks = 0
+        next_click = 0.0
+        while True:
+            send()
+            n += 1
+            if stop_when is not None and stop_when():
+                break
+            if presses is not None:
+                if n >= presses:
+                    break
+                left = interval
+            else:
+                left = window - (time.time() - start)
+                if left <= 0:
+                    break
+            step_end = time.time() + min(interval, left)
+            # 发键的节奏和点击的节奏各走各的 —— 挂在一起的话点击会被技能键的
+            # 间隔卡住(爱琳莫那边 R 被 E2_POLL 卡住就是这个)
+            while True:
+                now = time.time()
+                if now >= step_end:
+                    break
+                if poke and now >= next_click:
+                    self.click()
+                    clicks += 1
+                    next_click = now + click_interval
+                self.macro_wait(min(0.02, step_end - time.time()))
+        # 【点击数也要打进去】: x{n} 只数了技能键, 看不出这段时间有没有在持续普攻。
+        # 用户 2026-08-16 问过一次"E的期间也要一直普攻" —— 实际一直在点,
+        # 只是日志里看不见。A x0 就是真的没点(poke=False 的那几格)
+        self.macro_mark(f'{tag}(x{n},A x{clicks})')
+        return n
+
+    def release_attack(self):
+        if self.holding_attack:
+            self.task.mouse_up()
+            self.holding_attack = False
+
+    def tap(self, hold=None):
+        """点一下普攻, 【真的按住 hold 秒】。为什么不能用 task.click 见 A_TAP 的注释。"""
+        hold = self.A_TAP if hold is None else hold
+        self.task.mouse_down()
+        self.holding_attack = True
+        try:
+            self.macro_wait(hold)
+        finally:
+            self.task.mouse_up()
+            self.holding_attack = False
+
+    def click(self, *args, **kwargs):
+        """本类里所有的 self.click() 都改成按住 A_TAP —— 引擎里那些"顺手点"也一样。
+
+        BaseChar.click 强制 down_time=0.01, 在这条轴上等于没点。参数照收不用:
+        这条轴的点击【一律点屏幕中心】, 没有带坐标的调用。
+        """
+        self.tap()
+
+    def quick_switch(self, target, click=False, click_during=None, settle=None, time_out=None,
+                     read_con=False, assume_con=False, click_interval=None,
+                     click_first=False):
+        """按数字键直切给指定角色。
+
+        不走 switch_next_char(): 那个要先跑 _choose_switch_target 选人, 顺序是框架
+        说了算; 而且它每次发数字键都跟一次左键, 想不要那下 A 就没法不要。
+
+        Args:
+            click: 到场之后补一下普攻(复刻框架 BaseCombatTask.py:644 的行为)。
+                这条轴上一般不用 —— 持续普攻本身就在点, 再补就是多推一段连段。
+            click_during: 等换人生效的这段时间里继续点。默认跟随持续普攻开关。
+                这就是用户说的"狂点普攻切人": 换人不是瞬间的, 这几下落在上一个
+                角色身上, 正好把他最后那一段打出来。
+            read_con: 按键之前读一次协奏, 决定要不要按"带变奏"记账。
+                【不便宜】(能量环连通域分析), 只有真的要变奏的那两三处才传 True。
+            assume_con: 不读屏, 直接按满协奏记。用在【刚放完大招】之后 ——
+                那时协奏必满, 而演出期间能量环读数不可信。
+
+        Returns: 是否真的切过去了。
+        """
+        if target is None:
+            return False
+        if target is self.cur:
+            # 目标已经在场。【这里必须早退】: 不早退的话到场判据立刻成立,
+            # 整步 50 毫秒走完, 后面那些"给他的"按键其实发在了别人身上
+            self.macro_mark(f'>{target.name[:3]}(already)')
+            return True
+        entry = time.time()
+        time_out = self.SWITCH_TIME_OUT if time_out is None else time_out
+        settle = self.SWITCH_SETTLE if settle is None else settle
+        click_during = self.poking if click_during is None else click_during
+        click_interval = self.A_INTERVAL if click_interval is None else click_interval
+        source = self.cur if self.cur is not None else self
+        # 【第一个数字键要抢在读协奏之前发】: 读协奏是能量环的连通域分析, 少则
+        # 二三十毫秒、睡完之后的第一次读屏能到 0.86 秒 —— 夹在"上一个动作"和
+        # "数字键"之间就是白白的延迟。切人本身要 0.06~0.11 才落地, 来得及读完
+        slot = target.index + 1
+        # 【记下第一个数字键的时刻】: 有几格是靠它当锚点的。
+        # 用户逐帧量的都是"从切人到 A 出手", 而窗口默认从【检测到到场】算起 ——
+        # 中间隔着切人生效 + 读屏确认, 两者差好几十毫秒
+        self.switch_press_at = time.time()
+        # 【先点几下再发第一个数字键】(click_first = 点几下)。用在"边打A边不停切人"
+        # 的格子上: 游戏在角色动作期间会拒绝切人 —— 这正是那种写法不会掐掉 A 的原因。
+        # 但如果这一刻场上角色【刚到场、还没起手】, 切人键就没有东西挡着, 会当场生效,
+        # 她一下都不打就走。
+        # 【一下不够】(用户 2026-08-16: "这里千咲又没A出来了"): 那一下要是没被接受
+        # 就白给了。所以改成可以指定点几下 —— 每多一下只把切人键推迟一个
+        # click_interval(0.06), 但多一次撞上"能出招的那一帧"的机会
+        for i in range(int(click_first)):
+            self.click()
+            if i + 1 < int(click_first):
+                self.macro_wait(click_interval)
+        self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
+        if assume_con:
+            con_full = True
+        elif read_con:
+            con_full = bool(source.is_con_full())
+        else:
+            con_full = False
+        con_cost = time.time() - entry
+
+        start = time.time()
+        last = start   # 第一个数字键已经在上面发过了
+        next_click = 0.0
+        trace = [] if self.TRACE_SWITCH else None
+        team_size = len([c for c in self.task.chars if c is not None])
+        untrusted_hits = 0
+        clicks = 0
+        while time.time() - start < time_out:
+            now = time.time()
+            if now - last >= self.SWITCH_KEY_INTERVAL:
+                self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
+                last = now
+            # 点击的节奏跟切人键解耦: 切人键 0.03 秒一发, 点击照旧 A_INTERVAL,
+            # 否则这段时间会以 0.03 的密度灌点击, 远低于安全下限
+            if click_during and now >= next_click:
+                self.click()
+                clicks += 1
+                next_click = now + click_interval
+            self.task.next_frame()
+            in_team, index, count = self.task.in_team()
+            # 【count 不达标的 index 打折扣, 但不能一票否决】: in_team() 在只找到
+            # 一个槽位文本时照样返回 True 和一个 index(那是渲染顺序的产物);
+            # 但一票否决会造成假失败 —— 有槽位被特效盖住时 count 就是不达标,
+            # 切人明明成功了也判不出来, 卡满超时, 整条轴从这里崩
+            hit = in_team and index == target.index
+            trusted = in_team and count >= team_size
+            untrusted_hits = untrusted_hits + 1 if (hit and not trusted) else 0
+            if trace is not None:
+                trace.append(f'{time.time() - start:.2f}:'
+                             f'{(index if trusted else f"?{index}") if in_team else "x"}')
+            if hit and (trusted or untrusted_hits >= self.UNTRUSTED_CONFIRM):
+                self.handoff(source, target, con_full)
+                self.macro_mark(f'>{target.name[:3]}{"^" if con_full else ""}'
+                                f'({time.time() - entry:.2f}|con{con_cost:.2f}|A x{clicks})')
+                if trace:
+                    self.logger.info(f'switch trace -> {target.name}: {" ".join(trace)}')
+                if click:
+                    self.click()
+                    self.macro_mark(f'{target.name[:3]}A')
+                self.macro_gap(settle)
+                return True
+        # 【失败时更要打 trace】:
+        #   一直是旧角色的 index  -> 游戏真的在拒绝切人(上一个动作还没演完)
+        #   带 ? 的都是目标 index -> 切过去了, 是 count 判据把它挡住了
+        #   全是 x               -> HUD 整个不在(演出/时停里)
+        self.logger.warning(f'switch to {target.name} slot {slot} timed out '
+                            f'after {time_out:.1f}s (stuck in an animation?)'
+                            + (f' trace: {" ".join(trace)}' if trace else ''))
+        self.macro_mark(f'>{target.name[:3]}FAIL')
+        return False
+
+    def handoff(self, from_char, to_char, con_full):
+        """复刻 switch_next_char() 尾部那套交接记账 (BaseCombatTask.py:663-672)。
+
+        直接按数字键绕开了框架逻辑, 不补的话没人的 is_current_char 是 True,
+        get_current_char() 返回 None, AutoCombatTask 主循环当场崩。
+        """
+        self.task.in_liberation = False
+        from_char.switch_out(con_full=con_full)
+        to_char.is_current_char = True
+        to_char.has_intro = con_full
+        to_char.has_sub_dps_intro = con_full and from_char.is_sub_dps
+        to_char.last_switch_in_time = time.time()
+        if con_full:
+            now = time.time()
+            self.task.add_freeze_duration(now, to_char.intro_motion_freeze_duration, -100)
+            from_char.last_outro_time = now
+        self.cur = to_char
+
+    def switch_out_while_key(self, target, source, key_send, click=True,
+                             read_con=False, time_out=None, tag=None):
+        """一边切人, 一边给【离场角色】补技能键 —— 键只在 HUD 还读得到他时才发。
+
+        用户 2026-08-19: "E和切人同时进行, 同时持续攻击"。
+
+        【为什么要那道门】: 切人期间发出去的技能键会被游戏【带过换人边界, 落在新上场
+        的角色身上】—— 真同时发的话那发 E 很可能变成达妮娅放的, 白烧她一层充能,
+        而且小爱没变成机甲。这条在 达E1 那格已经烧过一次(所以那里改成了单发)。
+        所以判据是【HUD 还显示离场角色在场 = 这一发还会落在他身上】, 一从 HUD 上
+        消失就立刻停发。
+
+        跟 switch_into_lib 是同一个机制、相反的方向: 那边要 R 落在【新】角色身上,
+        所以【等】离场角色消失才开始发; 这边要 E 落在【老】角色身上, 所以他一消失
+        就【停】。
+
+        点击不受这道门约束 —— 点击落错人无所谓(顶多多推一段连段)。
+        """
+        if target is None:
+            return False
+        if target is self.cur:
+            self.macro_mark(f'>{target.name[:3]}(already)')
+            return True
+        entry = time.time()
+        time_out = self.SWITCH_TIME_OUT if time_out is None else time_out
+        src = source if source is not None else (self.cur or self)
+        slot = target.index + 1
+        self.switch_press_at = entry
+        # 【第一个数字键要抢在读协奏之前发】(quick_switch 里早就是这么做的, 这个新方法
+        # 漏了 —— 用户 2026-08-19 报"小爱E切达还是快0.2s")。
+        # 读协奏是能量环的连通域分析: 帧是热的时候二三十毫秒, 但【睡完之后的第一次
+        # 读屏要等一张新截图, 实测能到 0.86 秒】。夹在"上一个动作"和"数字键"之间
+        # 就是纯延迟, 而切人本身要 0.06~0.11 才落地, 完全来得及在换人之前读完
+        self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
+        con_full = bool(src.is_con_full()) if read_con else False
+        team_size = len([c for c in self.task.chars if c is not None])
+        n_key = n_click = 0
+        untrusted_hits = 0
+        arrived = False
+        next_click = 0.0
+        while time.time() - entry < time_out:
+            now = time.time()
+            self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
+            self.task.next_frame()
+            in_team, index, count = self.task.in_team()
+            # 只要 HUD 还认为离场角色在场, 这一发技能键就还落在他身上
+            if in_team and index == src.index:
+                key_send()
+                n_key += 1
+            if click and now >= next_click:
+                self.click()
+                n_click += 1
+                next_click = now + self.A_INTERVAL
+            hit = in_team and index == target.index
+            trusted = in_team and count >= team_size
+            untrusted_hits = untrusted_hits + 1 if (hit and not trusted) else 0
+            if hit and (trusted or untrusted_hits >= self.UNTRUSTED_CONFIRM):
+                arrived = True
+                break
+        label = tag or f'>{target.name[:3]}+key'
+        if arrived:
+            self.handoff(src, target, con_full)
+            self.macro_mark(f'{label}{"^" if con_full else ""}'
+                            f'({time.time() - entry:.2f}|key x{n_key},A x{n_click})')
+        else:
+            self.logger.warning(f'switch_out_while_key: {target.name} never came in '
+                                f'({n_key} keys, {n_click} clicks)')
+            self.macro_mark(f'{label}FAIL(x{n_key})')
+        return arrived
+
+    def fire_lib(self, char, tag='R', window=None):
+        """把大招发出去。判据是【队伍 HUD 掉下去 = 演出开始】。
+
+        不用 click_liberation(): 它一路阻塞到演出结束才返回, 而这条轴上好几处要在
+        演出【期间】继续做事(预输入普攻 / 连发 E / 疯狂切人)。
+
+        【发键之前不读屏确认可放】: 那次读屏是纯延迟, 夹在"上一个动作"和"R键"之间;
+        而且它并不能替我们做决定 —— 读到不可用我们照样要发(读数会抖, "没放出来"
+        的代价远大于"多按一下")。可用性只在失败分支里读一次, 用来分辨
+        "能量不够" 和 "键被动画吞了"。
+
+        【窗口给短】: 正常一两发就进去了。给长的话万一 HUD 判据失灵, 这里会一直
+        按 R —— 把后面轮到的那一发大招白按掉。宁可这一次没放出来, 也不要乱放。
+        """
+        window = self.LIB_FIRE_WINDOW if window is None else window
+        start = time.time()
+        # 【记下按 R 的时刻】: 后面几格拿它当锚点, 不拿"HUD 回来"。
+        # 按键时刻是我们自己发的、精确; HUD 要读屏, 每轮抖几十毫秒。
+        # 用户 2026-08-16 逐帧: 达按 R -> A 抬手 = 7s22~12s01 = 4.65 秒,
+        # 同一格 HUD 消失 4.18 秒 —— 【HUD 回来之后她还要 0.47 秒才能出招】
+        self.lib_press_at = start
+        n = 0
+        while time.time() - start < window:
+            # 【先发键再读屏】(用户 2026-08-16: "QR的还是慢了一点点")。
+            # 原来是"读一帧 -> 判HUD -> 才发R", 于是【每次放大招前都白读一次屏】——
+            # 实机 denQ@4.49 -> denR1_fired@4.59, 那 0.10 秒全是这次读屏。
+            # 而第一轮那次判断本来就没意义: 刚按完 Q, 不可能已经在演出里。
+            # 多发的那一下不会有副作用 —— 演出期间的按键被丢掉、不排队
+            char.send_liberation_key()
+            n += 1
+            # 【发键的节奏和读屏的节奏各走各的】(同 spam_key 里那条):
+            # 读屏要 0.04, 挂在一起就等于把重试周期翻倍, 而 R 被接受的时刻
+            # 只跟【按键什么时候落下】有关
+            if n % self.LIB_READ_EVERY == 0:
+                self.task.next_frame()
+                if not self.task.in_team()[0]:
+                    char.record_liberation_use()
+                    self.macro_mark(f'{tag}_fired(x{n})')
+                    return True
+            self.sleep(self.LIB_KEY_INTERVAL, check_combat=False)
+        # 最后再确认一次: 键刚发出去、演出还差一帧才开始的情况很常见
+        self.task.next_frame()
+        if not self.task.in_team()[0]:
+            char.record_liberation_use()
+            self.macro_mark(f'{tag}_fired(x{n})')
+            return True
+        self.macro_mark(f'{tag}_NOFIRE(x{n})')
+        # 失败了才去读一次能量环: lit=False 是"能量不够/大招还没转好",
+        # lit=True 是"键被上一个动作的动画吞了" —— 两种要改的地方完全不同
+        try:
+            lit = bool(char.liberation_available())
+        except Exception:
+            lit = 'err'
+        self.logger.warning(f'{tag}: {char.name} liberation never started an animation '
+                            f'after {n} presses (icon lit={lit})')
+        return False
+
+    def poke_until_hud_back(self, tag='anim', time_out=None, tail=None):
+        """演出期间一直点普攻, 等队伍 HUD 回来(演出结束)再往下走。
+
+        【为什么点】: 演出结束的第一帧就要有输入落进去, 而演出期间的点击是被丢掉的、
+        不排队 —— 连点免疫被吞, 单发要么埋在演出里要么等太久。
+        【为什么还要 tail】: HUD 回来那一刻角色多半还在收招里, 那几下照样被吞。
+
+        用户在启动轴上明写了这一格: "达妮娅动画期间一直点普攻触发不了, 所以需要等
+        一点点时间等出手再切, 或者说你识别到了HUD就可以切了"。
+
+        【"HUD 回来"要先确认它消失过】: 同 spam_key_through_lib —— 进来的这一刻
+        画面还在渐变, 读一帧很可能读回 True, 那就是"演出刚开头就判成结束"。
+        """
+        time_out = self.LIB_ANIM_TIME_OUT if time_out is None else time_out
+        tail = self.LIB_ANIM_TAIL if tail is None else tail
+        start = time.time()
+        n = 0
+        gone_seen = False
+        back = False
+        next_click = 0.0
+        while time.time() - start < time_out:
+            now = time.time()
+            if now >= next_click:
+                self.click()
+                n += 1
+                next_click = now + self.A_INTERVAL
+            self.task.next_frame()
+            if not self.task.in_team()[0]:
+                gone_seen = True
+            elif gone_seen or time.time() - start >= self.HUD_NO_ANIM_GRACE:
+                back = True
+                break
+            self.macro_wait(0.01)
+        # 演出这一段计入 freeze, 否则框架的各种 time_elapsed_accounting_for_freeze
+        # 会把它算成"这个角色磨蹭了 5 秒"
+        self.add_freeze_duration(start, time.time() - start)
+        self.macro_mark(f'{tag}({"ok" if back else "timeout"},'
+                        f'{"anim" if gone_seen else "NOANIM"},x{n},'
+                        f'{time.time() - start:.2f}s)')
+        if tail > 0:
+            self.macro_spam(tail, self.A_INTERVAL, tag=f'{tag}Tail')
+        return back
+
+    def wait_con_at_least(self, char, level, tag='con', cap=None, interval=None, poke=True):
+        """边打边等协奏圈涨到 level 以上(0~1)。到上限也往下走, 不把轴卡死。
+
+        跟 wait_con_for_intro 的区别: 那个是"等满才交棒"(门槛是 CON_ENOUGH=0.99,
+        【那个值是"环还没闭合"的哨兵, 不是真满】—— 要真满就把 level 传 1.0), 这个是
+        【等到某个门槛才做下一个动作】—— 用户 2026-08-21: "达妮娅有时候被打断,
+        能不能确保协奏圈超过75%才开R2Q切人"。
+
+        【为什么是门槛不是满】: R2 和 Q 自己还会把圈推上去一截, 所以起手时到 75%
+        就够她离场时是满的。等满再开 R2 反而是把这一截白等掉。
+
+        【读协奏不便宜】(能量环连通域分析), 所以轮询间隔别调太小。
+        【等的期间必须继续打】: 圈是靠打中涨的, 干站着等只会等到超时。
+        """
+        cap = self.CON_WAIT_TIME_OUT if cap is None else cap
+        interval = self.CON_POLL_INTERVAL if interval is None else interval
+        start = time.time()
+        n = 0
+        con = 0.0
+        hit = False
+        samples = []
+        next_click = 0.0
+        while self.time_elapsed_accounting_for_freeze(start) < cap:
+            try:
+                con = float(char.get_current_con())
+            except Exception:
+                con = 0.0
+            if len(samples) < self.CON_SAMPLE_MAX:
+                samples.append(f'{time.time() - start:.2f}:{con:.2f}')
+            if con >= level:
+                hit = True
+                break
+            now = time.time()
+            if poke and now >= next_click:
+                self.click()
+                n += 1
+                next_click = now + self.A_INTERVAL
+            self.macro_wait(interval)
+        self.macro_mark(f'{tag}({con:.2f},{"ok" if hit else "CAP"},A x{n},'
+                        f'{time.time() - start:.2f}s)')
+        if not hit:
+            self.logger.info(f'{tag}: con only reached {con:.2f} (< {level:.2f}) in '
+                             f'{cap:.1f}s — {" ".join(samples)}')
+        return hit
+
+    def on_field_char(self, time_out=None):
+        """现在场上是谁 —— 【只在拿不到入口角色时才用】, 因为它开局会说谎。
+
+        in_team() 的判据是"哪个槽位的名字文本【找不到】, 谁就在场"(BaseWWTask.py:930)。
+        战斗刚开始时队伍 HUD 还在渐入, 三个槽位的文本不是同时出现的 —— 这时它只找到
+        一个文本, 但 exist_count == 1 那个分支【照样返回 True 和一个 index】,
+        而那个 index 只是渲染顺序的产物。可信判据是 count >= 队伍人数。
+        """
+        time_out = self.FIELD_SETTLE_TIME_OUT if time_out is None else time_out
+        expected = len([c for c in self.task.chars if c is not None])
+        end = time.time() + time_out
+        while True:
+            self.task.next_frame()   # in_team() 读的是缓存帧, 不刷就是反复读同一张图
+            in_team, index, count = self.task.in_team()
+            if in_team and count >= expected:
+                for char in self.task.chars:
+                    if char is not None and char.index == index:
+                        return char
+                return None
+            if time.time() >= end:
+                self.logger.warning(f'team HUD never settled in {time_out:.1f}s '
+                                    f'(in_team={in_team} index={index} count={count} '
+                                    f'expected={expected}), cannot tell who is on field')
+                return None
+            self.macro_wait(0.03)
+
+    def wait_hud_back(self, tag='anim', time_out=None, tail=0.0):
+        """等演出结束(队伍 HUD 回来), 【期间一下都不点】。
+
+        跟 poke_until_hud_back 的唯一差别就是不点普攻 —— 【角色在空中时必须用这个】:
+        那时候的点击会变成下落攻击, 一下就把她砸回地面, 后面整段空中戏就没了。
+
+        【"HUD 回来"要先确认它消失过】: 进来的这一刻画面可能还在渐变, 读一帧很可能
+        读回 True, 那就是"演出刚开头就判成结束"。
+        """
+        time_out = self.LIB_ANIM_TIME_OUT if time_out is None else time_out
+        start = time.time()
+        gone_seen = False
+        back = False
+        while time.time() - start < time_out:
+            self.task.next_frame()
+            if not self.task.in_team()[0]:
+                gone_seen = True
+            elif gone_seen or time.time() - start >= self.HUD_NO_ANIM_GRACE:
+                back = True
+                break
+            self.macro_wait(0.01)
+        self.add_freeze_duration(start, time.time() - start)
+        self.macro_mark(f'{tag}({"ok" if back else "timeout"},'
+                        f'{"anim" if gone_seen else "NOANIM"},{time.time() - start:.2f}s)')
+        self.macro_wait(tail)
+        return back
+
+    def send_echo_now(self, char, tag='Q', presses=2, window=0.0):
+        """立刻放 Q。【三个角色统一走这里, 而且都放在离场前的最后一步】
+        (用户 2026-08-21: "因为声骸套装不一样, 统一设定最后放")。
+
+        【不读屏】: click_echo(time_out=0) 的第一件事是读屏 echo_available(),
+        读到 False 就掉进慢路径 —— 那条路要 OCR 一次 echo 的 CD, 再轮询最多 1 秒。
+        而 Q 的位置个个都在处决/大招刚结束那一带, 那几帧的读数正是最不可信的时候。
+        发键不读屏: 落在 CD 上是空操作, 不花钱。
+        """
+        self.spam_key(char.send_echo_key, window, interval=0.0, tag=tag,
+                      presses=presses, poke=False)
+        char.record_echo_use()
+
+    def hold_until_forte_cleared(self, tag):
+        """(调用时左键已经按着)按到重击就绪图标熄灭为止 = 这一发重击真的放出去了。
+
+        对秧秧来说这个图标亮 = 【苍翎】满 2 点, 暗 = 重击(苍剑式/羽剑式)把苍翎消耗掉了。
+
+        - 【先要读到过"满"才认"清空"】: HUD 刚回来那几帧图标还在渐入, 读不到 != 清空了。
+          HUD 回来 HEAVY_SEE_GRACE 秒还一次都没读到满, 就当判据读不到, 改盲按
+          HEAVY_BLIND_HOLD 秒 —— 不能拿"没读到"当"已经放出去"。
+        - 【按了 HEAVY_REPRESS 秒还满着 -> 松开重按】: 大招收招里那个按下沿可能被
+          游戏丢了, 按住的状态不一定会被补读; 给它一个新的按下沿。
+        - HUD 又不在(被别的演出盖住)的那几帧不判。
+        """
+        start = time.time()
+        press_at = start
+        seen_full = False
+        cleared = False
+        blind = False
+        represses = 0
+        trace = []
+        while time.time() - start < self.HEAVY_CAP:
+            self.task.next_frame()
+            if not self.task.in_team()[0]:
+                self.macro_wait(0.02)
+                continue
+            try:
+                full = bool(self.is_mouse_forte_full())
+            except Exception:
+                full = False
+            now = time.time()
+            if len(trace) < 30:
+                trace.append(f'{now - start:.2f}:{1 if full else 0}')
+            if full:
+                seen_full = True
+                if self.HEAVY_REPRESS > 0 and now - press_at >= self.HEAVY_REPRESS:
+                    self.task.mouse_up()
+                    self.macro_wait(0.05)
+                    self.task.mouse_down()
+                    press_at = time.time()
+                    represses += 1
+            elif seen_full:
+                cleared = True
+                break
+            elif now - start >= self.HEAVY_SEE_GRACE:
+                blind = True
+                break
+            self.macro_wait(0.02)
+        if blind:
+            left = self.HEAVY_BLIND_HOLD - (time.time() - press_at)
+            if left > 0:
+                self.macro_wait(left)
+        state = 'cleared' if cleared else ('blind' if blind else 'CAP')
+        self.macro_mark(f'{tag}重击({state},repress{represses},{time.time() - start:.2f}s)')
+        if not cleared:
+            self.logger.info(f'{tag}: heavy-ready icon never read as cleared ({state}) '
+                             f'— trace: {" ".join(trace)}')
+        return cleared
+
+    # ==================== 本条轴额外用到的原语 ====================
+
+    def mark_busy(self, busy):
+        """F 键监视线程靠它区分"战斗中手动处决"和"重开副本"。两个名字都置, 见文件顶部。"""
+        self.task._ww_macro_busy = busy
+        self.task._three_fire_macro_busy = busy
+
+    def wait_hud_up(self, cap=None, tag='HUD'):
+        """等队伍 HUD 【现在】在场。按 R 之前用 —— HUD 本来就不在的时候 fire_lib 会当场判
+        "演出开始了", 一发都没按出去就记成放了。跟 wait_hud_back(先消失再回来)是两回事。"""
+        cap = self.HUD_UP_CAP if cap is None else cap
+        start = time.time()
+        while time.time() - start < cap:
+            self.task.next_frame()
+            if self.task.in_team()[0]:
+                if time.time() - start > 0.05:
+                    self.macro_mark(f'{tag}在场({time.time() - start:.2f}s)')
+                return True
+            self.macro_wait(0.02)
+        self.macro_mark(f'{tag}一直不在({cap:.1f}s)')
+        return False
+
+    def fire_r(self, char, tag, window):
+        """先等 HUD 在场再 fire_lib。fire_lib 里的 self.sleep 会把 skip_combat_check 放回 False,
+        这里重新置上(宏里后面还有好几格高频切人)。"""
+        self.wait_hud_up(tag=f'{tag}前HUD')
+        fired = self.fire_lib(char, tag=tag, window=window)
+        self.task.skip_combat_check = True
+        return fired
+
+    def hold_heavy(self, tag):
+        """按住左键到重击就绪图标熄灭(重击把苍翎吃掉)。按住期间一下都不点。"""
+        self.task.mouse_down()
+        self.holding_attack = True
+        self.macro_mark(f'{tag}按住')
+        try:
+            return self.hold_until_forte_cleared(tag)
+        finally:
+            self.release_attack()
+            self.macro_mark(f'{tag}松开')
+
+    def pass_intro(self, source, target, cap, tag, poke=False):
+        """等 source 协奏真满, 然后切给 target(带变奏记账)。"""
+        self.wait_con_at_least(source, self.CON_FULL_LEVEL, tag=tag, cap=cap, poke=poke)
+        return self.quick_switch(target, read_con=True)
+
+    # ==================== 各格 ====================
+
+    def lib_ready_now(self, char, reads):
+        for i in range(reads):
+            self.task.next_frame()
+            try:
+                if self.task.in_team()[0] and char.liberation_available():
+                    return True
+            except Exception:
+                pass
+            if i + 1 < reads:
+                self.macro_wait(0.03)
+        return False
+
+    def press_key_until_cd(self, send, available, cap, tag, ready_grace=0.15, poke=False):
+        """一直按某个技能键到它进 CD。返回放出去了没有(本来就在 CD 上返回 False)。
+
+        【先见过"亮"才认"暗"】: 刚切人那几帧技能栏还是上一个人的, 读到的是【上一个人】的 CD。
+        实机 2026-09-11 两处都栽在这:
+          - 维里奈刚放完 Q 切今汐, 今汐到场 0.21s 就"判到 Q 进 CD", 可她那时还在变奏入场的不响应输入里,
+            角根本没召出来 -> 惊龙破空后协奏只有 0.50, 长离没变奏;
+          - 长离刚放完 E 切维里奈, 维里奈到场 0.12s 就"判到 E 进 CD"(读的是长离的 E CD 数字)。
+        所以要先读到过一次可用, 之后变成不可用才算放出去; ready_grace 秒都没见过可用, 才当它本来就在
+        CD 上、直接跳过。(别的队伍那份引擎里的 press_e_until_cd 没有这道门, 这里不用它。)
+        poke: 按键之间顺手点普攻(两条节奏各走各的, 不挤在同一帧)。
+        """
+        start = time.time()
+        n = live = clicks = 0
+        seen_ready = False
+        next_click = 0.0
+        while time.time() - start < cap:
+            self.task.next_frame()
+            hud = bool(self.task.in_team()[0])
+            if hud:
+                if available():
+                    seen_ready = True
+                elif seen_ready and live > 0:
+                    self.macro_mark(f'{tag}_ok(x{n},A x{clicks},{time.time() - start:.2f}s)')
+                    return True
+                elif not seen_ready and time.time() - start >= ready_grace:
+                    # 两种情况分不开: 本来就在 CD 上 / 第一发就被接受、技能栏换过来时已经在 CD 了
+                    # (没有入场锁的角色切进来第一发 E 常常就是这样)。都不用再按
+                    self.macro_mark(f'{tag}_没见过亮(x{n},{time.time() - start:.2f}s)')
+                    return False
+            send()
+            n += 1
+            if hud:
+                live += 1
+            step_end = time.time() + self.E_RESEND_STEP
+            while True:
+                now = time.time()
+                if now >= step_end:
+                    break
+                if poke and now >= next_click:
+                    self.click()
+                    clicks += 1
+                    next_click = now + self.A_INTERVAL
+                self.macro_wait(min(0.02, step_end - now))
+        self.macro_mark(f'{tag}_CD?(x{n},seen{int(seen_ready)},{cap:.1f}s)')
+        self.logger.info(f'{tag}: never read as on-cooldown after {n} presses (seen ready={seen_ready})')
+        return False
+
+    def press_echo_until_cd(self, char, cap, tag, ready_grace=0.15):
+        return self.press_key_until_cd(char.send_echo_key, char.echo_available, cap, tag,
+                                       ready_grace=ready_grace)
+
+    def press_res_until_cd(self, char, cap, tag, ready_grace=None, poke=False):
+        """刚切进来的角色按 E 到进 CD(带"先见过亮"那道门)。"""
+        ready_grace = self.SKILL_BAR_SETTLE if ready_grace is None else ready_grace
+        return self.press_key_until_cd(char.send_resonance_key, char.resonance_available, cap, tag,
+                                       ready_grace=ready_grace, poke=poke)
+
+    def macro_enter(self, entry_char):
+        chi = self.teammate('Chisa')
+        sui = self.teammate('Suisui')
+        if chi is None or sui is None:
+            return None, None, None
+        previous = getattr(self.task, 'skip_combat_check', False)
+        self.task.skip_combat_check = True
+        self.mark_busy(True)
+        self.cur = entry_char or self.on_field_char() or self
+        self.poking = False
+        # 处决全程交给玩家手动按, 框架切人时那一发一律关掉(内置非治疗角色默认会按)
+        self.check_f_on_switch = False
+        chi.check_f_on_switch = False
+        sui.check_f_on_switch = False
+        self.macro_desync = 0
+        self.macro_start()
+        return chi, sui, previous
+
+    def macro_exit(self, previous):
+        # 长按跨了好几个方法, 中途抛异常的话鼠标会一直按着。这里是唯一保证松手的地方
+        self.release_attack()
+        self.poking = False
+        self.task.skip_combat_check = previous
+        self.mark_busy(False)
+
+    def press_e_then_switch(self, char, target, window, to_switch, interval=None, tag='E'):
+        """发 E, 【从第一发 E 起算】过 to_switch 秒切给 target。补发窗口必须 <= to_switch。"""
+        interval = self.KEY_INTERVAL if interval is None else interval
+        e_at = time.time()
+        self.spam_key(char.send_resonance_key, window, interval=interval, tag=tag, poke=False)
+        char.record_resonance_use()
+        left = to_switch - (time.time() - e_at)
+        if left > 0:
+            self.macro_wait(left)
+        return self.quick_switch(target)
+
+
+    # ==================== 宏回放 ====================
+
+    def try_f_break(self, tag):
+        """处决提示亮着就按 F, 按完等 HUD 回来。返回按了没有。
+
+        【为什么不能直接 task.f_break()】: 它的门是 `can_break or check_f_break()`, 而
+        check_f_break 里【屏幕中央那一路找图有 1 秒频率限制】; 宏跑的时候 skip_combat_check=True,
+        战斗判定线程也不刷新 can_break —— 两条腿一起瘸, 症状是"处决从来不放"。
+        所以这里自己补中央那一路, 命中就把 can_break 置上, 再让 f_break() 走它的短路分支。
+        【is_pick_f 那道门不能省】: F 同时是拾取/交互键。
+        """
+        if not self.F_BREAK:
+            return False
+        task = self.task
+        ready = bool(getattr(task, 'can_break', False))
+        if not ready:
+            try:
+                task.next_frame()
+                hit = task.find_one('f_break',
+                                    box=task.box_of_screen(0.2, 0.2, 0.75, 0.8,
+                                                           hcenter=True, vcenter=True),
+                                    target_height=720)
+                ready = bool(hit) and not task.is_pick_f()
+            except Exception as e:
+                self.logger.info(f'{tag}: f_break probe failed {e}')
+                return False
+            if ready:
+                task.can_break = True
+        if not ready:
+            return False
+        start = time.time()
+        task.f_break()
+        task.can_break = False
+        # f_break() 【提示一消失就返回, 不等动画演完】—— 后面那几格都要读 HUD, 得等它回来
+        self.wait_hud_back(tag=f'{tag}处决anim', time_out=self.F_BREAK_ANIM)
+        self.macro_mark(f'{tag}处决({time.time() - start:.2f}s)')
+        return True
+
+    def watch_hud_gone(self, window, tag, poke=False):
+        """在 window 里盯着队伍 HUD 有没有消失过(= 全局时停/演出开始), 【用满 window】。
+
+        不提前返回 —— 这一格的长度是宏表定的, 出手了就得原样走完, 提前走会把后面每一格都推歪。
+        poke: HUD 还在(= 这一格的技能还没出手)时顺手点普攻。【真出手了一下都不会点】,
+        因为出手那一刻 HUD 就没了; 没出手的话这段时间正好拿来攒回路。
+        """
+        end = time.time() + window
+        gone = 0
+        seen = False
+        clicks = 0
+        next_click = 0.0
+        while time.time() < end:
+            self.task.next_frame()
+            if self.task.in_team()[0]:
+                gone = 0
+                if poke and not seen and time.time() >= next_click:
+                    self.tap()
+                    clicks += 1
+                    next_click = time.time() + self.A_INTERVAL
+            else:
+                gone += 1
+                if gone >= self.LIB_GONE_CONFIRM:
+                    seen = True
+            left = end - time.time()
+            if left <= 0:
+                break
+            self.macro_wait(min(0.02, left))
+        self.macro_mark(f'{tag}({"出手" if seen else "没出"},A x{clicks})')
+        return seen
+
+    def macro_key(self, act, hold, gap):
+        """把宏表里的一格发出去(不含切人)。技能键【发给当时在场的那个人】。
+
+        走 char.send_*_key 而不是硬编码 'E'/'R'/'Q': 玩家改过键位也认。
+        record_*_use 是框架自己的 CD 记账, 不记的话宏散掉之后内置逻辑会以为技能还能用。
+
+        返回【这一格的 gap 是不是已经在这里面用掉了】—— 带保底的那两格要自己管时间。
+        """
+        # 【char 要在所有分支之前取】: 'A~' 那一支也要用它。原来这一行在 A/W/SPACE 后面,
+        # 2026-09-22 加 'A~' 时插在了它前面 -> UnboundLocalError, 实机当场停任务
+        char = self.cur if self.cur is not None else self
+        if act == 'A~':
+            # 千咲的电锯长按。【先确认在电锯模式】: E*(齿轨轮回)被吞的话这一下退化成普通普攻
+            if self.SAFETY and self.CHI_SAW_GATE and not self.chi_in_saw:
+                self.logger.info(f'{char.name}: 上一格没进电锯模式 — 长按前补一发 E(齿轨轮回)')
+                self.macro_mark(f'{char.name[:2]}电锯补E')
+                self.chi_in_saw = self.cast_enhanced_e(char, tag=f'{char.name[:2]}补',
+                                                       cap=self.CHI_SAW_RETRY_WAIT)
+            act = 'A'
+            self.chi_in_saw = False      # 这一串打完接着就是锯环·终结, 电锯模式随之结束
+        if act == 'A':
+            # 【切人之后紧跟着的长按要多等一下】, 见 HOLD_AFTER_SWITCH
+            if (self.SAFETY and self.last_was_switch and hold >= self.HOLD_SETTLE_MIN
+                    and self.HOLD_AFTER_SWITCH > 0):
+                self.macro_wait(self.HOLD_AFTER_SWITCH)
+                self.macro_mark(f'长按前等入场({self.HOLD_AFTER_SWITCH:.2f})')
+            self.tap(hold)
+            return False
+        if act == 'W':
+            # 向前走一下(循环宏第一格)。WASD 是游戏默认键位, 框架没把它放进 key_config
+            self.task.send_key('w', down_time=hold)
+            self.macro_mark('走W')
+            return False
+        if act == 'SPACE':
+            self.task.send_key(self.task.key_config.get('Jump Key'), down_time=hold)
+            self.macro_mark('跳')
+            return False
+        if act == 'E+':
+            # 强化E1: 在同样长的一格里连发, 盖过变奏入场的 QTE 锁。见 E_SPAM_INTERVAL
+            if not self.SAFETY:
+                char.send_resonance_key(down_time=hold)
+                char.record_resonance_use()
+                self.macro_mark(f'{char.name[:2]}强化E1')
+                return False
+            self.spam_key(char.send_resonance_key, hold + gap, interval=self.E_SPAM_INTERVAL,
+                          tag=f'{char.name[:2]}强化E1', poke=False)
+            char.record_resonance_use()
+            return True
+        if act == 'E#':
+            # 按到这个技能进 CD 为止。【先见过亮才认暗】(press_key_until_cd), 刚切进来那几帧
+            # 技能栏还是上一个人的, 不带这道门会当场假成功
+            if not self.SAFETY:
+                char.send_resonance_key(down_time=hold)
+                char.record_resonance_use()
+                self.macro_mark(f'{char.name[:2]}E')
+                return False
+            entry = time.time()
+            self.press_res_until_cd(char, self.E_CD_CAP, tag=f'{char.name[:2]}E',
+                                     ready_grace=self.E_READY_GRACE)
+            char.record_resonance_use()
+            # 【判据成立也要把这一格的时间走完】: 提前走等于把后面每一格都往前挪,
+            # 宏的节奏就不是宏表那个节奏了(切人确认也是这么处理的)
+            left = (hold + gap) - (time.time() - entry)
+            if left > 0:
+                self.macro_wait(left)
+            return True
+        if act in ('R!', 'R3'):
+            if act == 'R3':
+                # 【穗穗专用的回路闸】: 三段回路没满就先接着点普攻, 满了立刻往下走
+                self.wait_forte3(f'{char.name[:2]}回路')
+            # 【能量不够就先点普攻攒】。放在回路闸后面: 那一段本来就在点 A, 能量顺带也涨了,
+            # 先让它跑完再读, 免得白等一轮
+            self.fill_liberation(char, f'{char.name[:2]}能量')
+            if not self.SAFETY:
+                char.send_liberation_key(down_time=hold)
+                char.record_liberation_use()
+                self.macro_mark(f'{char.name[:2]}R')
+                return False
+            # 【连发到 HUD 消失, 不是"发一次然后盯着"】(2026-09-22 实机改的)。
+            # 宏表里穗穗/千咲的 Q 那格【gap 就是 0】, R 紧跟着 Q 按下去会落在声骸动作里
+            # 被游戏丢掉 —— 演出期间的按键是被丢弃的、不排队, 盖住整段只能靠连发。
+            # 旧写法是"发一次 + watch_hud_gone 盯满整格", 症状是【白烧掉一整格 4.35 秒】
+            # 才发现没出手再去补救(实录 SuR(没出,A x22) / ChR(没出,A x19))。
+            # 启动轮之所以碰巧是好的, 是因为回路闸在前面等了 1.3 秒, 正好给了 Q 演完的时间
+            entry = time.time()
+            tag = f'{char.name[:2]}R'
+            fired = self.fire_r(char, tag, self.LIB_FIRE_WINDOW)
+            if not fired:
+                self.logger.info(f'{char.name}: 大招连发 {self.LIB_FIRE_WINDOW:.1f}s 没出手 — 再补救')
+                fired = self.fire_r(char, f'{tag}补救', self.R_EXTRA_CAP)
+            if fired:
+                self.wait_hud_back(tag=f'{tag}anim', time_out=self.LIB_ANIM_TIME_OUT)
+                # 【演出结束就走, 不补足 gap】(2026-09-22 实机: 千咲强化E "还是卡一下")。
+                # 表里这一格的 gap 写的【就是演出时长】(千咲 3700 / 穗穗 4350), 是作者
+                # 拿秒表估的; 而 wait_hud_back 是等 HUD 真的回来 —— 它比 gap 准。
+                # 演出实测 3.49s 而 gap 给 3.75s, 补足那 0.26s 是纯站着, 紧跟着的强化E
+                # 就被这 0.26 秒往后推。其余格子照旧补足(那些 gap 是节奏, 不是演出时长)
+                return True
+            left = (hold + gap) - (time.time() - entry)
+            if left > 0:
+                self.macro_wait(left)
+            return True
+        if act == 'E*':
+            # 千咲的强化E。【先等收招】: 上一格是她的大招, HUD 回来 != 能出招
+            if not self.SAFETY or not self.CHI_E_STAR:
+                char.send_resonance_key(down_time=self.M_E_KEY_DOWN)
+                char.record_resonance_use()
+                self.macro_mark(f'{char.name[:2]}E')
+                return False
+            entry = time.time()
+            self.macro_wait(self.CHI_R_TO_E)
+            # 残响不够就先点普攻攒够 —— 干等是等不来的。
+            # 【它返回的就是"够没够"】, 所以下面直接按, 不再走 cast_enhanced_e 的
+            # "等图标亮"那一遍: 同一个图标刚读过, 再确认一次纯粹多花 0.12 秒读屏,
+            # 而用户要的就是"R 完就按"
+            ready = self.fill_saw_resonance(char, tag=char.name[:2])
+            self.send_e_once(f'{char.name[:2]}强化E({"亮" if ready else "没亮"})', char)
+            self.chi_in_saw = ready
+            if not ready:
+                self.logger.info(f'{char.name}: 残响没攒满就按了强化E — 这一轮多半没进电锯')
+            left = (hold + gap) - (time.time() - entry)
+            if left > 0:
+                self.macro_wait(left)
+            return True
+        if act == 'E':
+            char.send_resonance_key(down_time=hold)
+            char.record_resonance_use()
+        elif act == 'R':
+            char.send_liberation_key(down_time=hold)
+            char.record_liberation_use()
+        elif act == 'Q':
+            char.send_echo_key(down_time=hold)
+            char.record_echo_use()
+        else:
+            raise ValueError('unknown macro action ' + repr(act))
+        self.macro_mark(f'{char.name[:2]}{act}')
+        return False
+
+    def macro_switch(self, target, hold, con_full, gap):
+        """宏里的数字键。返回【这一格的 gap 是不是已经用掉了】。
+
+        SAFETY 关掉 = 按一下就走, 人按宏就是这样, 也继承了宏的风险: 上一个动作还没演完时
+        游戏会拒绝切人, 这一下就白给, 后面每一格都发在错的人身上。
+        SAFETY 开着 = 【在这一格自己的 gap 里盯到场】: 正常 0.1 秒就到, 剩下的 gap 照等,
+        时序一点不变; 没到就按 SWITCH_REPRESS 补按, 最多再多等 SWITCH_EXTRA。
+        con_full 只喂给框架记账(has_intro / 变奏冻结时间), 不读屏 —— 读一次协奏要几十毫秒
+        到近一秒, 塞进宏的间隙里就把时序推歪了。
+        """
+        if target is None:
+            return False
+        if target is self.cur:
+            self.macro_mark(f'>{target.name[:3]}(already)')
+            return False
+        source = self.cur if self.cur is not None else self
+        slot = target.index + 1
+        entry = time.time()
+        self.task.send_key(slot, down_time=hold)
+        if not self.SAFETY:
+            self.handoff(source, target, con_full)
+            self.macro_mark(f'>{target.name[:3]}{"^" if con_full else ""}')
+            return False
+        soft = entry + hold + gap
+        hard = soft + self.SWITCH_EXTRA
+        last = time.time()
+        hits = 0
+        arrived = False
+        while time.time() < hard:
+            self.task.next_frame()
+            in_team, index, _count = self.task.in_team()
+            hits = hits + 1 if (in_team and index == target.index) else 0
+            if hits >= self.SWITCH_CONFIRM:
+                arrived = True
+                break
+            if time.time() - last >= self.SWITCH_REPRESS:
+                self.task.send_key(slot, down_time=hold)
+                last = time.time()
+            self.macro_wait(0.02)
+        cost = time.time() - entry
+        late = time.time() - soft
+        if arrived:
+            self.handoff(source, target, con_full)
+            self.macro_mark(f'>{target.name[:3]}{"^" if con_full else ""}'
+                            f'({cost:.2f}{f",晚{late:.2f}" if late > 0.05 else ""})')
+        else:
+            # 【没切过去就照实记】: 读一次场上到底是谁, 后面几格至少发在对的人身上
+            actual = self.on_field_char()
+            self.macro_desync += 1
+            if actual is not None and actual is not target:
+                if actual is not source:
+                    self.handoff(source, actual, False)
+                self.cur = actual
+                self.macro_mark(f'>{target.name[:3]}超时({cost:.2f},场上是{actual.name[:3]})')
+            else:
+                # 读不到(演出/时停里 HUD 整个不在)——只能先按目标记, 但照样算一次失步
+                self.handoff(source, target, con_full)
+                self.macro_mark(f'>{target.name[:3]}超时({cost:.2f},读不到场上是谁)')
+            self.logger.warning(f'macro switch to {target.name} never confirmed in '
+                                f'{cost:.2f}s — 游戏在拒绝切人(被打断/上一个动作没演完?)')
+        left = soft - time.time()
+        if left > 0:
+            self.macro_wait(left)
+        return True
+
+    def run_macro(self, table, tag):
+        """逐条回放一张宏表。中间【一次读屏都没有】, 时间到就走下一格。"""
+        chi = self.teammate('Chisa')
+        sui = self.teammate('Suisui')
+        if chi is None or sui is None:
+            return False
+        chars = {'YY': self, 'CHI': chi, 'SUI': sui}
+        planned = sum(h + g for _, h, g, _ in table) / 1000.0 * self.MACRO_SPEED
+        start = time.time()
+        marks = len(self.macro_marks)
+        self.chi_in_saw = False        # 每轮重新记账: 电锯模式不跨轮
+        for act, hold_ms, gap_ms, _note in table:
+            hold = hold_ms / 1000.0 * self.MACRO_SPEED
+            gap = gap_ms / 1000.0 * self.MACRO_SPEED
+            if act.startswith('>'):
+                consumed = self.macro_switch(chars.get(act[1:].rstrip('^')), hold,
+                                             act.endswith('^'), gap)
+                self.last_was_switch = True
+            else:
+                consumed = self.macro_key(act, hold, gap)
+                self.last_was_switch = False
+            if not consumed:
+                self.macro_wait(gap)
+            if self.macro_desync >= self.MACRO_ABORT_DESYNC:
+                self.macro_mark(f'{tag}_放弃(失步x{self.macro_desync})')
+                self.logger.warning(
+                    f'{tag}: 切人累计 {self.macro_desync} 次没确认, 这一轮宏放弃 —— '
+                    f'交回框架, 下一次从手动段重来 (被打断了?)')
+                self.logger.info(f'{tag}(中断): {self.macro_timeline(marks)}')
+                return False
+        self.logger.info(f'{tag}: {len(table)} keys in {time.time() - start:.2f}s '
+                         f'(table says {planned:.2f}s) — {self.macro_timeline(marks)}')
+        return True
+
+
+    # ==================== 手动段(宏没覆盖的那一段) ====================
+
+    def send_e_once(self, tag, char=None):
+        """发一次 E。【秧秧的 E 绝对不能连发】——
+
+        剑式切换每按一次换一个形态, 连发两下等于换回去了; 而且只有【流响耗尽】时按下去的
+        那一次才是"剑式流转"(回 100 流响 + 1 苍翎), 没耗尽时按的"剑式切换"只换形态、不给苍翎。
+        所以补按只能靠"看图标还不亮"来驱动(ensure_forte_ready), 不能拿窗口连发盖。
+        """
+        char = self if char is None else char
+        char.send_resonance_key(down_time=self.M_E_KEY_DOWN)
+        char.record_resonance_use()
+        self.macro_mark(tag)
+
+    def ensure_forte_ready(self, tag, cap=None, retries=None):
+        """按 E 切形态, 然后等重击就绪图标亮(= 苍翎满 2 点)。不亮就再补一次 E。
+
+        入场锁/收招会把第一次按键吃掉 —— 吃掉了苍翎就还是 1 点, 图标不亮, 后面那一下长按
+        打出来的是普攻不是重击。【但不能靠连发盖】(见 send_e_once), 只能读图标决定补不补。
+        判据读不到(M_USE_FORTE_ICON 关掉, 或者一直读不到亮)就照发一次 E 往下走, 由
+        hold_until_forte_cleared 的盲按分支兜底。
+        """
+        cap = self.M_FORTE_CAP if cap is None else cap
+        retries = self.M_E_RETRIES if retries is None else retries
+        self.send_e_once(f'{tag}E')
+        if not self.M_USE_FORTE_ICON:
+            self.macro_wait(self.M_E_TO_HEAVY)
+            return False
+        for attempt in range(retries + 1):
+            start = time.time()
+            streak = 0
+            while time.time() - start < cap:
+                self.task.next_frame()
+                if self.task.in_team()[0]:
+                    try:
+                        full = bool(self.is_mouse_forte_full())
+                    except Exception:
+                        full = False
+                    streak = streak + 1 if full else 0
+                    if streak >= self.FORTE_CONFIRM:
+                        # 【叫"图标亮"不叫"苍翎满"】: 实测它在按 E 之前就亮着,
+                        # 代表的是苍翎 >= 1, 不是满 2 —— 别拿它当"能放重击了"
+                        self.macro_mark(f'{tag}图标亮({time.time() - start:.2f}s)')
+                        return True
+                self.macro_wait(0.02)
+            if attempt < retries:
+                self.logger.info(f'{tag}: 重击就绪图标 {cap:.2f}s 没亮 — 那一下 E 多半被吃了, 补按一次')
+                self.send_e_once(f'{tag}E补')
+        self.macro_mark(f'{tag}苍翎没读到满')
+        self.logger.info(f'{tag}: heavy-ready icon never lit — 后面那一下长按改盲按')
+        return False
+
+    def e_icon_white(self):
+        """E 技能图标框里的白像素占比。读不到时返回 -1, 不让它把轴卡住。"""
+        try:
+            box = self.task.get_box_by_name(self.CHI_E_LIT_BOX)
+            return self.task.calculate_color_percentage(self.CHI_E_LIT_COLOR, box)
+        except Exception as e:
+            self.logger.info(f'e icon probe failed ({e})')
+            return -1.0
+
+    def fill_liberation(self, char, tag):
+        """大招图标不亮(能量没满)就接着点普攻攒, 亮了立刻停手。返回攒够没有。
+
+        【大招是能量门控不是 CD 门控】—— 判据是 liberation_available()(读图标),
+        不是 has_cd('liberation')(那读的是 CD 数字, 大招没有数字)。
+        上限到了照放不误: fire_r 连发两轮都不出手最多是这一轮少一个大招, 不该把宏卡死。
+        """
+        if self.LIB_FILL <= 0:
+            return True
+        start = time.time()
+        n = 0
+        next_click = 0.0
+        while time.time() - start < self.LIB_FILL:
+            self.task.next_frame()
+            try:
+                if self.task.in_team()[0] and char.liberation_available():
+                    if n:
+                        self.macro_mark(f'{tag}({time.time() - start:.2f}s,A x{n})')
+                    return True
+            except Exception:
+                pass
+            now = time.time()
+            if now >= next_click:
+                self.click()
+                n += 1
+                next_click = now + self.LIB_FILL_INTERVAL
+            self.macro_wait(0.02)
+        self.macro_mark(f'{tag}(CAP,A x{n})')
+        self.logger.info(f'{tag}: 大招能量 {self.LIB_FILL:.1f}s 没攒满(点了 {n} 下 A) — 照按')
+        return False
+
+    def fill_saw_resonance(self, char, tag):
+        """千咲: E 图标不亮(= 锯环残响没满)就接着点普攻攒, 亮了立刻停手。
+
+        常态攻击命中会回残响, 所以【干等没用, 必须动手】。上限 CHI_FILL_SAW 到了照往下走:
+        这一轮少一次电锯, 好过把整条宏卡在这一格。
+        """
+        if self.CHI_FILL_SAW <= 0:
+            return True
+        start = time.time()
+        n = 0
+        next_click = 0.0
+        while time.time() - start < self.CHI_FILL_SAW:
+            self.task.next_frame()
+            if self.task.in_team()[0] and self.e_icon_white() >= self.CHI_E_LIT_THRESHOLD:
+                if n:
+                    self.macro_mark(f'{tag}攒残响({time.time() - start:.2f}s,A x{n})')
+                return True
+            now = time.time()
+            if now >= next_click:
+                self.click()
+                n += 1
+                next_click = now + self.CHI_FILL_INTERVAL
+            self.macro_wait(0.02)
+        self.macro_mark(f'{tag}攒残响(CAP,A x{n})')
+        self.logger.info(f'{tag}: 锯环残响 {self.CHI_FILL_SAW:.1f}s 没攒满(点了 {n} 下 A) — '
+                         f'这一轮多半开不出电锯')
+        return False
+
+    def cast_enhanced_e(self, char, tag, cap=None):
+        """等 E 图标亮(= 回路能量满、强化态就绪)再按。返回读到亮没有。
+
+        【到点没亮也照按一次】: 按了不亏 —— 落在普通E 上也是在攒回路, 而"不按"是白白
+        放掉一次机会。没亮时把 trace 打进日志, 实机调阈值就靠它。
+        """
+        cap = self.CHI_E_LIT_MAX_WAIT if cap is None else cap
+        start = time.time()
+        streak = 0
+        lit = False
+        trace = []
+        while time.time() - start < cap:
+            self.task.next_frame()
+            if self.task.in_team()[0]:
+                w = self.e_icon_white()
+                if len(trace) < 24:
+                    trace.append(f'{time.time() - start:.2f}:{w:.3f}')
+                streak = streak + 1 if w >= self.CHI_E_LIT_THRESHOLD else 0
+                if streak >= self.CHI_E_LIT_CONFIRM:
+                    lit = True
+                    break
+            self.macro_wait(self.CHI_E_LIT_POLL)
+        if not lit:
+            # 等不到亮也照按一次: 落在普通E 上也是在攒残响, 不按是白丢一次机会
+            char.send_resonance_key(down_time=self.M_E_KEY_DOWN)
+            char.record_resonance_use()
+            self.macro_mark(f'{tag}强化E(没亮,{time.time() - start:.2f}s)')
+            self.logger.info(f'{tag}: E 图标没读到亮(残响没满?), 照按一次 — '
+                             f'trace {" ".join(trace)}')
+            return False
+        if not self.CHI_E_CONFIRM:
+            char.send_resonance_key(down_time=self.M_E_KEY_DOWN)
+            char.record_resonance_use()
+            self.macro_mark(f'{tag}强化E(不确认)')
+            return True
+        # 【连发到图标暗为止】, 不是"按一次然后回头确认"。
+        # 齿轨轮回放出去 -> 强化态被消耗 -> 图标暗; 还亮着就是那一下被收招/硬直吞了,
+        # 而演出期间的按键是被丢弃的、不排队 —— 单发必丢, 只有连发盖得住
+        char.send_resonance_key(down_time=self.M_E_KEY_DOWN)
+        char.record_resonance_use()
+        if self.CHI_E_FIRE_WINDOW <= 0:
+            # 单发。【不回头确认也不重按】—— 重按是"改状态"那一类, 见类文档"保底的边界"
+            self.macro_mark(f'{tag}强化E(亮,{time.time() - start:.2f}s)')
+            return True
+        fire_start = time.time()
+        n = 1
+        while time.time() - fire_start < self.CHI_E_FIRE_WINDOW:
+            char.send_resonance_key(down_time=self.M_E_KEY_DOWN)
+            char.record_resonance_use()
+            n += 1
+            self.macro_wait(self.CHI_E_FIRE_INTERVAL)
+            self.task.next_frame()
+            w = self.e_icon_white()
+            if w < self.CHI_E_LIT_THRESHOLD:
+                self.macro_mark(f'{tag}进电锯(x{n},{time.time() - start:.2f}s)')
+                return True
+        self.macro_mark(f'{tag}强化E没确认(x{n})')
+        self.logger.warning(f'{tag}: 强化E 连发 {n} 次图标一直亮着 — 没进电锯模式, '
+                            f'后面那串长按会退化成普通普攻')
+        return False
+
+    def forte3_full(self):
+        """穗穗的三段回路(芳菲信 600)满没满。
+
+        【这几帧连着读完, 中间不做别的】—— 靠外层循环去凑命中次数会白白多等一轮。
+        HUD 被演出盖住时读不到, 返回 False 落在"还没满"这一侧, 方向是安全的
+        (顶多多点几下普攻, 不会误判成满就去放大招)。
+        """
+        for i in range(self.FORTE3_CONFIRM):
+            if not self.task.find_one(Labels.suisui_forte3, threshold=self.FORTE3_THRESHOLD):
+                return False
+            if i + 1 < self.FORTE3_CONFIRM:
+                self.task.next_frame()   # 换一帧再读, 否则两次读的是同一张图
+        return True
+
+    def wait_forte3(self, tag):
+        """穗穗大招前的保底: 三段回路没满就接着点普攻, 满了立刻停手。返回满了没有。
+
+        上限 FORTE3_WAIT 到了【照放不误】: 少一档伤害, 好过把整轮宏卡死在这一格。
+        """
+        if not self.FORTE3_GATE:
+            return True
+        start = time.time()
+        n = 0
+        next_click = 0.0
+        while time.time() - start < self.FORTE3_WAIT:
+            if self.forte3_full():
+                waited = time.time() - start
+                self.macro_mark(f'{tag}满({waited:.2f}s,A x{n})')
+                if n == 0 and waited < self.FORTE3_SUSPECT:
+                    # 【一下没点就"满"了, 十有八九是误判】。穗穗有两个形态两条【不同】的
+                    # 资源条: 浣尘时显示【水云息】, 濯雨时才是【芳菲信】; 而 suisui_forte3
+                    # 匹配的是芳菲信满档那张图 —— 她要是没进濯雨时(E 被吞, 醒春潮没放出来),
+                    # 读的就是水云息那条条, 会误命中。
+                    # 实机对照: 启动轮 满(1.44s,A x11) / (1.88s,A x14), 循环轮 满(0.03s,A x0)
+                    self.logger.warning(
+                        f'{tag}: {waited:.2f}s 一下没点就读到"回路满" — 多半是误判, '
+                        f'穗穗可能【没进濯雨时】(E 被吞了?), 读到的是水云息那条条')
+                return True
+            now = time.time()
+            if now >= next_click:
+                self.click()
+                n += 1
+                next_click = now + self.A_INTERVAL
+            self.macro_wait(0.02)
+        self.macro_mark(f'{tag}没满(CAP,A x{n})')
+        self.logger.warning(f'{tag}: 三段回路 {self.FORTE3_WAIT:.1f}s 没攒满(点了 {n} 下 A), '
+                            f'照放 —— 表里给穗穗的 A 不够, 或者那几下被打断了')
+        return False
+
+    def hold_yu_blind(self, tag):
+        """(调用时左键已经按着)先按到重击就绪图标熄灭 = 重击真出手了, 再把 M_YU_HOLD 按满。
+
+        判据只负责【确认出手】, 按满时间负责【让释羽风落/聆风祀声那几段接上】—— 两件都要。
+        图标到 M_YU_HEAVY_CAP 还没灭就照走(别把这一格卡死); M_YU_TRACE 会把读数打进日志。
+        【等判据的时间算在 M_YU_HOLD 里面】, 所以总长不变。
+        """
+        start = time.time()
+        if self.M_USE_FORTE_ICON:
+            hs = time.time()
+            seen = False
+            cleared = False
+            while time.time() - hs < self.M_YU_HEAVY_CAP:
+                self.task.next_frame()
+                if self.task.in_team()[0]:
+                    try:
+                        full = bool(self.is_mouse_forte_full())
+                    except Exception:
+                        full = False
+                    if full:
+                        seen = True
+                    elif seen:
+                        cleared = True
+                        break
+                self.macro_wait(0.02)
+            self.macro_mark(f'{tag}出手({"ok" if cleared else "CAP"},{time.time() - hs:.2f}s)')
+            if not cleared:
+                self.logger.info(f'{tag}: 重击就绪图标 {self.M_YU_HEAVY_CAP:.1f}s 没读到熄灭 '
+                                 f'(苍翎没满 2? 长按被吞?) — 照按满时间')
+        trace = []
+        next_read = 0.0
+        while True:
+            left = self.M_YU_HOLD - (time.time() - start)
+            if left <= 0:
+                break
+            if self.M_YU_TRACE and time.time() - start >= next_read:
+                next_read = (time.time() - start) + self.M_YU_TRACE_EVERY
+                self.task.next_frame()
+                try:
+                    lit = 1 if (self.task.in_team()[0] and self.is_mouse_forte_full()) else 0
+                except Exception:
+                    lit = -1
+                trace.append(f'{time.time() - start:.2f}:{lit}')
+            self.macro_wait(min(0.05, left))
+        self.macro_mark(f'{tag}长按({time.time() - start:.2f}s)')
+        if trace:
+            self.logger.info(f'{tag}: forte icon trace — {" ".join(trace)}')
+
+    def cast_cang_heavy(self, tag):
+        """1苍: E 切形态 -> 长按到重击就绪图标熄灭。没打出来就【再来一轮】。
+
+        为什么再来一轮有用, 见 M_CANG_RETRIES 上面那段: 第一轮的长按已经把流响打掉了,
+        第二次按 E 很可能正好是"剑式流转", 把苍翎补到 2 点。
+        """
+        for attempt in range(self.M_CANG_RETRIES + 1):
+            suffix = '' if attempt == 0 else f'重{attempt}'
+            self.ensure_forte_ready(f'{tag}苍{suffix}', cap=self.M_FORTE_CAP)
+            self.macro_wait(self.M_E_TO_HEAVY)
+            if self.hold_heavy(f'{tag}1苍{suffix}'):
+                return True
+            if attempt < self.M_CANG_RETRIES:
+                self.logger.info(
+                    f'{tag}: 重击没出手 —— 苍翎多半只有 1 点(那一下 E 是"剑式切换"'
+                    f'不是"剑式流转")。刚才那段长按已经在耗流响了, 再走一轮 E + 长按')
+        self.logger.warning(f'{tag}: 1苍 打了 {self.M_CANG_RETRIES + 1} 轮都没出手 — '
+                            f'这一轮的绝息(160% 暴伤)丢了')
+        return False
+
+    def seg_yy_2yu1cang(self, tag):
+        """手动段。秧秧刚变奏入场(羽挟苍空 +1 苍翎), 打【1苍 -> R -> 2羽】, 打完就地交回去按循环宏。
+
+        字幕把这一段说全了(见类注释)。拆成四步是因为【四步的判据各不相同】:
+          · 1苍   : E 切形态(+1 苍翎, 满2) -> 长按到重击就绪图标暗 = 重击·苍剑式放出去了
+          · R     : 共鸣解放, 判据是 HUD 消失再回来(演出)
+          · 1羽   : 再 E 切形态(+1 苍翎, 满2), 【E 按下的一瞬间就把左键按住】——
+                    预输入的重击会在秧秧能响应的第一帧派生, 她升空, 打出重击·羽剑式 ->
+                    空中攻击·释羽风落; 同样按到图标暗
+          · 第2羽 : 释羽风落之后进【聆风祀声】12 秒, 这期间羽剑式普攻变成普攻·湮象风华
+                    (3 段, 算重击伤害) —— 字幕"继续长按接点按普攻", 所以是长按一小会儿
+                    再松手点 3 下, 【不吃苍翎】
+        末尾按一次处决: 字幕"有处决打处决强制取消后摇, 然后按循环宏"。没处决就白按一下,
+        有处决就正好把湮象风华的后摇顶掉 —— 这是全条轴唯一按 F 的地方。
+        """
+        self.poking = False
+        # ---- 1苍 ----
+        # 变奏入场动作(羽挟苍空)还在演, 抢在里面按的 E 会被游戏吃掉
+        self.macro_wait(self.M_INTRO_LOCK)
+        self.cast_cang_heavy(tag)
+
+        # ---- 开大 ----
+        self.macro_wait(self.M_CANG_TO_R)
+        if self.fire_r(self, f'{tag}R', self.M_R_WINDOW):
+            self.wait_hud_back(tag=f'{tag}Ranim')
+        else:
+            self.logger.info(f'{tag}: 大招没出手(能量没满?), 照走 —— 少一点苍翎, 1羽可能打不出来')
+
+        # ---- 1羽: E 切形态 + 预输入重击, 然后【一路按住 M_YU_HOLD】----
+        # 字幕: "开大后, 接e技能切形态, e按下的一瞬间【就按住】普攻预输入重击,
+        #        这时候秧秧会升空然后直接打出1羽"
+        # 【先等收招】: HUD 回来 != 能出招, 见 M_R_TO_E。
+        # 【顺序是 E 在前、按住在后, 中间只隔 M_E2_TO_HEAVY】: 反过来先按住左键会先打出
+        # 一段普攻, 把形态切换的派生窗口顶掉。
+        # 【按住之后不等图标亮】: 实录里 E 按下(v141.5)到重击就绪图标亮(v142.2)隔了 0.7 秒,
+        # "预输入"的意思就是在那之前就按住、让游戏在能派生的第一帧自己出招 —— 等图标亮再按
+        # 就不是预输入了。
+        # 【这一段不读判据, 只按时间】—— 原因见 M_YU_HOLD 上面那段注释(图标不会灭)
+        if self.M_WAIT_DOWN_BEFORE_E and self.flying():
+            self.logger.info(f'{tag}: 大招收尾人还在空中, 先等落地再按 E')
+            self.macro_mark(f'{tag}等落地')
+            self.wait_down()
+        self.macro_wait(self.M_R_TO_E)
+        self.send_e_once(f'{tag}羽E')
+        self.macro_wait(self.M_E2_TO_HEAVY)
+        self.task.mouse_down()
+        self.holding_attack = True
+        self.macro_mark(f'{tag}预输入按住')
+        try:
+            self.hold_yu_blind(f'{tag}1羽')
+        finally:
+            self.release_attack()
+            self.macro_mark(f'{tag}松开')
+
+        # ---- 第2羽: 松手改点按, 打低空的普攻·湮象风华连段 ----
+        for _ in range(self.M_YU2_TAPS):
+            self.tap()
+            self.macro_wait(self.M_YU2_INTERVAL)
+        self.macro_mark(f'{tag}2羽(A x{self.M_YU2_TAPS})')
+
+        # ---- 处决(这一段的收尾, 也是全轴唯一一处) ----
+        # 【先等最后那一段湮象风华打完】, 见 M_YU2_TAIL
+        self.macro_wait(self.M_YU2_TAIL)
+        if not self.try_f_break(f'{tag}2羽后'):
+            # 【没处决就得等后摇自己演完】, 见 M_YU2_NO_BREAK_TAIL
+            self.macro_mark(f'{tag}没处决等后摇({self.M_YU2_NO_BREAK_TAIL:.2f})')
+            self.macro_wait(self.M_YU2_NO_BREAK_TAIL)
+
+    # ==================== 两条轴 ====================
+
+    def perform_opener(self, entry_char=None):
+        """启动轴 = 启动宏一张表跑完。返回时秧秧刚变奏入场, 下一次 do_perform 从手动段接上。"""
+        chi, sui, previous = self.macro_enter(entry_char)
+        if chi is None:
+            return False
+        self.logger.info(f'yangqiansui opener entry: {self.cur.name}')
+        try:
+            self.loop_count = 0
+            # 【启动宏第一格是穗穗的 A】: 开局场上本来就该是她(1 号位), 不是的话先切过去
+            if self.cur is not sui:
+                self.quick_switch(sui)
+            self.run_macro(self.OPENER_MACRO, '启动宏')
+        finally:
+            self.macro_exit(previous)
+        return True
+
+    def perform_loop(self, entry_char=None):
+        """循环轴的一步 = 手动段(2羽1苍) -> 循环宏。返回时秧秧刚变奏入场(跟启动轴同一个位置)。"""
+        chi, sui, previous = self.macro_enter(entry_char)
+        if chi is None:
+            return False
+        try:
+            # 手动段全在秧秧身上; 宏散掉之后框架可能把别人放上来了, 先切回自己
+            if self.cur is not self:
+                self.quick_switch(self)
+            self.loop_count += 1
+            n = self.loop_count
+            self.seg_yy_2yu1cang(tag=f'L{n}')
+            # 【手动段也要有时间轴】: 不打的话这一段出问题时日志里只有几条 warning,
+            # 看不出是哪一步慢的
+            self.logger.info(f'L{n} 手动段: {self.macro_timeline()}')
+            # 循环宏第一格还在秧秧身上(W/E/A), 不用切人也不用等协奏, 直接接
+            self.run_macro(self.LOOP_MACRO, f'循环宏#{n}')
+            self.logger.info(
+                f'loop step #{n} {self.time_elapsed_accounting_for_freeze(self.macro_t0):.2f}s '
+                f'(wall {time.time() - self.macro_t0:.2f}s)')
+        finally:
+            self.macro_exit(previous)
+        return True
+
+    # ==================== 框架接口 ====================
+
+    def run_opener_from(self, entry_char):
+        """跑启动轴并落防重入标记。【穗穗那份也调它】—— 启动宏第一格是她的普攻,
+        正常情况下入口在她身上, 不在这里。
+
+        标记要在跑之前落: 中途抛异常(脱战/任务被停)也不能让启动轴重跑。
+        """
+        self.opener_armed = False
+        self.last_opener = time.time()
+        return self.perform_opener(entry_char)
+
+    def do_perform(self):
+        """本队里秧秧驱动两条轴。两条都在她变奏入场时返回, 下一次框架调的还是她。"""
+        if not self.is_in_yangqiansui:
+            return super().do_perform()
+        blocked = self.opener_blocked_by()
+        if blocked is None:
+            # 走到这儿说明启动轴待跑但场上是秧秧(穗穗没被框架放上来) ——
+            # perform_opener 里会先切回穗穗再开表
+            if self.run_opener_from(self):
+                return
+            self.logger.warning('yangqiansui opener aborted, falling back to the native rotation')
+            return super().do_perform()
+        self.logger.info(f'yangqiansui: opener not pending ({blocked}), running the loop')
+        if self.perform_loop(self):
+            return
+        return super().do_perform()
+
+    def get_switch_priority(self, current_char=None, has_intro=False, target_low_con=False):
+        """宏散掉之后, 框架选人时秧秧优先 —— 她一上场轴就接上了。
+
+        【启动轴待跑时反过来给 NO】: 启动宏的第一格是穗穗的 A, 场上得是穗穗才对得上,
+        秧秧抢先上场会把整张表错开一格。其余时候给 HIGH。
+        """
+        if self.is_in_yangqiansui:
+            if self.opener_pending():
+                return SwitchPriority.NO
+            return SwitchPriority.HIGH
+        return super().get_switch_priority(current_char, has_intro, target_low_con)
+
+    def on_combat_end(self, chars):
+        self.release_attack()
+        self.poking = False
+        return super().on_combat_end(chars)
