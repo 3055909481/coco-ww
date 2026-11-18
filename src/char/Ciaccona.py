@@ -92,9 +92,8 @@ class Ciaccona(BaseChar):
             self.task.next_frame()
 
     def continues_click_a(self, duration=0.6):
-        start = time.time()
-        while time.time() - start < duration:
-            self.task.send_key(key='a')
+        # 原来是空转狂发 a 键(没有 next_frame), 改成按住 a 走 duration 秒
+        self.hold_key('a', duration)
 
     def judge_forte(self):
         if self.is_mouse_forte_full():
