@@ -40,6 +40,8 @@ class Lucilla(BaseChar):
         if settle > 0:
             self.sleep(settle, check_combat=False)
         self.task.next_frame()
+        # 延奏和格洛犸图声骸联动, 入场先放声骸(大招 CD 中提前走也要放到)
+        self.click_echo(time_out=0)
 
         if self.try_liberation():
             return True
