@@ -90,10 +90,16 @@
 
 ## 🚀 运行
 
-coco-ww 没有打包好的安装程序，需要从源码运行：
+### 下载发布包（推荐）
 
-1. 把仓库放在**纯英文路径**下（框架硬性要求，路径里有中文会启动失败）。
-2. 安装 Python 3.12，然后建虚拟环境、装依赖：
+1. 到 [Releases](https://github.com/wk321425/coco-ww/releases) 下载最新的 `coco-ww-vX.Y.Z.zip`（自带 Python 3.12 运行环境，不用另装）。
+2. 解压到**纯英文路径**，例如 `D:\coco-ww`（框架硬性要求，路径里有中文会启动失败）。
+3. 双击 `启动 coco-ww.bat`。它会自动请求管理员权限：鸣潮以管理员身份运行，coco-ww 也必须是，否则发不出按键。
+
+### 从源码运行
+
+1. 把仓库克隆到**纯英文路径**下。
+2. 安装 Python 3.12（[python.org](https://www.python.org/downloads/) 的安装版，带 `py` 启动器），然后建虚拟环境、装依赖：
 
    ```powershell
    py -3.12 -m venv .venv
@@ -106,7 +112,7 @@ coco-ww 没有打包好的安装程序，需要从源码运行：
    .\.venv\Scripts\python.exe -X utf8 main.py
    ```
 
-`启动 coco-ww.bat` 会自动提权，但它用的是根目录 `python\` 里的运行环境（这个目录不进版本库）。把 Python 3.12 运行环境和依赖放进 `python\` 后，就可以直接双击它启动。
+从源码运行时 `启动 coco-ww.bat` 用不了：它用的是根目录 `python\` 里的运行环境，这个目录只在发布包里有，不进版本库。
 
 ## 🔧 疑难解答
 
