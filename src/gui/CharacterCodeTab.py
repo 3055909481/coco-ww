@@ -45,7 +45,7 @@ from src.char.TeamVariants import (
 )
 
 # coco-ww 的工坊就是这个 GitHub 仓库: codes/ 放队伍 zip, teams.json 是仓库里的 Actions 生成的索引。
-WORKSHOP_REPO = "wk321425/ok-ww-char-code"
+WORKSHOP_REPO = "wk321425/coco-ww-char-code"
 WORKSHOP_BRANCH = "main"
 UPLOAD_TEAM_URL = f"https://github.com/{WORKSHOP_REPO}"
 # 同一份仓库内容的几个入口, 按顺序试。第一个是 GitHub 自己的, 内容最新(几分钟内), 国内常连不上;

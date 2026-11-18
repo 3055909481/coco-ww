@@ -238,7 +238,7 @@ config = {
         # github 指向上游原项目: coco-ww 是在它的基础上裁出来的
         'default': {
             'github': 'https://github.com/ok-oldking/ok-wuthering-waves',
-            'workshop': 'https://github.com/wk321425/ok-ww-char-code',
+            'workshop': 'https://github.com/wk321425/coco-ww-char-code',
         },
     },
     'about': """
