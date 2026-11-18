@@ -264,6 +264,12 @@ class FakeTask:
         if after_sleep:
             self.sleep(after_sleep)
 
+    def release_held_inputs(self):
+        held = (self.mouse_is_down, set(self.keys_down))
+        self.mouse_is_down = False
+        self.keys_down.clear()
+        return held
+
     def mouse_down(self, *a, **k):
         self.mouse_is_down = True
         self.tick(0.002)

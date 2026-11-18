@@ -1040,6 +1040,43 @@ class BaseCombatTask(CombatCheck):
             if not self.in_combat():
                 self.raise_not_in_combat('sleep check not in combat')
 
+    # ---- 记住自己按住了什么, 角色上场异常退出时只松这些(不去碰玩家自己按着的键) ----
+    def _held(self):
+        held = self.__dict__.get('_held_inputs')
+        if held is None:
+            held = self.__dict__['_held_inputs'] = set()
+        return held
+
+    def send_key_down(self, key, after_sleep=0):
+        self._held().add(('key', str(key).lower()))
+        return super().send_key_down(key, after_sleep=after_sleep)
+
+    def send_key_up(self, key, after_sleep=0):
+        self._held().discard(('key', str(key).lower()))
+        return super().send_key_up(key, after_sleep=after_sleep)
+
+    def mouse_down(self, x=-1, y=-1, name=None, key="left"):
+        self._held().add(('mouse', key))
+        return super().mouse_down(x, y, name=name, key=key)
+
+    def mouse_up(self, name=None, key="left"):
+        self._held().discard(('mouse', key))
+        return super().mouse_up(name=name, key=key)
+
+    def release_held_inputs(self):
+        held = list(self._held())
+        for kind, key in held:
+            try:
+                if kind == 'mouse':
+                    self.mouse_up(key=key)
+                else:
+                    self.send_key_up(key)
+            except Exception as e:
+                logger.debug(f'release_held_inputs {kind} {key} failed {e}')
+        if held:
+            logger.info(f'released held inputs {held}')
+        return held
+
     def check_perform_watch(self):
         """原生角色单次上场超过硬上限就抛 CharPerformTimeout, 由 BaseChar.perform 松键并切人。
 

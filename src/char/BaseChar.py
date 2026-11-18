@@ -73,6 +73,8 @@ class BaseChar:
     # 防止读屏判据失灵时在一个角色身上死循环。站场久的角色在子类里调大。
     # 自定义队伍代码重写了 do_perform 的不受这个限制(宏自己管时间)。
     PERFORM_HARD_TIMEOUT = 30.0
+    # click_liberation 连按多久大招图标还亮着就放弃
+    LIBERATION_CLICK_TIME_OUT = 5.0
 
     def __init__(self, task, index, char_name=None, confidence=1, ring_index=-1, char_type=CharType.MAIN_DPS,
                  buff_time=None):
@@ -245,11 +247,85 @@ class BaseChar:
             self.release_inputs()
             self.on_perform_timeout()
             self.switch_next_char()
+        except BaseException:
+            # 脱战/停任务/死亡: 别把蓄力中的左键、长按的 E 留在按下状态
+            self.release_inputs()
+            raise
         finally:
             watch = getattr(self.task, 'perform_watch', None)
             if watch and watch[0] is self:
                 self.task.perform_watch = None
         self.logger.debug(f'set current char false {self.index}')
+
+    # ---------------- 原生角色代码共用的有界小动作 ----------------
+
+    def field_time(self):
+        """本次上场已经多久(秒, 扣除大招/变奏时停)。"""
+        return self.time_elapsed_accounting_for_freeze(self.last_perform)
+
+    def hold_mouse(self, seconds, until=None, min_time=0.0):
+        """按住左键最多 seconds 秒; until() 成立且已按满 min_time 就提前松开。不管怎样退出都会松开。
+
+        Returns:
+            bool: until 成立而提前松开返回 True, 按满时长返回 False。
+        """
+        self.check_combat()
+        start = time.time()
+        hit = False
+        self.task.mouse_down()
+        try:
+            while time.time() - start < seconds:
+                if until is not None and time.time() - start >= min_time and until():
+                    hit = True
+                    break
+                self.task.next_frame()
+        finally:
+            self.task.mouse_up()
+        self.sleep(0.01)
+        return hit
+
+    def hold_key(self, key, seconds, until=None, min_time=0.0):
+        """按住某个键最多 seconds 秒, 用法同 hold_mouse。"""
+        self.check_combat()
+        start = time.time()
+        hit = False
+        self.task.send_key_down(key)
+        try:
+            while time.time() - start < seconds:
+                if until is not None and time.time() - start >= min_time and until():
+                    hit = True
+                    break
+                self.task.next_frame()
+        finally:
+            self.task.send_key_up(key)
+        self.sleep(0.01)
+        return hit
+
+    def tap_until(self, send, done, time_out, interval=0.12):
+        """每 interval 秒做一次 send(), 直到 done() 成立或超时。返回 done 是否成立。"""
+        start = time.time()
+        last = 0
+        while time.time() - start < time_out:
+            if done():
+                return True
+            now = time.time()
+            if now - last >= interval:
+                send()
+                last = now
+            self.check_combat()
+            self.task.next_frame()
+        return bool(done())
+
+    def attack_while(self, seconds, stop=None, interval=0.1):
+        """普攻 seconds 秒, stop() 成立提前结束。返回是否因 stop 提前结束。"""
+        start = time.time()
+        while time.time() - start < seconds:
+            if stop is not None and stop():
+                return True
+            self.task.click(interval=interval)
+            self.check_combat()
+            self.task.next_frame()
+        return False
 
     def native_perform(self):
         """do_perform 是不是框架自带的(src.char.*), 自定义队伍代码重写了就返回 False。"""
@@ -264,25 +340,19 @@ class BaseChar:
         pass
 
     def release_inputs(self):
-        """松开所有可能被按住的键, 防止超时/异常后角色一直蓄力或一直往前跑。"""
+        """松开战斗任务自己按住的键/鼠标, 防止超时/异常后角色一直蓄力或一直往前跑。"""
         task = self.task
         try:
-            task.mouse_up()
+            if hasattr(task, 'release_held_inputs'):
+                task.release_held_inputs()
+            else:
+                task.mouse_up()
         except Exception as e:
-            self.logger.debug(f'release_inputs mouse_up failed {e}')
-        keys = []
-        for getter in (self.get_resonance_key, self.get_liberation_key, self.get_echo_key):
-            try:
-                keys.append(getter())
-            except Exception:
-                pass
-        keys += ['w', 'a', 's', 'd']
-        for key in keys:
-            try:
-                task.send_key_up(key)
-            except Exception:
-                pass
-        task.in_liberation = False
+            self.logger.debug(f'release_inputs failed {e}')
+        try:
+            task.in_liberation = False
+        except Exception:
+            pass
 
     def wait_down(self, click=True):
         """等待角色从空中落下到地面。"""
@@ -425,6 +495,12 @@ class BaseChar:
             self.task.skip_combat_check = previous_skip_combat_check
 
     def alert_skill_failed(self):
+        # 读屏失灵时每次上场都会走到这, 弹窗限流
+        now = time.time()
+        if now - getattr(self.task, '_last_skill_failed_alert', 0) < 60:
+            self.logger.error('click skill failed (alert suppressed)')
+            return
+        self.task._last_skill_failed_alert = now
         self.task.log_error(self.task.tr('Click skill failed, check if the keybinding is correct in coco-ww settings!'),
                             notify=True)
         self.task.screenshot('click_resonance too long, breaking')
@@ -549,8 +625,10 @@ class BaseChar:
             check_fun = self.is_forte_full
         if check_fun():
             self.task.mouse_down()
-            success = self.task.wait_until(lambda: not check_fun(), time_out=2)
-            self.task.mouse_up()
+            try:
+                success = self.task.wait_until(lambda: not check_fun(), time_out=2)
+            finally:
+                self.task.mouse_up()
             self.sleep(0.05)
             return success
 
@@ -685,9 +763,13 @@ class BaseChar:
                     if not clicked:
                         clicked = True
                     last_click = now
-                if time.time() - start > SKILL_TIME_OUT:
+                if time.time() - start > self.LIBERATION_CLICK_TIME_OUT:
+                    # 图标一直亮却放不出来(被控/空中/键位不对/图标另有含义): 放弃这次, 别判脱战
+                    self.logger.error(f'click_liberation still available after '
+                                      f'{self.LIBERATION_CLICK_TIME_OUT}s of clicking, give up')
                     self.alert_skill_failed()
-                    self.task.raise_not_in_combat('too long clicking a liberation')
+                    self._liberation_available = False
+                    return False
                 self.task.next_frame()
             if clicked:
                 if self.task.wait_until(lambda: not self.task.in_team()[0], time_out=0.4,
@@ -949,6 +1031,7 @@ class BaseChar:
         start = time.time()
         while time.time() - start < duration:
             self.task.send_key(key, interval=interval)
+            self.task.next_frame()
 
     def continues_right_click(self, duration, interval=0.1, direction_key=None):
         """持续进行鼠标右键点击操作一段时间，可选同时按住方向键。
@@ -960,12 +1043,16 @@ class BaseChar:
         """
         if direction_key is not None:
             self.task.send_key_down(direction_key)
-            self.task.next_frame()
-        start = time.time()
-        while time.time() - start < duration:
-            self.task.click(interval=interval, key="right")
-        if direction_key is not None:
-            self.task.send_key_up(direction_key)
+        try:
+            if direction_key is not None:
+                self.task.next_frame()
+            start = time.time()
+            while time.time() - start < duration:
+                self.task.click(interval=interval, key="right")
+                self.task.next_frame()
+        finally:
+            if direction_key is not None:
+                self.task.send_key_up(direction_key)
 
     def normal_attack(self):
         """执行一次普通攻击。"""
@@ -982,8 +1069,10 @@ class BaseChar:
         self.check_combat()
         self.logger.debug('heavy attack start')
         self.task.mouse_down()
-        self.sleep(duration)
-        self.task.mouse_up()
+        try:
+            self.sleep(duration)
+        finally:
+            self.task.mouse_up()
         self.sleep(0.01)
         self.logger.debug('heavy attack end')
 
