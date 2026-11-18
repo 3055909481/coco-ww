@@ -239,6 +239,8 @@ config = {
         'default': {
             'github': 'https://github.com/ok-oldking/ok-wuthering-waves',
             'workshop': 'https://github.com/wk321425/coco-ww-char-code',
+            # 「应用更新」出错 (比如运行环境变了只能整包更新) 时的下载按钮也指这里
+            'download': 'https://github.com/wk321425/coco-ww/releases/latest',
         },
     },
     'about': """
