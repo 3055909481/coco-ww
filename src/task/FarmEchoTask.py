@@ -12,10 +12,6 @@ from src.task.task_icons import task_icon
 
 logger = Logger.get_logger(__name__)
 
-# 打完后这么多秒内进战斗只认血条: 走去捡声骸时中键会锁到还在倒地的 Boss,
-# 以前就此重进战斗对空再打一整轮(变奏入场+找怪 3 秒+等复苏弹窗 2 秒)才去捡
-POST_COMBAT_HEALTH_ONLY_SECONDS = 15
-
 
 class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
     owns_switch_healer_config = True
@@ -88,10 +84,6 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
             '罗蕾莱': {'name': r'(罗蕾莱|夜之女皇)', 'set_night': True},
         }
         self.is_revived = False
-        self._health_only_until = 0.0
-
-    def combat_entry_needs_health_bar(self):
-        return time.time() < self._health_only_until
 
     def on_combat_check(self):
         if not self._in_realm:
@@ -106,7 +98,6 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
         return super()._unbuffed_non_main_target(current_char, candidates)
 
     def revive_action(self):
-        self._health_only_until = 0.0
         if self._in_realm:
             # 副本内只有开启传送才能回到 boss，此时先退本回血，由 do_run 重新传送
             if not self.teleport_to_boss_enabled():
@@ -151,7 +142,6 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
         self._farm_start_time = time.time()
         self._has_treasure = False
         self.is_revived = False
-        self._health_only_until = 0.0
         self.init_parameters()
         if self.teleport_to_boss_enabled():
             self.teleport_to_configured_boss_and_prepare()
@@ -198,11 +188,9 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
                 self.log_info(self.tr('combat_wait_time: {combat_wait_time}').format(combat_wait_time=self.combat_wait_time))
                 self.check_boss_name()
 
-                self._health_only_until = 0.0
                 self.combat_once(wait_combat_time=5, raise_if_not_found=False)
                 if self.is_revived:
                     continue
-                self._health_only_until = time.time() + POST_COMBAT_HEALTH_ONLY_SECONDS
 
                 if self.pick_echo():
                     logger.info(f'farm echo on the face')
@@ -229,7 +217,6 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
             except TaskDisabledException:
                 raise
             except CharRevivedException:
-                self._health_only_until = 0.0
                 if not self.teleport_to_boss_enabled():
                     raise
                 recovery_retries += 1
@@ -244,7 +231,6 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
                 self.teleport_to_configured_boss_and_prepare()
                 continue
             except Exception as e:
-                self._health_only_until = 0.0
                 if self.should_reteleport_after_farm_exception():
                     self.log_error(self.tr('Farm failed after walking into boss combat, teleporting again'), e)
                     self.is_revived = False

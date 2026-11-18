@@ -13,8 +13,13 @@ from src.task.BaseWWTask import BaseWWTask
 
 logger = Logger.get_logger(__name__)
 
+# 结束条件(刷4C=画面里有声骸)要隔这么久再成立一次才算打完
+END_CONFIRM_SECONDS = 0.3
+
 
 class CombatCheck(BaseWWTask):
+    # 第一次看到结束条件的时刻, <=0 表示没在确认
+    _end_seen_since = 0.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -81,6 +86,7 @@ class CombatCheck(BaseWWTask):
         self.has_lavitator = False
         self.can_break = False
         self._f_grace_since = -1.0
+        self._end_seen_since = 0.0
         self.scene.set_not_in_combat()
         return False
 
@@ -153,10 +159,6 @@ class CombatCheck(BaseWWTask):
         """保护期最多撑多久, 0 = 一直撑到锁到目标。"""
         return 0.0
 
-    def combat_entry_needs_health_bar(self):
-        """为真时进战斗只认血条, 锁定框不算。刷4C 打完捡声骸那一阵用, 见 FarmEchoTask。"""
-        return False
-
     def f_grace_hold(self):
         """按 F 开打后怪还没出来: 只补点一下中键就放行, 不卡那 3 秒找怪, 也不判脱战, 宏照常出招。
 
@@ -195,11 +197,22 @@ class CombatCheck(BaseWWTask):
                 return self.reset_to_false(reason='on_combat_check failed')
             if self.has_target():
                 self.last_in_realm_not_combat = 0
+                self._end_seen_since = 0.0
                 return self.scene.set_in_combat()
             # Boss 血条还在就没打完, 只是一时没锁住(跳开/演出), 不能凭画面里有声骸收手
             if (self.combat_end_condition is not None and not self.has_boss_health_bar()
                     and self.combat_end_condition()):
-                return self.reset_to_false(reason='end condition reached')
+                # 一帧看到「声骸」不算: 识别会误报, 而 Boss 没死时收手要空站好几秒才接上。
+                # 隔一次判定再看到才收手, 中间照常出招
+                now = time.time()
+                if self._end_seen_since <= 0:
+                    self._end_seen_since = now
+                    self.log_info('end condition seen, confirm on next check')
+                    return self.scene.set_in_combat()
+                if now - self._end_seen_since >= END_CONFIRM_SECONDS:
+                    return self.reset_to_false(reason='end condition reached')
+                return self.scene.set_in_combat()
+            self._end_seen_since = 0.0
             has_health = self.check_health_bar()
             retarget_timeout = 30 if has_health else self.target_enemy_time_out
             if self.target_enemy(wait=True, time_out=retarget_timeout, check_health=has_health):
@@ -216,12 +229,8 @@ class CombatCheck(BaseWWTask):
             if not has_target and target:
                 self.log_debug('try target')
                 self.middle_click(after_sleep=0.1)
-            if self.combat_entry_needs_health_bar():
-                # 刚打完那一阵中键会锁到还没消失的 Boss, 光有锁定框不算, 要看到血条
-                in_combat = self.has_health_bar()
-            else:
-                in_combat = has_target or ((self.config.get('Auto Target') or not isinstance(
-                    self, AutoCombatTask)) and self.check_health_bar())
+            in_combat = has_target or ((self.config.get('Auto Target') or not isinstance(self,
+                                                                                         AutoCombatTask)) and self.check_health_bar())
             if in_combat:
                 if not has_target and not self.target_enemy(wait=True):
                     if not self.target_enemy_error_notified:
