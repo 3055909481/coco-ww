@@ -159,6 +159,16 @@ class BaseChar:
     def get_buff_time(self):
         return self._buff_time
 
+    def burst_intro(self):
+        """这次上场是不是主C的爆发窗口: 有副C的队只认副C变奏入场(吃延奏增伤),
+        队里没副C就任何变奏入场都算, 不然配奶妈队永远打不出整套。"""
+        if self.has_sub_dps_intro:
+            return True
+        if not self.has_intro:
+            return False
+        teammates = [c for c in getattr(self.task, 'chars', []) if c and c is not self]
+        return not any(c.is_sub_dps for c in teammates)
+
     @property
     def buff_time(self):
         return self.get_buff_time()

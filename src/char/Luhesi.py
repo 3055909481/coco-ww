@@ -13,15 +13,6 @@ class Luhesi(BaseChar):
         self.perform_everything()
         self.switch_next_char()
 
-    def full_combo_intro(self):
-        # 有副C(琳奈/散华)时只在副C变奏入场吃延奏增伤打整套; 队里没副C就任何变奏入场都打, 不然永远打不出来
-        if self.has_sub_dps_intro:
-            return True
-        if not self.has_intro:
-            return False
-        teammates = [c for c in getattr(self.task, 'chars', []) if c and c is not self]
-        return not any(c.is_sub_dps for c in teammates)
-
     def lib(self):
         if self.luhesi_lib_available() and self.click_liberation(wait_if_cd_ready=0):
             self.f_break()
@@ -37,7 +28,7 @@ class Luhesi(BaseChar):
 
     def perform_everything(self):
         self.continues_normal_attack(1.1)
-        if not self.full_combo_intro():
+        if not self.burst_intro():
             self.send_resonance_key(post_sleep=0.1)
             return
         else:
