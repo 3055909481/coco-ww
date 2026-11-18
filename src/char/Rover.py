@@ -154,12 +154,12 @@ class Rover(BaseChar):
         self.click_echo(time_out=0)
         if self.is_forte_full():
             self.check_combat()
-            if self.resonance_available() and self.click_resonance()[0]:
+            if self.resonance_available() and self.click_resonance(time_out=1)[0]:
                 self.continues_normal_attack(1.4)
                 self.sleep(0.1)
         self.check_combat()
         if not self.click_liberation(send_click=True):
-            self.click_resonance()
+            self.click_resonance(time_out=1)
 
     def spectro_routine_aftertune_combo(self):
         self.heavy_attack()
@@ -236,7 +236,7 @@ class Rover(BaseChar):
                 use_skyfall_severance = self.use_skyfall_severance
                 if flying:
                     self.wind_routine_click_while_flying(1.6 if use_skyfall_severance else 1.74)
-                if use_skyfall_severance and self.click_resonance(send_click=False)[0]:
+                if use_skyfall_severance and self.click_resonance(send_click=False, time_out=1)[0]:
                     self.wind_routine_click_while_flying(1)
         self.click_liberation(send_click=True)
         self.wind_routine_wait_down()
@@ -277,6 +277,6 @@ class Rover(BaseChar):
         self.wait_down()
         self.click_echo()
         liber = self.click_liberation(send_click=True)
-        res = self.click_resonance(send_click=True)[0]
+        res = self.click_resonance(send_click=True, time_out=1)[0]
         if not (liber or res):
             self.continues_normal_attack(1)

@@ -463,6 +463,8 @@ for _name in ['switch_next_char', '_choose_switch_target', '_oldest_switch_targe
               'STARVE_NORMAL_SECONDS', 'STARVE_MUST_SECONDS', 'STARVE_PRIORITY', 'MAIN_DPS_MAX_WAIT',
               '_off_field_seconds', '_main_dps_waiting_too_long']:
     setattr(FakeTask, _name, BaseCombatTask.__dict__[_name])
+FakeTask._log_switch_candidate = lambda self, char, priority: _trace_candidate(self, char, priority)
+FakeTask._log_switch_choice = lambda self, c, t, h, r: _trace_choice(self, c, t, h, r)
 
 
 def make_char(task, cls_name, index):
@@ -479,6 +481,21 @@ def make_char(task, cls_name, index):
                buff_time=info.get('buff_time'))
     _apply_char_config(task, char, info)
     return char
+
+
+TRACE = False
+
+
+def _trace_candidate(self, char, priority):
+    if TRACE:
+        print(f'      cand {char.name:<12} prio={int(priority):<4} buff={char.has_buff()} '
+              f'off={self._off_field_seconds(char):.0f}s')
+
+
+def _trace_choice(self, current_char, target, has_intro, reason):
+    if TRACE:
+        print(f'      pick {target.name} intro={has_intro} reason={reason}')
+    return target
 
 
 def run_team(team, seed, seconds, frozen_ratio=0.0):
@@ -525,6 +542,9 @@ def run_team(team, seed, seconds, frozen_ratio=0.0):
         field = CLOCK.t - before
         stats[char.name]['max_field'] = max(stats[char.name]['max_field'], field)
         now_char = task.get_current_char()
+        if TRACE:
+            print(f'  {CLOCK.t - task.combat_start:6.1f}s {char.name:<12} field {field:5.1f}s '
+                  f'intro={char.has_intro} -> {now_char.name if now_char else None}')
         if now_char is not None and now_char is not char:
             switches.append((CLOCK.t, now_char.name))
         if task.mouse_is_down:
@@ -574,6 +594,8 @@ def main():
     ap.add_argument('--team', action='append')
     ap.add_argument('--seconds', type=float, default=180)
     ap.add_argument('--seeds', type=int, default=3)
+    ap.add_argument('--seed', type=int, default=None, help='只跑这一个 seed')
+    ap.add_argument('--trace', action='store_true', help='逐次打印上场/切人')
     ap.add_argument('--solo', action='store_true', help='每个角色配两个普通队友各跑一遍')
     ap.add_argument('--frozen', type=float, default=0.5,
                     help='奇数 seed 里这个比例的读屏结果整局不变(模拟某个判据失灵/一直成立)')
@@ -593,9 +615,11 @@ def main():
                 teams.append([name, a, b])
         if args.names:
             teams = [t for t in teams if any(n in t for n in args.names)]
+    global TRACE
+    TRACE = args.trace
     total_problems = 0
     for team in teams:
-        for seed in range(args.seeds):
+        for seed in ([args.seed] if args.seed is not None else range(args.seeds)):
             CLOCK.t = 100000.0
             try:
                 stats, problems, longest = run_team(team, seed, args.seconds,

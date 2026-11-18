@@ -734,6 +734,13 @@ class BaseCombatTask(CombatCheck):
                 switch_priority = SwitchPriority.NO
             if guard_starving:
                 switch_priority = self._starving_priority(char, switch_priority)
+                if (char.is_main_dps and not current_char.is_main_dps
+                        and self._off_field_seconds(char) > self.MAIN_DPS_MAX_WAIT
+                        and switch_priority < self.STARVE_PRIORITY):
+                    # 辅助报 MUST(比如穗穗太久没满协奏退场)也不能让主C一直等
+                    logger.info(f'switch starvation guard: main dps {char} off field '
+                                f'{self._off_field_seconds(char):.0f}s, priority {switch_priority} -> starve')
+                    switch_priority = self.STARVE_PRIORITY
             self._log_switch_candidate(char, switch_priority)
             if switch_priority > SwitchPriority.NO:
                 prioritized_candidates.append((switch_priority, char))

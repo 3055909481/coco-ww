@@ -75,6 +75,7 @@ class BaseChar:
     PERFORM_HARD_TIMEOUT = 30.0
     # click_liberation 连按多久大招图标还亮着就放弃
     LIBERATION_CLICK_TIME_OUT = 5.0
+    NATIVE_SKILL_TIME_OUT = 3.0
 
     def __init__(self, task, index, char_name=None, confidence=1, ring_index=-1, char_type=CharType.MAIN_DPS,
                  buff_time=None):
@@ -414,8 +415,10 @@ class BaseChar:
         self.wait_intro(1.2)
         self.click_echo(time_out=0)
         self.click_liberation()
-        if not self.click_resonance()[0]:
-            self.heavy_click_forte(self.is_mouse_forte_full)
+        if not self.click_resonance(time_out=1)[0]:
+            if not self.heavy_click_forte(self.is_mouse_forte_full):
+                # 什么都没放出来就普攻一小段, 别原地秒切
+                self.attack_while(0.8, stop=self.is_con_full)
         self.switch_next_char()
 
     def has_cd(self, box_name):
@@ -529,7 +532,8 @@ class BaseChar:
         animation_start = 0
         last_f_click = 0
         if time_out == 0:
-            the_time_out = SKILL_TIME_OUT
+            # 原生代码没给超时: 图标亮着 3 秒还放不出来(被控/空中/读错)就算了; 自定义队伍代码保持原来的 15 秒
+            the_time_out = self.NATIVE_SKILL_TIME_OUT if self.native_perform() else SKILL_TIME_OUT
         else:
             the_time_out = time_out
         while True:
