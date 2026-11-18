@@ -19,3 +19,6 @@ configs/custom_teams/*.backup/
 /configs/devices.json
 /configs/_ok.json
 /configs/Notification.json
+
+# 第三方整理的全角色帧表(来源不明, 只本机做轴参考, 不公开)
+/configs/鸣潮动作数据汇总.xlsx
