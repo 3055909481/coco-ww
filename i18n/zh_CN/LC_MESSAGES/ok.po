@@ -2227,3 +2227,24 @@ msgstr "清宵"
 
 msgid "Suoming"
 msgstr "锁暝"
+
+msgid "Weekly Boss Name"
+msgstr "战歌重奏Boss"
+
+msgid "Boss Challenge Name"
+msgstr "讨伐强敌Boss"
+
+msgid "Special Nightmare Name"
+msgstr "特异梦魇Boss"
+
+msgid "Found by name in the list, new bosses appear here after one run"
+msgstr "按名字在列表里找，游戏加新Boss也不会点错；新Boss跑过一次后重启就能选"
+
+msgid "boss book: clicked {name}"
+msgstr "素材获取：选中 {name}"
+
+msgid "boss book: {wanted} not found, list has: {names}"
+msgstr "素材获取里没找到 {wanted}，列表里有：{names}"
+
+msgid "boss book: new bosses found {names}, restart to pick them"
+msgstr "发现新Boss：{names}，重启 coco-ww 后可在下拉框里选"
