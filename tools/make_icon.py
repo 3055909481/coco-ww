@@ -2,7 +2,6 @@ r"""coco-ww 图标: 在原图标上画一个被抱着的椰子(切开顶、露�
 
     python\python.exe -X utf8 tools\make_icon.py tools\icon_original.png icons\icon.png
 同时写 icons\icon.ico(多尺寸)。加第三个参数 straw 会多画一根吸管(试过, 挡脸, 没用)。
-改完图标要重跑 tools\make_exe.py, exe 里的图标才会跟着换。
 """
 import math
 import os

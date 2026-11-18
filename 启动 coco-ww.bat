@@ -6,7 +6,4 @@ if errorlevel 1 (
     exit /b
 )
 cd /d "%~dp0"
-rem coco-ww.exe is a renamed pythonw.exe so the process shows up as coco-ww; fall back if it is missing.
-set "EXE=%~dp0python\coco-ww.exe"
-if not exist "%EXE%" set "EXE=%~dp0python\pythonw.exe"
-start "" "%EXE%" -X utf8 main.py
+start "" "%~dp0python\pythonw.exe" -X utf8 main.py
