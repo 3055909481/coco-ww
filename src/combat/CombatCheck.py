@@ -15,6 +15,8 @@ logger = Logger.get_logger(__name__)
 
 # 结束条件(刷4C=画面里有声骸)要隔这么久再成立一次才算打完
 END_CONFIRM_SECONDS = 0.3
+# 残血 Boss 血条最窄认到多宽(占屏宽), 4K 下 3 像素
+BOSS_SLIVER_WIDTH = 3 / 3840
 
 
 class CombatCheck(BaseWWTask):
@@ -199,8 +201,8 @@ class CombatCheck(BaseWWTask):
                 self.last_in_realm_not_combat = 0
                 self._end_seen_since = 0.0
                 return self.scene.set_in_combat()
-            # Boss 血条还在就没打完, 只是一时没锁住(跳开/演出), 不能凭画面里有声骸收手
-            if (self.combat_end_condition is not None and not self.has_boss_health_bar()
+            # Boss 还在(残血也算)就没打完, 只是一时没锁住(跳开/演出), 不能凭画面里有声骸收手
+            if (self.combat_end_condition is not None and not self.boss_still_alive()
                     and self.combat_end_condition()):
                 # 一帧看到「声骸」不算: 识别会误报, 而 Boss 没死时收手要空站好几秒才接上。
                 # 隔一次判定再看到才收手, 中间照常出招
@@ -407,12 +409,14 @@ class CombatCheck(BaseWWTask):
             return True
         return self.has_boss_health_bar()
 
+    def boss_health_area(self):
+        return self.box_of_screen(1269 / 3840, 58 / 2160, 2533 / 3840, 200 / 2160, hcenter=True, vcenter=True)
+
     def has_boss_health_bar(self):
         """屏幕顶上 Boss 血条还有血(只看血的颜色, Boss 死后空槽和名字残留不算)。"""
         min_width, min_height = self._health_bar_min_size()
         boxes = find_color_rectangles(self.frame, boss_health_color, min_width, min_height * 1.3,
-                                      box=self.box_of_screen(1269 / 3840, 58 / 2160, 2533 / 3840, 200 / 2160,
-                                                             hcenter=True, vcenter=True))
+                                      box=self.boss_health_area())
         if len(boxes) == 1:
             self.boss_health_box = boxes[0]
             self.boss_health_box.width = 10
@@ -421,6 +425,19 @@ class CombatCheck(BaseWWTask):
             self.draw_boxes('boss_health', boxes, color='blue')
             return True
         return False
+
+    def boss_still_alive(self):
+        """收手前问一句 Boss 还在不在: 破韧图标还挂着, 或者顶上血条还剩一点颜色。
+
+        has_boss_health_bar 要一整块且宽过 12/3840 屏宽(2K 下 8 像素, 约 1% 血), 残血时认不到;
+        这里只在要收手时看一次, 剩几像素、被特效切成几段也算还活着。
+        """
+        if self.is_boss():
+            return True
+        min_height = self.height_of_screen(9 / 2160)
+        boxes = find_color_rectangles(self.frame, boss_health_color, self.width_of_screen(BOSS_SLIVER_WIDTH),
+                                      min_height * 1.3, box=self.boss_health_area())
+        return len(boxes) > 0
 
     def check_health_bar(self):
         return self.has_health_bar() or self.is_boss()

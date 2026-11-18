@@ -6,8 +6,11 @@ import os
 import sys
 import unittest
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from ok import Box
 from src.task.FarmEchoTask import FarmEchoTask
 
 
@@ -41,7 +44,7 @@ def make_task(target=False, health=False, boss_bar=False, echo=False, retarget=F
     task.combat_end_condition = lambda: task.echo
     task.find_target = lambda double_check=False: task.target
     task.check_health_bar = lambda: task.health or task.boss_bar
-    task.has_boss_health_bar = lambda: task.boss_bar
+    task.boss_still_alive = lambda: task.boss_bar
     task.target_enemy = lambda *a, **k: task.retarget
     task.find_one = lambda *a, **k: None
     task.check_f_break = lambda: None
@@ -80,6 +83,55 @@ class EndConditionTest(unittest.TestCase):
         task._end_seen_since = 1.0  # 就算之前看到过, Boss 还有血也不收手
         self.assertTrue(task.in_combat())
         self.assertTrue(task._in_combat)
+
+
+class FrameTask(FarmEchoTask):
+    frame = None  # 盖掉基类从执行器取帧的属性
+
+
+W, H = 2560, 1440
+
+
+def frame_with_boss_fill(width_px, pieces=1):
+    """2K 黑屏, Boss 血条位置画 pieces 段宽 width_px 的血色。"""
+    frame = np.zeros((H, W, 3), dtype=np.uint8)
+    y0 = int(H * 100 / 2160)
+    x0 = int(W * 1300 / 3840)
+    for i in range(pieces):
+        x = x0 + i * (width_px + 6)
+        frame[y0:y0 + 10, x:x + width_px] = (40, 120, 250)  # BGR, 落在 boss_health_color 里
+    return frame
+
+
+def make_frame_task(frame, boss_icon=False):
+    task = object.__new__(FrameTask)
+    task.__dict__.update(_in_combat=True, boss_health_box=None, boss_health=None)
+    task.frame = frame
+    task.width_of_screen = lambda r: int(r * W)
+    task.height_of_screen = lambda r: int(r * H)
+    task.boss_health_area = lambda: Box(int(W * 1269 / 3840), int(H * 58 / 2160),
+                                        to_x=int(W * 2533 / 3840), to_y=int(H * 200 / 2160))
+    task.is_boss = lambda: boss_icon
+    task.draw_boxes = lambda *a, **k: None
+    return task
+
+
+class BossStillAliveTest(unittest.TestCase):
+    def test_sliver_counts_as_alive(self):
+        task = make_frame_task(frame_with_boss_fill(4))
+        self.assertFalse(task.has_boss_health_bar(), '残血 4 像素, 原来的血条判断认不到')
+        self.assertTrue(task.boss_still_alive())
+
+    def test_split_fill_counts_as_alive(self):
+        task = make_frame_task(frame_with_boss_fill(30, pieces=2))
+        self.assertFalse(task.has_boss_health_bar(), '被切成两段, 原来要求恰好一块')
+        self.assertTrue(task.boss_still_alive())
+
+    def test_empty_bar_is_dead(self):
+        self.assertFalse(make_frame_task(frame_with_boss_fill(0, pieces=0)).boss_still_alive())
+
+    def test_break_icon_counts_as_alive(self):
+        self.assertTrue(make_frame_task(frame_with_boss_fill(0, pieces=0), boss_icon=True).boss_still_alive())
 
 
 if __name__ == '__main__':
