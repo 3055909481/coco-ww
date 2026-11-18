@@ -6,19 +6,24 @@ from src.char.BaseChar import BaseChar, SwitchPriority
 class Lucilla(BaseChar):
     """洛瑟菈(拍照攒相片, 大招进「追忆」)。
 
-    机制(做绯洛穗轴时录屏逐帧量过):
-    - 长按 E 对焦: 按下后约 0.86~1.10 秒圈变金, 这时松手是「追光」(+50 印象、+20 协奏, 松手后约 0.9 秒到账,
-      不怕打断); 早松/晚松都是「补光」(只 +25 印象, E 冷却当场减 8 秒)。按住 1.2 秒以上必定补光。
-    - 变奏入场直接给 2 张相片(+100), 再一发追光就能开大。
+    机制(帧表 + 攻略视频 + 绯洛穗录屏):
+    - 长按 E / 普攻第 3 段展开聚焦环, 判定分三段: 长判1 松手=成功, 长判2 松手=失败, 长判3 松手或按到底=成功。
+      成功是「追光/可圈可点」(+50 印象 = 1 张相片, E 追光另给 +20 协奏), 失败是「补光/乏善可陈」(+25)。
+      录屏量过第一个金色窗口在按下后 0.86~1.10 秒, 但 E 起手一被前一个动作缓存就整个往后挪, 定时松手很容易落进长判2。
+      攻略作者的用法是「按住不动等它跑满, 自动打出强化版」: E 按到底(帧表 92F+起手延迟)、A3 按到底(86F)都必定成功。
+    - 追光的印象在追光第 54F 才到账, 这之前切人会打断、能量不涨。
+    - 变奏入场直接给 2 张相片(+100), 再一发追光就能开大。没变奏就 E + A1A2 长按 A3 慢慢攒。
     - 大招演出约 4.5 秒(隐藏 HUD), 然后进「追忆」: E/R 都放不了, 按住普攻依次打溯念留形 1/2/3 段,
       第 3 段一直按着持续消耗相片, 松手或打完自动「断舍离」(+20 协奏, 期间不能切人, 隐藏 HUD ~1.4 秒), 然后退出追忆。
       中途松手会少打相片, 所以要一直按住到断舍离。
     """
-    FOCUS_HOLD_TIME: float = 0.95
+    FOCUS_HOLD_TIME: float = 2.0
     R_AFTER_FOCUS: float = 1.4
-    HEAVY_CHARGE_TIME: float = 1.4
+    A1_TO_A2: float = 0.45
+    A2_TO_A3: float = 0.3
+    A3_HOLD_TIME: float = 2.1
     INTRO_SETTLE: float = 0.9
-    CHARGE_TIME_OUT: float = 7.2
+    CHARGE_TIME_OUT: float = 9.0
     LIBERATION_CD_SKIP: float = 1.5
     LIB_ANIMATION_CAP: float = 6.0
     ZHUIYI_HOLD_CAP: float = 8.0
@@ -44,9 +49,12 @@ class Lucilla(BaseChar):
             if self.energy_full() and not self.liberation_available():
                 self.logger.info('Lucilla energy full but liberation not castable, switch')
                 break
-            # 能量没满且大招长 CD -> 没必要攒
+            # 能量没满且大招长 CD -> 不攒满, E 好了打一发追光(印象和协奏都留着)再走
             if not self.liberation_available() and self.task.get_cd('liberation') > self.LIBERATION_CD_SKIP:
                 self.logger.info('Lucilla liberation on long cd, switch to save time')
+                if self.resonance_available():
+                    self.focus_shot()
+                    self.sleep(1.0)
                 break
             if self.try_liberation():
                 return True
@@ -56,26 +64,24 @@ class Lucilla(BaseChar):
                 if self.task.wait_until(self.liberation_available, time_out=self.R_AFTER_FOCUS):
                     continue
             else:
-                # E 没好(或还在追忆里): 长按普攻; 在追忆里这就是打到断舍离
-                self.heavy_attack(self.HEAVY_CHARGE_TIME)
+                # E 没好: A1 A2 长按 A3 拿一张相片; 还在追忆里的话就是打到断舍离
+                self.focus_a3()
             self.task.next_frame()
         return False
 
     def focus_shot(self):
-        """长按 E 对焦 FOCUS_HOLD_TIME 秒松手(追光)。用 time.sleep 精确计时, 执行器多睡几十毫秒就会出窗口。"""
-        key = self.get_resonance_key()
-        self.task.send_key_down(key)
-        try:
-            end = time.time() + self.FOCUS_HOLD_TIME
-            while True:
-                left = end - time.time()
-                if left <= 0:
-                    break
-                time.sleep(min(left, 0.02))
-        finally:
-            self.task.send_key_up(key)
+        """长按 E 到聚焦环跑满, 自动出追光。不赌金色窗口: E 起手被缓存时定时松手会落进补光。"""
+        self.hold_key(self.get_resonance_key(), self.FOCUS_HOLD_TIME)
         self.record_resonance_use()
         self.logger.info(f'Lucilla focus E held {self.FOCUS_HOLD_TIME:.2f}s')
+
+    def focus_a3(self):
+        """A1 -> A2 -> 长按 A3 到聚焦环跑满(可圈可点, +50 印象)。"""
+        self.click()
+        self.sleep(self.A1_TO_A2)
+        self.click()
+        self.sleep(self.A2_TO_A3)
+        self.hold_mouse(self.A3_HOLD_TIME)
 
     def try_liberation(self):
         """大招就绪则放(顺带先放声骸)并打完追忆、切人, 返回是否放出。"""
