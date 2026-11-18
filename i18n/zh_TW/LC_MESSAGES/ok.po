@@ -2326,3 +2326,9 @@ msgstr "素材獲取裡沒找到 {wanted}，列表裡有：{names}"
 
 msgid "boss book: new bosses found {names}, restart to pick them"
 msgstr "發現新Boss：{names}，重啟 coco-ww 後可在下拉框裡選"
+
+msgid "challenge: {button} did not respond, click again"
+msgstr "進本：「{button}」沒反應，補點一次"
+
+msgid "challenge: not in world after {seconds}s"
+msgstr "進本：{seconds} 秒還沒進到副本"

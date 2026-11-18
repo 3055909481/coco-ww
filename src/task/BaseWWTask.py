@@ -1109,9 +1109,53 @@ class BaseWWTask(BaseTask):
             raise_if_not_found=False,
         )
 
-    def click_team_challenge(self):
-        self.wait_click_feature('team_start_challenge', raise_if_not_found=True, click_after_delay=0.5, after_sleep=1)
-        self.wait_click_skip_dialog_confirm()
+    # 等级页「单人挑战」和队伍页「开启挑战」都在右下这一条
+    CHALLENGE_BUTTON_BOX = (0.60, 0.86, 0.98, 0.97)
+    CHALLENGE_TEXTS = (('team', re.compile(r'开启挑战|開啟挑戰|Start', re.IGNORECASE)),
+                       ('level', re.compile(r'单人挑战|單人挑戰|Solo', re.IGNORECASE)))
+
+    def find_challenge_button(self):
+        """当前停在等级页/队伍页时返回 (页名, 按钮框)，否则 None。
+
+        外文客户端认不出字时用 team_start_challenge 模板兜底（它在两页的主按钮上都能匹配，点哪页都是往前走）。
+        """
+        texts = self.ocr(*self.CHALLENGE_BUTTON_BOX, name='challenge_buttons') or []
+        for page, pattern in self.CHALLENGE_TEXTS:
+            box = next((t for t in texts if pattern.search(t.name)), None)
+            if box is not None:
+                return page, box
+        box = self.find_one('team_start_challenge')
+        return ('button', box) if box is not None else None
+
+    def click_challenge_until_in_world(self, time_out=120, retry_interval=4):
+        """从等级页/队伍页一路点到进副本，点击丢了会补点。
+
+        2026-11-19 实机：点完「单人挑战」后停在等级页没翻页，旧代码只点一次就干等 120 秒。
+        这里每轮看一眼停在哪页：换了页 1 秒后点这一页的按钮；同一页超过 retry_interval 秒还没走就补点。
+        结晶波片(含备用)不足时进队伍界面前会弹「无法获取奖励, 是否继续进入」，每轮都先勾「不再提示」点确认。
+        """
+        start = time.time()
+        last_click, last_page, clicks = 0.0, None, 0
+        while time.time() - start < time_out:
+            self.next_frame()
+            if self.in_team_and_world():
+                self.sleep(0.5)
+                return True
+            if self.click_skip_dialog_confirm():
+                continue
+            found = self.find_challenge_button()
+            now = time.time()
+            if found is not None:
+                page, box = found
+                wait = 1.0 if page != last_page else retry_interval
+                if now - last_click >= wait:
+                    if page == last_page:
+                        self.log_info(self.tr('challenge: {button} did not respond, click again').format(button=box.name))
+                    self.click_box(box, after_sleep=0.5)
+                    last_click, last_page, clicks = time.time(), page, clicks + 1
+                    continue
+            self.sleep(0.5)
+        raise Exception(self.tr('challenge: not in world after {seconds}s').format(seconds=time_out))
 
     def wait_click_travel(self):
         self.wait_until(self.click_traval_button, raise_if_not_found=True, time_out=10)

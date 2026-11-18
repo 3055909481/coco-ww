@@ -272,6 +272,8 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
                 self._just_entered_boss_realm = True
             else:
                 walk_result = self.walk_after_boss_teleport()
+        except TaskDisabledException:
+            raise  # 手动停任务不是传送失败，别再走领月卡等补救
         except Exception as e:
             raise RuntimeError(self.tr('Teleport to boss failed')) from e
 
@@ -327,12 +329,11 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
         if is_team:
             if teleport_to_boss == 'Weekly Challenge':
                 self.click_configured_boss_level()
-                self.click_solo_challenge()
-            self.click_team_challenge()
+            self.click_challenge_until_in_world(time_out=120)
         else:
             self.realm_entry_at_heal_point = False  # 传送到 boss 附近再走进本, 退本不会回到信标
             self.wait_click_travel()
-        self.wait_in_team_and_world(time_out=120)
+            self.wait_in_team_and_world(time_out=120)
         self.sleep(2)
         return is_team
 
@@ -377,10 +378,7 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
             raise RuntimeError(self.tr('Teleport to boss failed: can not find F before entering realm'))
         self.send_key('f', after_sleep=3)
         self.click_configured_boss_level()
-        self.sleep(1)
-        self.click_solo_challenge()
-        self.click(0.908, 0.919, after_sleep=5)
-        self.wait_in_team_and_world(time_out=120)
+        self.click_challenge_until_in_world(time_out=120)
         self._in_realm = True
         self.treat_as_not_in_realm = False
         self._has_treasure = False
@@ -398,12 +396,6 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
         if not level_box:
             raise RuntimeError(self.tr('Can not find boss level {boss_level}').format(boss_level=boss_level))
         self.click_box(level_box)
-
-    def click_solo_challenge(self):
-        self.click(0.880, 0.911, after_sleep=2)
-        # 结晶波片(含备用)不足时, 进队伍界面前会弹「无法获取奖励, 是否继续进入」;
-        # 勾选本次登录不再提示并确认, 刷声骸不需要领奖励. 弹窗点击后立即出现, 不弹时只多等 1 秒
-        self.wait_click_skip_dialog_confirm(time_out=1)
 
     def handle_boss_restart_after_treasure(self):
         self._has_treasure = True
