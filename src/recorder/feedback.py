@@ -1,4 +1,4 @@
-"""一键反馈包: 一局的记录、整局画面、这局按 F8 导出的原图、版本信息、这局前后的 ok-ww 日志(可选带上录屏)打成一个 zip。
+"""一键反馈包: 一局的记录、整局画面、这局按 F8 导出的原图、版本信息、这局前后的 coco-ww 日志(可选带上录屏)打成一个 zip。
 不依赖 Qt。
 
 收到的人在复盘页点「打开反馈包」: 解压到 <记录目录>/imported/<包名>/, 和本地的记录分开放(不会被开新局时删掉)。"""
@@ -84,7 +84,7 @@ class FeedbackPlan:
 
 
 def default_log_path():
-    """ok-ww 正在写的日志; 拿不到就用它的默认位置 logs/ok-script.log。"""
+    """coco-ww 正在写的日志; 拿不到就用它的默认位置 logs/ok-script.log。"""
     try:
         from ok.util import logger as ok_logger
         handler = getattr(ok_logger, '_file_handler', None)
@@ -96,7 +96,7 @@ def default_log_path():
 
 
 def log_files(log_path, wall0, wall1):
-    """过了午夜 ok-ww 把旧日志改名成 ok-script.<日期>.log, 一局前后可能跨两份。"""
+    """过了午夜 coco-ww 把旧日志改名成 ok-script.<日期>.log, 一局前后可能跨两份。"""
     stem, ext = os.path.splitext(log_path)
     day = datetime.date.fromtimestamp(wall0 - LOG_MARGIN)
     last = datetime.date.fromtimestamp(wall1 + LOG_MARGIN)
@@ -161,7 +161,7 @@ def summary_text(info, run, lap_slot):
         *detail_lines(run),
         '',
         '【环境】',
-        f"ok-ww {info['ok_ww'] or '?'} · 录这局的插件 v{info['plugin_recorded'] or '?'} · {info['os']}",
+        f"coco-ww {info['coco_ww'] or '?'} · 录这局的插件 v{info['plugin_recorded'] or '?'} · {info['os']}",
         '',
         '【包里有】',
         f"axis_runs/{info['run']}  这局的按键、读屏、在场、日志记录",
@@ -174,8 +174,8 @@ def summary_text(info, run, lap_slot):
     else:
         lines.append('F8 导出的原图: ' + ('这局没导出' if not info['exports_skipped'] else
                                           f"这局导出过 {info['exports_skipped']} 次, 打包时没带"))
-    lines.append(f"{LOG_NAME}  ok-ww 日志 {log['from'][11:19]} ~ {log['to'][11:19]} 共 {log['lines']} 行"
-                 if log['lines'] else '日志: 没找到这局的日志(日志文件不在, 或者 ok-ww 关了写日志)')
+    lines.append(f"{LOG_NAME}  coco-ww 日志 {log['from'][11:19]} ~ {log['to'][11:19]} 共 {log['lines']} 行"
+                 if log['lines'] else '日志: 没找到这局的日志(日志文件不在, 或者 coco-ww 关了写日志)')
     video = info.get('video')
     if video:
         lines.append(f"{VIDEO_DIR}/{video['name']}  录屏 {video['bytes'] / 1e6:.0f}MB")
@@ -250,7 +250,7 @@ def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=Non
         'duration': round(run.duration, 2), 'reason': run.reason,
         'team_dir': header.get('team_dir'), 'team_ver': header.get('team_ver'),
         'team': [run.char_name(i) for i in sorted(run.names)], 'size': header.get('size'),
-        'plugin_recorded': header.get('plugin'), 'plugin_packed': _plugin_version(), 'ok_ww': _ok_version(),
+        'plugin_recorded': header.get('plugin'), 'plugin_packed': _plugin_version(), 'coco_ww': _ok_version(),
         'os': platform.platform(), 'frames': plan.frames,
         'exports': [_export_info(f) for f in exports], 'exports_skipped': len(plan.exports) - len(exports),
         'log': {'from': _stamp(wall0 - LOG_MARGIN), 'to': _stamp(wall1 + LOG_MARGIN), 'lines': len(log_lines)},

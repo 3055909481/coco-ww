@@ -138,9 +138,9 @@ def _current_app_signature():
 
 def _interpreter_paths(executable, allow_console_pair=False):
     expected = {_normalized_path(executable)}
-    if allow_console_pair and os.path.basename(executable).lower() in ('python.exe', 'pythonw.exe'):
+    if allow_console_pair and os.path.basename(executable).lower() in ('python.exe', 'pythonw.exe', 'coco-ww.exe'):
         expected.update(_normalized_path(os.path.join(os.path.dirname(executable), name))
-                        for name in ('python.exe', 'pythonw.exe'))
+                        for name in ('python.exe', 'pythonw.exe', 'coco-ww.exe'))
     return expected
 
 

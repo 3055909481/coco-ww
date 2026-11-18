@@ -44,7 +44,7 @@ from src.char.TeamVariants import (
     import_archive_as_active, list_variants,
 )
 
-# 椰果版的工坊就是这个 GitHub 仓库: codes/ 放队伍 zip, teams.json 是仓库里的 Actions 生成的索引。
+# coco-ww 的工坊就是这个 GitHub 仓库: codes/ 放队伍 zip, teams.json 是仓库里的 Actions 生成的索引。
 WORKSHOP_REPO = "wk321425/ok-ww-char-code"
 WORKSHOP_BRANCH = "main"
 UPLOAD_TEAM_URL = f"https://github.com/{WORKSHOP_REPO}"
@@ -56,7 +56,7 @@ WORKSHOP_BASE_URLS = (
     f"https://fastly.jsdelivr.net/gh/{WORKSHOP_REPO}@{WORKSHOP_BRANCH}/",
 )
 WORKSHOP_TIMEOUT = 8
-WORKSHOP_USER_AGENT = "ok-ww-yeguo"
+WORKSHOP_USER_AGENT = "coco-ww"
 logger = Logger.get_logger(__name__)
 
 # The team list marks each team with a haloed dot, and both switch buttons wear the
@@ -176,7 +176,7 @@ def translate_ui(message):
         if translated and translated != message:
             return translated
 
-    # Fallback dictionaries for all officially supported locales in ok-ww:
+    # Fallback dictionaries for all officially supported locales in coco-ww:
     # zh_CN (Simplified Chinese), zh_TW (Traditional Chinese), ja_JP (Japanese), ko_KR (Korean), es_ES (Spanish)
     _locale_fallbacks = {
         "zh_CN": {

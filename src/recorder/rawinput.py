@@ -2,7 +2,7 @@
 
 Raw Input 是系统把键盘鼠标的原始事件「抄送」一份给登记过的窗口, 不在输入链路上: 这边卡住了游戏照样收得到按键。
 鼠标每动一下也会来一条(回报率多高就多少条), 所以只在人为操作模式、自动战斗关着时才登记, 测试代码时一条都不收。
-用自己的 WinDLL 实例声明函数签名, 不碰 ctypes.windll.user32(ok-ww 和队伍代码在用, 改了 argtypes 会坏)。
+用自己的 WinDLL 实例声明函数签名, 不碰 ctypes.windll.user32(coco-ww 和队伍代码在用, 改了 argtypes 会坏)。
 """
 import ctypes
 import os
@@ -14,7 +14,7 @@ from ctypes import wintypes as w
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 
-# 国服国际服一样; ok-ww 的 config.py 里也是这两个
+# 国服国际服一样; coco-ww 的 config.py 里也是这两个
 GAME_EXE = 'client-win64-shipping.exe'
 GAME_CLASS = 'UnrealWindow'
 
@@ -140,7 +140,7 @@ def is_action(device, key):
 
 
 def key_name(vk, make_code, flags):
-    """键名和 ok-ww 发键用的一致: 小写字母数字、space、lshift..., 左 Ctrl/Alt 叫 ctrl/alt。"""
+    """键名和 coco-ww 发键用的一致: 小写字母数字、space、lshift..., 左 Ctrl/Alt 叫 ctrl/alt。"""
     if vk == VK_SHIFT:
         return 'rshift' if make_code == RSHIFT_SCAN else 'lshift'
     if vk == VK_CONTROL:

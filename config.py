@@ -8,7 +8,7 @@ from src.game_launcher import get_game_launch_arguments
 from src.task.process_feature import process_feature
 from src.task.task_icons import task_icon
 
-# 椰果版自己的版本号; 程序底子是 ok-ww v3.8.0 (ok-script 3.0.5b7), 之后的角色和功能适配自己做
+# coco-ww 自己的版本号; 程序底子是上游 ok-wuthering-waves v3.8.0 (ok-script 3.0.5b7), 之后的角色和功能适配自己做
 version = "v1.0.0"
 base_version = "v3.8.0"
 
@@ -235,7 +235,7 @@ config = {
         'min_size': (1280, 720)
     },
     'links': {
-        # github 指向上游原项目: 椰果版是在它的基础上裁出来的
+        # github 指向上游原项目: coco-ww 是在它的基础上裁出来的
         'default': {
             'github': 'https://github.com/ok-oldking/ok-wuthering-waves',
             'workshop': 'https://github.com/wk321425/ok-ww-char-code',
@@ -243,7 +243,7 @@ config = {
     },
     'about': """
     <p>
-    <strong>OK-WW 椰果版</strong>: 基于开源项目 ok-wuthering-waves v3.8.0 裁剪, 只保留「刷 4C 声骸」和「自动战斗」
+    <strong>coco-ww</strong>: 基于开源项目 ok-wuthering-waves v3.8.0 裁剪, 只保留「刷 4C 声骸」和「自动战斗」
     (含按 F 开战、角色代码/队伍工坊、跑轴记录), 不跟随上游自动更新。
     </p>
     <p style="color:red;">
@@ -257,15 +257,15 @@ config = {
     </p>
 """,
     'screenshots_folder': "screenshots",
-    'gui_title': 'OK-WW 椰果版',
+    'gui_title': 'coco-ww',
     # 任务页: 两个分区直接叫功能名, 自动战斗排上面
     'tasks_trigger_title': '自动战斗',
     'tasks_onetime_title': '刷4C声骸',
     'tasks_trigger_first': True,  # Optional
     'game_name': 'Wuthering Waves',
     # 'coco_feature_folder': get_path(__file__, 'assets/coco_feature'),  # required if using feature detection
-    'log_file': 'logs/ok-ww.log',  # Optional, auto rotating every day
-    'error_log_file': 'logs/ok-ww_error.log',
+    'log_file': 'logs/coco-ww.log',  # Optional, auto rotating every day
+    'error_log_file': 'logs/coco-ww_error.log',
     'version': version,
     'onetime_tasks': [
         ["src.task.FarmEchoTask", "FarmEchoTask"],

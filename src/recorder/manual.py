@@ -302,7 +302,7 @@ class ManualDriver:
         if run is not None and run.manual:
             self.recorder.end_run(HOTKEY_STOP)
             return
-        text = '跑轴记录: ok-ww 没在运行, 这下没开始记(先点 ok-ww 的开始再按)'
+        text = '跑轴记录: coco-ww 没在运行, 这下没开始记(先点 coco-ww 的开始再按)'
         logger.warning(text)
         try:
             owner.notification(text, tray=True)
@@ -325,7 +325,7 @@ class ManualDriver:
         if run is not None and run.manual:
             if run.by == BY_HOTKEY:
                 return True  # 热键开的局只认热键收, 接着记按键; 热键在 _on_hotkey 里收
-            self.recorder.end_run('ok-ww 停下了(执行器暂停或插件被关)')
+            self.recorder.end_run('coco-ww 停下了(执行器暂停或插件被关)')
         return False
 
     def _emit(self, run, t, action, key, injected, lag, value, cut):

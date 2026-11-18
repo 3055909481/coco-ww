@@ -1,6 +1,6 @@
 """按 F 开始战斗的判定逻辑(不起游戏、不起界面)。
 
-在椰果版根目录跑:  python\\python.exe -X utf8 tests\\test_f_key_start.py
+在 coco-ww 根目录跑:  python\\python.exe -X utf8 tests\\test_f_key_start.py
 """
 import os
 import sys

@@ -657,7 +657,10 @@ def detail_lines(run):
         lines.append(video)
     feedback = run.feedback
     if feedback is not None:
-        lines.append(f"反馈包: {feedback.get('packed', '?')} 打的  ·  ok-ww {feedback.get('ok_ww') or '?'}  ·  "
+        # 插件版(装在上游 OKWW 里)打的包只有 ok_ww 字段
+        host = (f"coco-ww {feedback.get('coco_ww') or '?'}" if 'coco_ww' in feedback
+                else f"ok-ww {feedback.get('ok_ww') or '?'}")
+        lines.append(f"反馈包: {feedback.get('packed', '?')} 打的  ·  {host}  ·  "
                      f"插件 v{feedback.get('plugin_packed') or '?'}  ·  {feedback.get('os') or '?'}")
     stats = run.char_stats()
     if stats:

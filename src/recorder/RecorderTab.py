@@ -19,7 +19,7 @@ from .runs import (HUD_HIDDEN, RunData, Span, describe, detail_lines, headline, 
                    list_runs, source_text, video_clock, video_pending)
 from .screenrec import load_video_info, video_info_path
 
-# 椰果版用宿主自带的控件库(ok.ui.qt.kit): 按钮、下拉框、文字用它的类, 其余原生控件靠
+# coco-ww 用宿主自带的控件库(ok.ui.qt.kit): 按钮、下拉框、文字用它的类, 其余原生控件靠
 # theme.install() 给这一页套上的样式表上色。插件时代的 qfluentwidgets 新环境里没有。
 from PySide6.QtWidgets import QCheckBox as CheckBox, QLineEdit as SearchLineEdit, \
     QPlainTextEdit as PlainTextEdit, QScrollArea as ScrollArea, QSlider as Slider, QTableView as TableView, \
@@ -1058,7 +1058,7 @@ class AxisRecorderTab(QWidget):
         return default_out_dir()
 
     def _tick(self):
-        # 这页和轴在同一个进程里抢 GIL: 人在游戏里(ok-ww 不是前台窗口)或者正打着, 都不读盘
+        # 这页和轴在同一个进程里抢 GIL: 人在游戏里(coco-ww 不是前台窗口)或者正打着, 都不读盘
         recording = self._recording()
         if self._was_recording and not recording:
             self._refresh_due = 0  # 一局刚收尾, 能刷就马上刷, 别让人以为还在录
@@ -1363,7 +1363,7 @@ class AxisRecorderTab(QWidget):
     def _update_pack_button(self):
         self.pack_button.setText('打包中…' if self._packing else '打包反馈')
         self.pack_button.setEnabled(self.run is not None and not self._packing)
-        self.pack_button.setToolTip('把选中的这一局(记录、整局画面、这局 F8 导出的原图、版本、前后的 ok-ww 日志, 可选带上录屏)打成一个 zip\n'
+        self.pack_button.setToolTip('把选中的这一局(记录、整局画面、这局 F8 导出的原图、版本、前后的 coco-ww 日志, 可选带上录屏)打成一个 zip\n'
                                     f'存在 {os.path.join(self.out_dir, FEEDBACK_DIR)}, 留最近 10 个')
 
     def _pack_feedback(self):
@@ -1393,7 +1393,7 @@ class AxisRecorderTab(QWidget):
         team = ' / '.join(self.run.char_name(i) for i in sorted(self.run.names))
         frames = f' + 整局画面 {plan.frames} 帧' if plan.frames else ''
         intro = BodyLabel(f'把这一局打成一个 zip, 发给做轴的人看:\n{when} · {team} · {self.run.duration:.1f}s\n'
-                          f'记录{frames} + 版本 + 这局前后的 ok-ww 日志, 约 {plan.base_bytes / 1e6:.1f}MB')
+                          f'记录{frames} + 版本 + 这局前后的 coco-ww 日志, 约 {plan.base_bytes / 1e6:.1f}MB')
         note = PlainTextEdit()
         note.setPlaceholderText('哪里不对? 比如「第 2 圈 1:05 锁暝没放 R, 站着不动」(可以不填)')
         note.setFixedHeight(110)

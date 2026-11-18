@@ -61,9 +61,9 @@ TASK_STOPPED_END = 3.0
 # 让它先收, 轴接住异常打的那行日志(时间线)才记得进这局
 TASK_DISABLED_END = 0.5
 TASK_DISABLED_REASON = '战斗任务被关掉了(手动关闭或出错被停用, 看日志)'
-# ok-ww 的开始/停止(按钮或快捷键)只是让执行器暂停, 自动战斗开关不动: 停这么久就收
+# coco-ww 的开始/停止(按钮或快捷键)只是让执行器暂停, 自动战斗开关不动: 停这么久就收
 TASK_PAUSED_END = 1.0
-TASK_PAUSED_REASON = 'ok-ww 停止了(执行器暂停)'
+TASK_PAUSED_REASON = 'coco-ww 停止了(执行器暂停)'
 
 _START, _END, _INPUT, _SENDINPUT, _FIELD, _PERF, _READ, _LOG, _MARK, _RAW = range(10)
 
@@ -1005,7 +1005,7 @@ class Recorder:
         - 任务被关掉了: 正常关是框架在 sleep/next_frame 里抛 TaskDisabledException、自动战斗接住走 reset_to_false。
           可队伍代码里 try: next_frame() except Exception 会把它吞掉, 框架抛之前已经清了 current_task, 之后不再抛,
           轴照跑、任务一直算在跑; 出错被执行器直接 disable() 也不走 reset_to_false。关掉 TASK_DISABLED_END 秒还开着就收。
-        - 点了 ok-ww 的停止: 执行器暂停, 轴停在 sleep 里等, 任务开着、也算在跑。停了 TASK_PAUSED_END 秒就收,
+        - 点了 coco-ww 的停止: 执行器暂停, 轴停在 sleep 里等, 任务开着、也算在跑。停了 TASK_PAUSED_END 秒就收,
           接着开始的话下次判战斗另开一局。
         - 任务没关但不在跑了、TASK_STOPPED_END 秒没判过战斗。
         """

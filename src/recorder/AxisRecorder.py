@@ -89,9 +89,9 @@ class AxisRecorderTask(TriggerTask):
             self.MODE_KEY: (f'{MODE_CODE}: 记自动战斗打的每一局, 看轴代码按了什么、读到了什么。'
                             f'{MODE_MANUAL}: 记自己手打的每一局(按键用 Raw Input 收, 含按住多久; 在场角色读 HUD; 画面和 F8 导出照旧)。'
                             f'选{MODE_MANUAL}前要先在「触发任务」里关掉「自动战斗」, 开着它一进战斗就会接管, 关掉之前手打不记; '
-                            f'ok-ww 也要保持在运行(触发任务在跑)'),
+                            f'coco-ww 也要保持在运行(触发任务在跑)'),
             self.MANUAL_HOTKEY_KEY: (f'{MODE_MANUAL}时按一下开始记、再按一下结束; 中间不管有没有怪、HUD 在不在都不会自己停'
-                                     f'(只有切回{MODE_CODE}、打开自动战斗、关掉 ok-ww 会收掉, 忘了按的 2 小时后收)。'
+                                     f'(只有切回{MODE_CODE}、打开自动战斗、关掉 coco-ww 会收掉, 忘了按的 2 小时后收)。'
                                      f'开始和结束都会弹通知、响一声。和导出原图热键选成同一个时只留导出'),
             self.MANUAL_SOUND_KEY: ('开始响两声由低到高, 结束由高到低。游戏全屏时 Windows 勿扰常把通知横幅藏起来, '
                                     '听声音最准; 开着显卡录屏的话这两声也会录进去'),

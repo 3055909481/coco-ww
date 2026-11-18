@@ -1,6 +1,6 @@
 """按 F 开始战斗: 挑战/副本里按下物理 F 后, 不等锁到目标或血条出现就直接进战斗。
 
-原来是插件 f_start_combat (给 CombatCheck/AutoCombatTask 打补丁), 椰果版并进主程序:
+原来是插件 f_start_combat (给 CombatCheck/AutoCombatTask 打补丁), coco-ww 并进主程序:
 - 设置在「自动战斗」卡片里 (AutoCombatTask.F_START_KEY / F_DELAY_KEY / F_GRACE_KEY)
 - 判定在 AutoCombatTask.should_start_combat_by_key / start_combat_by_key
 - 没锁到目标的保护期在 CombatCheck.f_grace_hold
@@ -26,7 +26,7 @@ class FKeyWatcher:
     """记下游戏在前台时物理 F 键最近一次按下的时刻。整个进程只起一个线程。
 
     只读 GetAsyncKeyState 的高位: 低位整个进程共享、读一次就清零, 和别的读者会互相吃掉。
-    ok-ww 自己发的键走 PostMessage, 不改变按键状态, 所以拾取、处决等脚本按的 F 不会记进来。
+    coco-ww 自己发的键走 PostMessage, 不改变按键状态, 所以拾取、处决等脚本按的 F 不会记进来。
     """
 
     def __init__(self):

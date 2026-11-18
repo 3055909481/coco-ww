@@ -1,6 +1,6 @@
 """持宏者队伍代码共用的两个监视线程。
 
-原来每份持宏者代码都自带一份逐字相同的实现(20 多份), 椰果版收到这里, 队伍代码只留一句
+原来每份持宏者代码都自带一份逐字相同的实现(20 多份), coco-ww 收到这里, 队伍代码只留一句
     from src.combat.AxisWatch import f_settings, start_enable_watch, start_f_watch
 函数名、参数、写到 task 上的属性名都和原来一样, 所以还自带旧实现的队伍代码(比如工坊里别人传的)
 可以和这里混用: 线程按 task 上的标记只起一次, 谁先调用谁起。
@@ -61,7 +61,7 @@ def start_enable_watch(task, logger=None):
             except Exception:
                 return
 
-    threading.Thread(target=watch, name='ok_ww_enable_watch', daemon=True).start()
+    threading.Thread(target=watch, name='coco_ww_enable_watch', daemon=True).start()
 
 
 def start_f_watch(task, logger=None):
@@ -109,4 +109,4 @@ def start_f_watch(task, logger=None):
             except Exception:
                 return
 
-    threading.Thread(target=watch, name='ok_ww_f_watch', daemon=True).start()
+    threading.Thread(target=watch, name='coco_ww_f_watch', daemon=True).start()

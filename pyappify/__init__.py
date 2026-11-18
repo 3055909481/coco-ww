@@ -1,4 +1,4 @@
-"""椰果版不走 PyAppify 启动器, 也不跟上游自动更新。
+"""coco-ww 不走 PyAppify 启动器, 也不跟上游自动更新。
 
 ok 框架在几处直接 `import pyappify`, 这里只留它要读的那几个名字。框架对其余函数
 (get_version_list / create_shortcut / update_to_version ...) 都是先 getattr 再用,

@@ -52,10 +52,10 @@ THUMB = (96, 54)
 MATCH_MAX_SCORE = 0.4
 MATCH_MIN_CONTRAST = 0.3
 FLAT_STD = 8.0
-# 开录/停录只在鸣潮在前台时按: 录屏软件的快捷键管的是前台那个程序, ok-ww 在前台时按, N 卡开关的是「桌面」那段,
+# 开录/停录只在鸣潮在前台时按: 录屏软件的快捷键管的是前台那个程序, coco-ww 在前台时按, N 卡开关的是「桌面」那段,
 # 和游戏那段就对不上了(10-27 反馈包: 开录那下把一段之前就在录的停了, 停录那下又新开了一段)
 FOREGROUND_POLL = 0.2
-# 打完人在 ok-ww 里看复盘, 停录等回到鸣潮再按, 最多等这么久
+# 打完人在 coco-ww 里看复盘, 停录等回到鸣潮再按, 最多等这么久
 STOP_WAIT_SECONDS = 600.0
 # 打完(鸣潮在前台)再等这么久才停录: 下一局/下一波接着开打就接着录, 不停(10-27 反馈: 停录拖到下一局打着时才按, 把录屏停了)
 STOP_GRACE_SECONDS = 5.0
@@ -791,7 +791,7 @@ class VideoJob(threading.Thread):
                 return None
         pressed = self.owner.press(keys)
         if pressed is None:
-            info.update(method='没按出快捷键', note='SendInput 发键失败, 看 ok-ww 日志')
+            info.update(method='没按出快捷键', note='SendInput 发键失败, 看 coco-ww 日志')
         return pressed
 
     def _wait_to_stop(self):
