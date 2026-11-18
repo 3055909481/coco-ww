@@ -153,6 +153,10 @@ class CombatCheck(BaseWWTask):
         """保护期最多撑多久, 0 = 一直撑到锁到目标。"""
         return 0.0
 
+    def combat_entry_needs_health_bar(self):
+        """为真时进战斗只认血条, 锁定框不算。刷4C 打完捡声骸那一阵用, 见 FarmEchoTask。"""
+        return False
+
     def f_grace_hold(self):
         """按 F 开打后怪还没出来: 只补点一下中键就放行, 不卡那 3 秒找怪, 也不判脱战, 宏照常出招。
 
@@ -192,7 +196,9 @@ class CombatCheck(BaseWWTask):
             if self.has_target():
                 self.last_in_realm_not_combat = 0
                 return self.scene.set_in_combat()
-            if self.combat_end_condition is not None and self.combat_end_condition():
+            # Boss 血条还在就没打完, 只是一时没锁住(跳开/演出), 不能凭画面里有声骸收手
+            if (self.combat_end_condition is not None and not self.has_boss_health_bar()
+                    and self.combat_end_condition()):
                 return self.reset_to_false(reason='end condition reached')
             has_health = self.check_health_bar()
             retarget_timeout = 30 if has_health else self.target_enemy_time_out
@@ -210,8 +216,12 @@ class CombatCheck(BaseWWTask):
             if not has_target and target:
                 self.log_debug('try target')
                 self.middle_click(after_sleep=0.1)
-            in_combat = has_target or ((self.config.get('Auto Target') or not isinstance(self,
-                                                                                         AutoCombatTask)) and self.check_health_bar())
+            if self.combat_entry_needs_health_bar():
+                # 刚打完那一阵中键会锁到还没消失的 Boss, 光有锁定框不算, 要看到血条
+                in_combat = self.has_health_bar()
+            else:
+                in_combat = has_target or ((self.config.get('Auto Target') or not isinstance(
+                    self, AutoCombatTask)) and self.check_health_bar())
             if in_combat:
                 if not has_target and not self.target_enemy(wait=True):
                     if not self.target_enemy_error_notified:
@@ -374,32 +384,33 @@ class CombatCheck(BaseWWTask):
                             health_lost_start = None
                 return False
 
+    def _health_bar_min_size(self):
+        min_height = self.height_of_screen(9 / 2160)
+        min_width = self.width_of_screen((12 if self._in_combat else 100) / 3840)
+        return min_width, min_height
+
     def has_health_bar(self):
-        if self._in_combat:
-            min_height = self.height_of_screen(9 / 2160)
-            max_height = min_height * 3
-            min_width = self.width_of_screen(12 / 3840)
-        else:
-            min_height = self.height_of_screen(9 / 2160)
-            max_height = min_height * 3
-            min_width = self.width_of_screen(100 / 3840)
-
-        boxes = find_color_rectangles(self.frame, enemy_health_color_red, min_width, min_height, max_height=max_height)
-
+        min_width, min_height = self._health_bar_min_size()
+        boxes = find_color_rectangles(self.frame, enemy_health_color_red, min_width, min_height,
+                                      max_height=min_height * 3)
         if len(boxes) > 0:
             self.draw_boxes('enemy_health_bar_red', boxes, color='blue')
             return True
-        else:
-            boxes = find_color_rectangles(self.frame, boss_health_color, min_width, min_height * 1.3,
-                                          box=self.box_of_screen(1269 / 3840, 58 / 2160, 2533 / 3840, 200 / 2160,
-                                                                 hcenter=True, vcenter=True))
-            if len(boxes) == 1:
-                self.boss_health_box = boxes[0]
-                self.boss_health_box.width = 10
-                self.boss_health_box.x += 6
-                self.boss_health = self.boss_health_box.crop_frame(self.frame)
-                self.draw_boxes('boss_health', boxes, color='blue')
-                return True
+        return self.has_boss_health_bar()
+
+    def has_boss_health_bar(self):
+        """屏幕顶上 Boss 血条还有血(只看血的颜色, Boss 死后空槽和名字残留不算)。"""
+        min_width, min_height = self._health_bar_min_size()
+        boxes = find_color_rectangles(self.frame, boss_health_color, min_width, min_height * 1.3,
+                                      box=self.box_of_screen(1269 / 3840, 58 / 2160, 2533 / 3840, 200 / 2160,
+                                                             hcenter=True, vcenter=True))
+        if len(boxes) == 1:
+            self.boss_health_box = boxes[0]
+            self.boss_health_box.width = 10
+            self.boss_health_box.x += 6
+            self.boss_health = self.boss_health_box.crop_frame(self.frame)
+            self.draw_boxes('boss_health', boxes, color='blue')
+            return True
         return False
 
     def check_health_bar(self):

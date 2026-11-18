@@ -1,6 +1,7 @@
 import time
 
 from ok import TriggerTask, Logger, TaskDisabledException
+from src.Labels import Labels
 from src.char.CharFactory import char_names
 from src.combat.FKeyStart import F_EXTRA_LIFETIME, f_key_watcher, float_config
 from src.scene.WWScene import WWScene
@@ -9,10 +10,20 @@ from src.task.task_icons import task_icon
 
 logger = Logger.get_logger(__name__)
 
+# 按下 F 前后这么久之内屏幕上是「吸收」提示, 这次 F 就是吸收声骸
+ABSORB_PROMPT_WINDOW = 1.0
+# 同一个 F 提示一直挂着时, 隔这么久重读一次字(列表里换了选中项)
+F_PROMPT_REREAD_INTERVAL = 0.5
+
 
 class AutoCombatTask(BaseCombatTask, TriggerTask):
     owns_switch_healer_config = True
     _reset_combat_on_run = False
+    # F 交互提示: 上一帧的位置、上次读字的时刻、最近一次看到「吸收」的时刻
+    _f_prompt_box = None
+    _f_prompt_read_at = 0.0
+    _f_prompt_is_absorb = False
+    _absorb_prompt_at = -1.0
     F_START_KEY = '按 F 开始战斗'
     F_DELAY_KEY = 'F 之后等待(秒)'
     F_GRACE_KEY = '没锁到目标最多撑(秒)'
@@ -87,7 +98,45 @@ class AutoCombatTask(BaseCombatTask, TriggerTask):
     def drop_pending_f_press(self):
         self._f_consumed = time.time()
 
+    def find_f_prompt(self):
+        return self.find_one(Labels.pick_up_f_hcenter_vcenter, box=self.f_search_box, threshold=0.8)
+
+    def f_prompt_is_absorb(self, f):
+        absorb = self.absorb_echo_text()
+        if absorb is None:
+            return False
+        # 和 find_f_with_text 读同一块: F 右边的选项列表, 有一项是「吸收」就算
+        text_box = f.copy(x_offset=f.width * 5.2, width_offset=f.width * 6, height_offset=4.5 * f.height,
+                          y_offset=-0.8 * f.height, name='f_prompt_text')
+        return bool(self.ocr(box=text_box, match=absorb))
+
+    def note_f_prompt(self):
+        """没在战斗时每帧看一眼 F 交互提示, 记下最近一次看到「吸收」的时刻。
+
+        按 F 吸收声骸后提示马上就没了, 等判定这次按键时再看就晚了, 所以按之前就得一直盯着。
+        字只在提示新冒出来、换了位置或挂久了时读, 不是每帧都 OCR。
+        """
+        f = self.find_f_prompt()
+        if not f:
+            self._f_prompt_box = None
+            return
+        now = time.time()
+        last = self._f_prompt_box
+        moved = last is None or abs(f.y - last.y) > f.height / 2 or abs(f.x - last.x) > f.width / 2
+        if moved or now - self._f_prompt_read_at >= F_PROMPT_REREAD_INTERVAL:
+            # 大世界里的 F 本来就不开战, 不用读字
+            self._f_prompt_is_absorb = not self.is_open_world_auto_combat() and self.f_prompt_is_absorb(f)
+            self._f_prompt_read_at = now
+        self._f_prompt_box = f
+        if self._f_prompt_is_absorb:
+            self._absorb_prompt_at = now
+
+    def pressed_to_absorb(self, pressed):
+        return abs(pressed - self._absorb_prompt_at) <= ABSORB_PROMPT_WINDOW
+
     def should_start_combat_by_key(self):
+        if self.f_start_enabled:
+            self.note_f_prompt()
         pressed = self.last_f_press()
         if pressed <= self._f_consumed:
             return False
@@ -109,6 +158,10 @@ class AutoCombatTask(BaseCombatTask, TriggerTask):
         if self.is_open_world_auto_combat():
             # 大世界里捡东西、对话也按 F
             self.log_info('F 开始战斗: 大世界里按的 F, 忽略')
+            return False
+        if self.pressed_to_absorb(pressed):
+            # Boss 副本也算副本, 打完按 F 捡声骸以前会被当成开战, 对空打满保护期
+            self.log_info('F 开始战斗: 按的是吸收声骸, 忽略')
             return False
         return True
 
