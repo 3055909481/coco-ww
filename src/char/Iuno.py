@@ -59,7 +59,9 @@ class Iuno(BaseChar):
                     return True
             if not jumped and self.task.find_feature("iuno_jump", box="box_extra_action", threshold=0.6):
                 # 可以跳 起跳
-                while self.task.find_feature("iuno_jump", box="box_extra_action", threshold=0.6):
+                jump_start = time.time()
+                while (self.task.find_feature("iuno_jump", box="box_extra_action", threshold=0.6)
+                       and time.time() - jump_start < 2):
                     self.task.jump(after_sleep=0.1)
                 time_out += 3
                 jumped = True
