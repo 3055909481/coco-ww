@@ -1,10 +1,11 @@
 import re
 import time
 
+import cv2
 import win32api
 
 from ok import find_boxes_by_name, Logger, calculate_color_percentage, TaskDisabledException
-from ok import find_color_rectangles, get_mask_in_color_range, is_pure_black
+from ok import color_range_to_bound, find_color_rectangles, get_mask_in_color_range, is_pure_black
 from src import text_white_color
 from src.Labels import Labels
 from src.char.Roccia import Roccia
@@ -15,8 +16,11 @@ logger = Logger.get_logger(__name__)
 
 # 结束条件(刷4C=画面里有声骸)要隔这么久再成立一次才算打完
 END_CONFIRM_SECONDS = 0.3
-# 残血 Boss 血条最窄认到多宽(占屏宽), 4K 下 3 像素
-BOSS_SLIVER_WIDTH = 3 / 3840
+# 残血 Boss 血条尖头怎样算还有血(占屏高/屏宽). 血条高 2K 13 像素 / 1K 9 像素(约 19/2160);
+# 剩 1% 血时尖头 2K 8x13 面积 62 / 1K 5x9 面积 25, 门槛取高过半条、面积过 高x3/3840 屏宽
+BOSS_SLIVER_MIN_HEIGHT = 9 / 2160
+BOSS_SLIVER_MAX_HEIGHT = 40 / 2160
+BOSS_SLIVER_MIN_WIDTH = 3 / 3840
 
 
 class CombatCheck(BaseWWTask):
@@ -427,17 +431,27 @@ class CombatCheck(BaseWWTask):
         return False
 
     def boss_still_alive(self):
-        """收手前问一句 Boss 还在不在: 破韧图标还挂着, 或者顶上血条还剩一点颜色。
+        """收手前问一句 Boss 还在不在: 破韧图标还挂着, 或者顶上血条还剩一点血色。
 
-        has_boss_health_bar 要一整块且宽过 12/3840 屏宽(2K 下 8 像素, 约 1% 血), 残血时认不到;
-        这里只在要收手时看一次, 剩几像素、被特效切成几段也算还活着。
+        has_boss_health_bar 要求血色块占满外接框 95%, 可血条左端是尖头, 残血时只剩尖头那一截,
+        实机截图量过: 剩 7~8% 以下 2K/1K 都认不到。这里按连通块算, 只要高度够半条血条、面积够,
+        尖头也算(2K/1K 都能认到 1% 血)。只在要收手时看一次。
         """
         if self.is_boss():
             return True
-        min_height = self.height_of_screen(9 / 2160)
-        boxes = find_color_rectangles(self.frame, boss_health_color, self.width_of_screen(BOSS_SLIVER_WIDTH),
-                                      min_height * 1.3, box=self.boss_health_area())
-        return len(boxes) > 0
+        area = self.boss_health_area()
+        crop = self.frame[area.y:area.y + area.height, area.x:area.x + area.width, :3]
+        lower, upper = color_range_to_bound(boss_health_color)
+        mask = cv2.inRange(crop, lower, upper)
+        count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        min_h = self.height_of_screen(BOSS_SLIVER_MIN_HEIGHT)
+        max_h = self.height_of_screen(BOSS_SLIVER_MAX_HEIGHT)
+        min_area = min_h * self.width_of_screen(BOSS_SLIVER_MIN_WIDTH)
+        for i in range(1, count):
+            h, a = stats[i, cv2.CC_STAT_HEIGHT], stats[i, cv2.CC_STAT_AREA]
+            if min_h <= h <= max_h and a >= min_area:
+                return True
+        return False
 
     def check_health_bar(self):
         return self.has_health_bar() or self.is_boss()
