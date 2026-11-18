@@ -11,6 +11,11 @@ from src import text_white_color  # noqa
 SKILL_TIME_OUT = 15
 
 
+class CharPerformTimeout(Exception):
+    """原生角色单次上场超过硬上限时由战斗任务抛出, 只在 BaseChar.perform 里接住。"""
+    pass
+
+
 class CharType(StrEnum):
     """定义角色定位枚举。"""
     MAIN_DPS = 'MainDps'  # 主输出
@@ -64,6 +69,10 @@ class BaseChar:
     """
 
     HEALER_FULL_CON_SWITCH_LOCKOUT = 16.0
+    # 原生 do_perform 单次上场的硬上限(秒, 扣除大招/变奏时停)。到点就松开所有按键并强制切人,
+    # 防止读屏判据失灵时在一个角色身上死循环。站场久的角色在子类里调大。
+    # 自定义队伍代码重写了 do_perform 的不受这个限制(宏自己管时间)。
+    PERFORM_HARD_TIMEOUT = 30.0
 
     def __init__(self, task, index, char_name=None, confidence=1, ring_index=-1, char_type=CharType.MAIN_DPS,
                  buff_time=None):
@@ -225,8 +234,55 @@ class BaseChar:
         intact so timing/logging behavior remains consistent.
         """
         self.last_perform = time.time()
-        self.do_perform()
+        watched = self.native_perform()
+        if watched:
+            self.task.perform_watch = (self, self.last_perform, self.perform_hard_timeout())
+        try:
+            self.do_perform()
+        except CharPerformTimeout as e:
+            self.task.perform_watch = None
+            self.logger.warning(f'{self} perform hard timeout, release inputs and switch: {e}')
+            self.release_inputs()
+            self.on_perform_timeout()
+            self.switch_next_char()
+        finally:
+            watch = getattr(self.task, 'perform_watch', None)
+            if watch and watch[0] is self:
+                self.task.perform_watch = None
         self.logger.debug(f'set current char false {self.index}')
+
+    def native_perform(self):
+        """do_perform 是不是框架自带的(src.char.*), 自定义队伍代码重写了就返回 False。"""
+        module = getattr(type(self).do_perform, '__module__', '') or ''
+        return module.startswith('src.char.')
+
+    def perform_hard_timeout(self):
+        return self.PERFORM_HARD_TIMEOUT
+
+    def on_perform_timeout(self):
+        """硬超时后、切人前的清理, 子类可重置自己的状态机。"""
+        pass
+
+    def release_inputs(self):
+        """松开所有可能被按住的键, 防止超时/异常后角色一直蓄力或一直往前跑。"""
+        task = self.task
+        try:
+            task.mouse_up()
+        except Exception as e:
+            self.logger.debug(f'release_inputs mouse_up failed {e}')
+        keys = []
+        for getter in (self.get_resonance_key, self.get_liberation_key, self.get_echo_key):
+            try:
+                keys.append(getter())
+            except Exception:
+                pass
+        keys += ['w', 'a', 's', 'd']
+        for key in keys:
+            try:
+                task.send_key_up(key)
+            except Exception:
+                pass
+        task.in_liberation = False
 
     def wait_down(self, click=True):
         """等待角色从空中落下到地面。"""
@@ -347,6 +403,10 @@ class BaseChar:
             It snapshots availability, handles toolbox state, and lets the task
             choose the best teammate according to role, intro, and priority.
         """
+        # 已经在切人了, 硬超时不再管这一段(切人本身有自己的超时)
+        watch = getattr(self.task, 'perform_watch', None)
+        if watch and watch[0] is self:
+            self.task.perform_watch = None
         self.is_forte_full()
         self.has_intro = False
         self.has_sub_dps_intro = False
