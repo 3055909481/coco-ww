@@ -210,9 +210,52 @@ class MigrateIndexTest(BookLearnSandbox):
                        'Which Weekly Boss to Teleport': 6, 'Which Boss Challenge to Teleport': 99,
                        'Which Special Nightmare to Teleport': 1}
         task.migrate_teleport_index_to_name()
-        self.assertEqual(task.config['Weekly Boss Name'], '命途断章之轮')
+        self.assertEqual(task.config['Weekly Boss Name'], '芙露德莉斯（命途断章之轮）')
         self.assertEqual(task.config['Boss Challenge Name'], '')  # 超出已知列表：运行时按序号数，点到后再记名字
         self.assertEqual(task.config['Special Nightmare Name'], '梦魇·凯尔匹')  # 已经选了名字的不动
+
+    def test_bare_weekly_realm_becomes_option(self):
+        # 11-19 版存的是纯副本名，不换成下拉框里的写法界面上显示不出来
+        task = object.__new__(FarmEchoTask)
+        task.config = {'Weekly Boss Name': '虚妄诞生之种', 'Boss Challenge Name': '天傀劫煞',
+                       'Special Nightmare Name': '梦魇·赫卡忒'}
+        task.migrate_teleport_index_to_name()
+        self.assertEqual(task.config, {'Weekly Boss Name': '达妮娅（虚妄诞生之种）', 'Boss Challenge Name': '天傀劫煞',
+                                       'Special Nightmare Name': '梦魇·赫卡忒'})
+
+
+class WeeklyLabelTest(BookLearnSandbox):
+    def test_every_weekly_has_boss_name(self):
+        options = BossBook.known_options('zhange')
+        self.assertEqual(len(options), len(BossBook.SEED_NAMES['zhange']))
+        self.assertIn('鸣钟之龟（昔日咏叹之钟）', options)
+        self.assertIn('天演溯心（定序诸理之律）', options)
+        for option, realm in zip(options, BossBook.SEED_NAMES['zhange']):
+            self.assertNotEqual(option, realm, realm)
+            self.assertEqual(BossBook.realm_of(option), realm)
+
+    def test_other_categories_unchanged(self):
+        self.assertEqual(BossBook.known_options('qiangdi'), BossBook.known_names('qiangdi'))
+        self.assertEqual(BossBook.known_options('mengyan'), BossBook.known_names('mengyan'))
+
+    def test_realm_of(self):
+        for value, realm in [('角（时序命定之争）', '时序命定之争'), ('角(时序命定之争)', '时序命定之争'),
+                             ('时序命定之争', '时序命定之争'), ('梦魇·赫卡忒', '梦魇·赫卡忒'), ('', '')]:
+            self.assertEqual(BossBook.realm_of(value), realm)
+
+    def test_every_weekly_option_clicks_its_row(self):
+        for option in BossBook.known_options('zhange'):
+            task = FakeBookTask.make('zhange')
+            name = task.click_book_target_by_name('zhange', BossBook.realm_of(option))
+            PickByNameTest.assert_clicked_row(self, task, name, BossBook.realm_of(option))
+            self.assertTrue(any(option in m for m in task.logs), task.logs)  # 日志里也写 Boss 名
+
+    def test_new_weekly_without_alias_shows_realm(self):
+        self.assertEqual(BossBook.option_label('zhange', '某某新章之门'), '某某新章之门')
+        self.assertEqual(BossBook.to_option('zhange', '某某新章之门'), '某某新章之门')
+
+    def test_ocr_variant_still_gets_label(self):
+        self.assertEqual(BossBook.option_label('zhange', '彼世猩紅之幕'), '赫卡忒（彼世猩红之幕）')
 
 
 if __name__ == '__main__':

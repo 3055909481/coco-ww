@@ -1266,7 +1266,8 @@ class BaseWWTask(BaseTask):
             if hit:
                 name, btn = hit
                 self._learn_book_names(category, seen, reads, nests)
-                self.log_info(self.tr('boss book: clicked {name}').format(name=BossBook.display_name(name)))
+                self.log_info(self.tr('boss book: clicked {name}').format(
+                    name=BossBook.option_label(category, BossBook.display_name(name))))
                 self.draw_boxes(boxes=btn, color="red")
                 self.click(btn, after_sleep=1)
                 return name
@@ -1277,8 +1278,8 @@ class BaseWWTask(BaseTask):
             self.scroll_relative(0.65, 0.6, -self.BOOK_SCROLL_TICKS)
             self.sleep(0.6)
         self._learn_book_names(category, seen, reads, nests)
-        names = '、'.join(BossBook.display_name(s) for s in seen)
-        wanted = target or f'#{serial}'
+        names = '、'.join(BossBook.option_label(category, BossBook.display_name(s)) for s in seen)
+        wanted = BossBook.option_label(category, target) if target else f'#{serial}'
         raise Exception(self.tr('boss book: {wanted} not found, list has: {names}').format(wanted=wanted, names=names))
 
     def _learn_book_names(self, category, seen, reads, nests):

@@ -67,7 +67,7 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
                                                 }}
         for mode, (name_key, _) in self.TELEPORT_KEYS.items():
             self.config_type[name_key] = {'type': 'drop_down',
-                                          'options': BossBook.known_names(BossBook.CATEGORY_OF_MODE[mode])}
+                                          'options': BossBook.known_options(BossBook.CATEGORY_OF_MODE[mode])}
         self.config_type['Boss Level'] = {'type': "drop_down", 'options': ['50', '60', '70', '80', '90'], }
         self.config_type['Echo Pickup Method'] = {'type': "drop_down", 'options': self.find_echo_method}
         self.boss_list = ['Other', 'Hyvatia', 'Fallacy of No Return', 'Sentry Construct', 'Lorelei', 'Lioness of Glory',
@@ -295,11 +295,18 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
         self.migrate_teleport_index_to_name()
 
     def migrate_teleport_index_to_name(self):
-        """旧配置只有「第几个」：按游戏里从上往下的顺序换成名字（旧代码第 9 个以后会点歪，这里按本意换算）。"""
+        """旧配置只有「第几个」：按游戏里从上往下的顺序换成名字（旧代码第 9 个以后会点歪，这里按本意换算）。
+        已经存了名字的换成下拉框里的写法（周本以前存纯副本名，现在是「Boss（副本名）」）。"""
         for mode, (name_key, index_key) in self.TELEPORT_KEYS.items():
-            if self.config.get(name_key):
+            category = BossBook.CATEGORY_OF_MODE[mode]
+            value = self.config.get(name_key)
+            if value:
+                option = BossBook.to_option(category, value)
+                if option != value:
+                    self.config[name_key] = option
+                    logger.info(f'migrate {name_key}={value} -> {option}')
                 continue
-            names = BossBook.known_names(BossBook.CATEGORY_OF_MODE[mode])
+            names = BossBook.known_options(category)
             index = self.config.get(index_key, 1)
             if isinstance(index, int) and 1 <= index <= len(names):
                 self.config[name_key] = names[index - 1]
@@ -311,20 +318,21 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
             raise RuntimeError(self.tr('Unknown Teleport to Boss config: {teleport_to_boss}').format(teleport_to_boss=teleport_to_boss))
         name_key, index_key = self.TELEPORT_KEYS[teleport_to_boss]
         category = BossBook.CATEGORY_OF_MODE[teleport_to_boss]
-        target = self.config.get(name_key) or ''
+        label = self.config.get(name_key) or ''
+        target = BossBook.realm_of(label)
         serial = self.config.get(index_key, 1)
         by_name = self.game_lang == 'zh_CN'
         if not by_name:
             target = ''  # 名字表是中文的；外文客户端按旧的序号数（数法已修好，不再算错位）
         self.ensure_main(time_out=180)
-        self.info_set('Teleport to Boss', f'{teleport_to_boss} {target or "#" + str(serial)}')
+        self.info_set('Teleport to Boss', f'{teleport_to_boss} {label if target else "#" + str(serial)}')
         self.openF2Book('gray_book_boss')
         self.open_boss_book(category)
         clicked = self.click_book_target_by_name(category, target, serial)
         if by_name and not target:
             # 名字为空（序号超出已知列表）时按序号点到的，记成名字，以后游戏加 Boss 也不会挪位
             known = next((n for n in BossBook.known_names(category) if BossBook.same_name(clicked, n)), None)
-            self.config[name_key] = known or BossBook.display_name(clicked)
+            self.config[name_key] = BossBook.option_label(category, known or BossBook.display_name(clicked))
         is_team = self.wait_after_book_click()
         if is_team:
             if teleport_to_boss == 'Weekly Challenge':

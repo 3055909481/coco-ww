@@ -34,6 +34,27 @@ SEED_NAMES = {
                 '梦魇·无冠者', '梦魇·朔雷之鳞', '梦魇·云闪之鳞', '梦魇·无常凶鹭', '梦魇·飞廉之猩'],
 }
 
+# 战歌重奏列表里只写副本名，玩家叫的是 Boss 名，下拉框显示成「Boss（副本名）」。
+# 2026-11-19 对的表：fandom 中文 wiki 头目页「于 XX 出现」+ 材料页来源核实 9 个；
+# 角/伤痕按排除法（1.2 公告里角的副本叫「命定的纷争」，伤痕的掉落物是火）。
+# 新出的周本不在表里就只显示副本名，补一行即可。
+# 用玩家口头的简称：设置页下拉框正文只有 196px（13px 字），「天演溯心·衍律化形（…）」要 211px 会被截。
+BOSS_OF_REALM = {
+    'zhange': {
+        '定序诸理之律': '天演溯心',
+        '失坠困咎之庭': '千傀重楼',
+        '虚妄诞生之种': '达妮娅',
+        '星海迷途之扉': '辛吉勒姆',
+        '烬夜天启之章': '利维亚坦',
+        '命途断章之轮': '芙露德莉斯',
+        '彼世猩红之幕': '赫卡忒',
+        '时序命定之争': '角',
+        '无冠巨像之心': '无妄者',
+        '无序边境之火': '伤痕',
+        '昔日咏叹之钟': '鸣钟之龟',
+    },
+}
+
 LEARNED_FILE = os.path.join('configs', 'boss_book_names.json')
 
 # OCR 在这个字体上的固定误读（实机：魇→魔 每次都错，繁体字偶尔冒出来）
@@ -135,6 +156,36 @@ def known_names(category):
         if not any(same_name(seed, n) for n in names):
             names.append(seed)
     return names
+
+
+_LABEL = re.compile(r'^(.+?)\s*[（(]\s*(.+?)\s*[）)]\s*$')
+
+
+def option_label(category, name):
+    """列表里的名字 → 下拉框写法：周本有对照的写成「Boss（副本名）」，其余原样。"""
+    for realm, boss in BOSS_OF_REALM.get(category, {}).items():
+        if same_name(realm, name):
+            return f'{boss}（{realm}）'
+    return name
+
+
+def realm_of(value):
+    """下拉框/配置里的值 → 列表里要找的名字（「Boss（副本名）」取括号里的）。"""
+    m = _LABEL.match(value or '')
+    return m.group(2) if m else (value or '')
+
+
+def known_options(category):
+    return [option_label(category, n) for n in known_names(category)]
+
+
+def to_option(category, value):
+    """配置里存的值换成下拉框里有的那一项（旧版存的是纯副本名，不换下拉框显示不出来）。"""
+    if not value:
+        return value
+    realm = realm_of(value)
+    return next((o for o in known_options(category) if same_name(realm_of(o), realm)),
+                option_label(category, realm))
 
 
 def merge_order(known, observed):
