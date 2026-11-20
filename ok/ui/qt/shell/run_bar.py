@@ -299,15 +299,20 @@ class RunBar(QFrame):
 
     # --- actions --------------------------------------------------------------
 
-    def toggle_popover(self) -> None:
+    def toggle_popover(self, anchor=None) -> None:
+        """Open or close the connection settings under ``anchor`` (default: the pill in this bar).
+
+        A page that hides this bar (the home page) passes its own status chip.
+        """
+        anchor = anchor or self.connection_pill
         if not self.popover.isVisible():
             self.popover.refresh()
             self.connection_pill.set_open(True)
-        self.popover.toggle(self.connection_pill, above=False)
+        self.popover.toggle(anchor, above=False)
 
-    def open_popover(self) -> None:
+    def open_popover(self, anchor=None) -> None:
         if not self.popover.isVisible():
-            self.toggle_popover()
+            self.toggle_popover(anchor)
 
     def toggle_executor(self) -> None:
         from ok import og

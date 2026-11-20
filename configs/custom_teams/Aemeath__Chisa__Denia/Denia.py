@@ -2,7 +2,7 @@ import ctypes
 import threading
 import time
 
-from src.char.BaseChar import SwitchPriority, forte_white_color
+from src.char.BaseChar import SwitchPriority
 from src.char.Denia import Denia as NativeDenia
 
 # char_name 可能是这两个值中的任何一个: CharFactory.py:116 把 char_chisa 和
@@ -37,8 +37,77 @@ F_LOG_DEBOUNCE = 1.0     # 按住不放时别刷日志
 F_TASK_NAME = 'FStartCombatTask'
 
 
-# 监视线程的实现在主程序 src/combat/AxisWatch.py (椰果版), 这里只导入
-from src.combat.AxisWatch import f_settings, start_f_watch
+def f_settings(task):
+    """读界面上的(开关, F 之后等待秒数)。
+
+    【没装那张卡片就返回默认值(开, 0 秒)】—— 把队伍导给别人时对方没有 ok_tasks/
+    里的那个任务, 功能照常, 只是他那边没有界面可调。
+    """
+    executor = getattr(task, 'executor', None)
+    for group in ('trigger_tasks', 'onetime_tasks'):
+        for other in getattr(executor, group, None) or ():
+            if type(other).__name__ == F_TASK_NAME:
+                try:
+                    return bool(other.enabled), float(getattr(other, 'f_start_delay', 0) or 0)
+                except Exception:
+                    return True, 0.0
+    return True, 0.0
+
+
+def start_f_watch(task, logger=None):
+    """把【物理】F 键按下的墙钟时间记到 task._f_last_press。每个 task 只启一次。
+
+    线程是 daemon, 跟着进程退出, 不用管回收。
+    """
+    if getattr(task, '_f_watch_started', False):
+        return
+    task._f_watch_started = True
+    if not hasattr(task, '_f_last_press'):
+        # 【初值取 -1 而不是 0】: 读取方是 `if f_press > self.last_opener`, 而
+        # last_opener 的"没跑过"也是 -1。给 0 的话开局第一次判定就恒成立(0 > -1),
+        # 会连 use_liberation 那道检查一起跳过 —— 两边都用 -1 表示"从没发生过"才对得上
+        task._f_last_press = -1
+
+    def watch():
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetAsyncKeyState.restype = ctypes.c_short
+        except Exception as e:
+            task._f_watch_started = False
+            if logger:
+                logger.error(f'f watch: GetAsyncKeyState unavailable ({e}), '
+                             f'the "press F to re-arm the opener" shortcut stays off')
+            return
+        last_log = 0
+        was_down = False
+        while True:
+            try:
+                down = bool(user32.GetAsyncKeyState(F_VK) & 0x8000)
+                if down and not was_down and f_settings(task)[0]:
+                    # 【上升沿才算一次按下】。原来是"只要按着就每轮记一次",
+                    # 对 _f_last_press(取最新时刻)无所谓, 但下面 _f_pressed_at 是
+                    # 给框架消费的, 按住不放时反复刷新会让它永远"刚刚才按"
+                    now = time.time()
+                    task._f_last_press = now
+                    # 【这里是本线程和框架的唯一交接点】(2026-08-19):
+                    # 框架 CombatCheck.note_f_key() 原本自己调 GetAsyncKeyState,
+                    # 判据是【低位】—— 那一位的语义是"距上次调用之间被按过",
+                    # 【读一次就清, 而且整个进程共享】。本线程 20 毫秒轮询一次,
+                    # 每次调用都会把低位清掉, 框架那边就永远读到 0 ——
+                    # 结果是 watcher 一直在打日志, 而"按 F 直接进战斗"从来不触发。
+                    # 现在改成【一个读者】: 本线程读键, 顺手把框架要的时间戳也写了,
+                    # 框架不再自己读(见 CombatCheck.note_f_key 里的 watcher 分支)。
+                    # 采样率还比框架高(0.05 vs 战斗判定那一轮), 反而更灵敏
+                    task._f_pressed_at = now
+                    if logger and now - last_log >= F_LOG_DEBOUNCE:
+                        last_log = now
+                        logger.info('physical F pressed, opener re-armed')
+                was_down = down
+                time.sleep(F_POLL_INTERVAL)
+            except Exception:
+                return          # 进程收尾时 ctypes/解释器可能已经拆掉了, 安静退出
+
+    threading.Thread(target=watch, name='ok_ww_f_watch', daemon=True).start()
 
 
 class Denia(NativeDenia):
@@ -54,30 +123,21 @@ class Denia(NativeDenia):
     收尾爆发在 Aemeath.py 的 perform_denia_burst() 里 —— 那一段跟爱琳莫的收尾
     是同一串动作, 直接复用她已经调好的原语。
 
-    ================= 轴 =================
+    ================= 轴 (用户 2026-08-16 提供) =================
 
-    启动轴(用户 2026-08-16 提供, 这一版【没有改动】):
+    启动轴:
       千 EQR + A到A3  ->(狂点普攻切) 爱 A2 ->(立刻切, 停普攻) 达 EQ + R1 + A1
       -> 爱 A3 + E(变机甲) -> 千 A4 -> 达 A2A3 -> 千 A5+跳+A+E -> 达 A4
       -> 爱(机甲) A2A3 -> 千 A2 -> 达 A1A2+E1 -> 千 A3 -> 爱(机甲) A4+E
       -> 达 E2(普攻触发) -> 千 A4 -> 变奏爱 ->(疯狂切达, R 慢一拍预输入) 达 R2
       -> 变奏爱 Q+R1+强化E+处决+A到强化E亮+蓄力重击+R2
 
-    循环轴(2026-08-25 换成【25s轮椅轴·视频轴】, 整段重写):
-      [爱弥斯放完 R2 在场, 这一格什么都不做]
-      -> 变奏千 E+a3 -> 爱 a2a3+E(变机甲) -> 千 a4a5+Q
-      -> 千 A到强化E亮 -> 强化E(变身电锯) -> 长/短按a2a3(电锯终结)
-         【R 不在主线上】: 整段电锯期间一直盲发 R, 转好哪一刻就放哪一刻,
-         打断电锯动作没关系; 之后 A 到协奏满再切
-      -> 变奏达 a4+E+Q+R1 -> 达 4A(等回路条满+协奏75%)+两段强化E+R2
-      -> 变奏爱 Q+机a3a4+处决+R1+强化E+4A+强化E+机甲重击+R2 -> 变奏千(回到开头)
-      切人 6 次/圈。
-
-    【两版循环轴的接口不一样, 这是最容易踩的一脚】:
-      旧轴第一个动作是"爱 E 变机甲", 那一发 E 在【上一轮 R2 的演出里】预输入;
-      新轴第一个动作是【变奏千咲】, 爱弥斯要保持人形态, 变机甲的 E 挪到了
-      她 a2a3 之后。所以 perform_denia_burst 的 mecha_e 两处都传 False。
-      旧循环轴整段在 Denia.py.v1loop.bak 里。
+    循环轴:
+      爱 E(变机甲, 已在 R2 演出里预输入) -> 变奏达 A4 -> 千 E+A3 -> 爱 A123
+      -> 千 A4 -> 达 A123 -> 爱 A4+E -> 千 A5+跳+A -> 达 A -> 爱 A23+EE+A2
+      -> 达 E+R1+A12 -> 爱 A3+E -> 千 Q+R+E -> 达 A34 -> 千 长按普攻2.2s
+      -> 达 E1 -> 爱 A23+E -> 达 E2 -> 千 A -> 变奏爱 A34 -> 达 Q+R2
+      -> 变奏爱 A3+R1+强化E+处决+强化E+蓄力重击+R2
 
     ================= 这条轴的两条总纲 =================
 
@@ -665,217 +725,175 @@ class Denia(NativeDenia):
     # 所以合起来给 3.0
     O_AEM_INTRO_SWITCH_TIME_OUT = 3.0
 
-    # ==================== 循环轴(视频轴)的窗口 ====================
-    # 【这一整块是 2026-08-25 的新循环轴, 跟启动轴无关】。旧循环轴(带跳跃、
-    # 带爱弥斯 EE、千咲长按在中段)整段作废。
+    # ==================== 循环轴: 非连点的那些窗口 ====================
+    L_CHI_E_WINDOW = KEY_WINDOW
+    # 循环轴第一步等爱弥斯协奏的上限/停滞放弃 —— 比全局(2.0/1.2)短得多,
+    # 因为机甲形态下这个读数实机是不动的, 等它纯亏(用户: 那一步切慢了)
+    # 千咲 E 和 A3 合成一段同时发的总窗口 = 原来的 E 0.10 + A 0.20
+    # 0.30 -> 0.50 (用户 2026-08-19: "千咲EA还是没A出来 窗口再调长一点")。
+    # 【一次跨大一点】: 千咲到场后能出招的下界量到过 0.22, 而 0.30 的窗口
+    # 里还要先发 E、E 自己还有施法动作 —— A 实际能落的区间比 0.30 窄得多。
+    # 小步试探已经浪费过好几轮(千A2 那格八轮), 直接跨到 0.50
+    L_CHI_EA_WINDOW = 0.50
+    # 机甲爱 A123 那格改成【边打边切】之后, 先点几下再开始发切人键
+    L_AEM_A123_PRECLICKS = 3
+    # 冷启动(开场直接跑循环轴)时, 那发变机甲的 E 最多敲几次 / 间隔多少。
+    # 进了 CD 就提前退出, 所以这是上限不是固定次数
+    # 冷启动先把协奏打满的上限 / 停滞放弃。给得比循环轴那个(0.25/0.15)
+    # 长得多 —— 这里是真的在从零攒, 本来就要打几秒; 而且只跑一次
+    # 【协奏没满就不切人】(用户 2026-08-19: "在爱没A满协奏值前不要切人,
+    # 我们就是要模拟启动轴R2以后小爱满协奏值的样子")。
+    # 原来 8.0/3.0 有两条退路 —— 读数停滞 3 秒就放弃、拖到 8 秒就超时,
+    # 两条都会在协奏没满时照样往下切人, 达尼娅就吃不到变奏。
+    # 现在把停滞放弃调成跟上限一样大(等于关掉它), 上限放到 30 秒 ——
+    # 【只在冷启动跑一次】, 不影响后面每一圈(那边是 0.25/0.15)。
+    # 真的 30 秒都没满, 就不是时机问题而是 A 打空了(协奏必须打中才涨)
+    L_COLD_CON_WAIT = 30.0
+    L_COLD_CON_STALL = 30.0
+    L_COLD_E_PRESSES = 10
+    L_COLD_E_INTERVAL = 0.12
+    # 变奏达入场那一下 A4 的窗口。默认 A_LEAD(0.20), 这里放长到 0.50 是为了
+    # 看清她什么时候出手 —— 【观察完记得调回 0.20】
+    L_DEN_A4_LEAD = 0.90
+    L_LOOP_CON_WAIT = 0.25
+    L_LOOP_CON_STALL = 0.15
+    # 【A4 之后到发 E 之间的等待】(用户 2026-08-19: "这里E接快了 等个0.5s")。
+    # 用 macro_gap 而不是 macro_wait —— 【等的期间照样普攻】, 跟着 self.poking
+    # 走(此刻是开着的)。轴的总纲: 没明说停普攻的地方就不停。
+    # 【代价】: 这 0.5 秒里她会接着往下打段, E 出手时已经不在 A4 那一段上了。
+    # 如果要的是"停手干等", 把 macro_gap 换成 macro_wait 一行的事
+    L_AEM_A4_TO_E = 0.50
+    L_AEM_E_WINDOW = KEY_WINDOW
+    L_CHI_JUMP_WINDOW = 0.20
+    # 用户: "EE就是连续点按两次E技能"。两次之间要留出第一发的动画,
+    # 否则第二发落在里面被丢掉 —— 见 spam_key 的 presses 参数。
     #
-    # 【全部数字来自视频轴的逐帧标定】(E:\轴视频\爱达千轮椅循环轴.mp4), 之后按
-    # 用户的实机反馈逐格调过。标定方法和坑:
-    #   - 视频【不是等速的】: 作者加了慢放, 还有七段【定格】(f8-26 / f28-61 /
-    #     f72-103 / f128-176 / f407-466 / f602-664 / f751-754)。所以
-    #     【不能拿视频秒数当墙钟】—— 一律读【游戏内计时器】(倒计时, 百分秒)。
-    #   - 【大招演出期间游戏时钟会停】。跨演出的差值偏小, 那几处不按数值给,
-    #     改成读屏判据(poke_until_hud_back / chi_tail_watch)。
-    # 时间轴锚在【千咲变奏到场】那一帧(游戏内 1:33.58), 下面括号里的秒数都是它的偏移。
+    # 0.55/2下 -> 0.40/4下 (用户 2026-08-19: "时间可以 但是E的连按不够快
+    # 要多按几次")。
+    # 【为什么两个数一起改】: spam_key 里 interval = max(KEY_INTERVAL, window/presses),
+    # 所以【间隔是这两个数算出来的, 不是独立旋钮】——
+    #   0.55/2 -> 间隔 0.275, 总长 0.275
+    #   0.40/4 -> 间隔 0.100, 总长 0.300   (密了 2.75 倍, 总长几乎没变)
+    # 光加 presses 会把总长拉长(0.55/4 -> 0.1375 x3 = 0.41), 而这一格
+    # 【时间已经调好了】(用户: "时间可以"), 不能再拖。
+    # 【0.10 是地板】: KEY_INTERVAL=0.10, 再往下要动那个全局常量, 别在这里试。
+    # 【还想更多下就得让总长变长】, 到时候先问清楚是要更密还是要更多发
+    # 0.40/4下 -> 0.80/8下 (用户 2026-08-19: "这里有时候第二个E没有按
+    # 出来一直再普攻")。
+    # 【病因】: 4 下全挤在 0.30 秒内, 第一发 E 的动画稍微长一点就把
+    # 剩下三下全吃掉 —— 只放出一发, 强化E 没触发, 后面 2.50 秒纯在普攻。
+    # 间隔已经压在地板(KEY_INTERVAL=0.10)上了, 所以只能把流拉长。
     #
-    # 【这条轴上反复栽的一个形状: 变奏入场后的第一下动作要分两句写】——
-    # 入场动画期间的输入【全被吞】, 所以"先点掉动画"和"那一下 A / 那一发 E"
-    # 必须是两个窗口, 第二个窗口量的才是"递出去"。合成一句的症状永远是
-    # "那一下没打出来", 而加密没用、把整个窗口加长也只是把后面推晚。
-    # 千咲入场的 E、达尼娅入场的 a4、爱弥斯变奏入场(收尾)三处都栽过。
-
-    # ---- SEG1 ----
-    # 千咲变奏入场: E 和普攻【一起】连发的【上限】窗口。视频里她到场(0.00)
-    # -> E 落地(0.04) -> 一下普攻(0.18) -> 切爱弥斯(0.52)。
-    # 0.50 -> 1.60 (2026-08-26 实机 `chiEA(x6,A x4)@0.96`: 六发全被入场动画吞)。
-    # 【加长【不花时间】】: 配 stop_when(E 一进 CD 就停), 落地那一刻立刻走
-    L_CHI_INTRO_EA_WINDOW = 1.60
-    # E 落地之后那一下 a3(stop_when 会把上面的窗口切断, 所以 a3 要单独给)
-    L_CHI_INTRO_A3 = 0.35
-    # 爱弥斯 a2a3: 到场(0.57) -> 连点到 1.66 -> E(1.95) -> 切千咲(2.00)。
-    # 【锚在到场那一帧】。她是普通切人进来的, 切人的并行点击已经把 a1 送掉了
-    L_AEM_A23_WINDOW = 1.10
-    # 【a2a3 打完到发 E 之间】。视频 0.29 -> 0.79 (用户: "小爱E技能按早了要再慢0.5s")
-    # -> 0.49 (用户: "爱弥斯A3 E 衔接E再快0.3s")。
-    # 【E 的出手时刻就是这个数的结尾】。0.29 那一版判过"太早", 别再往下压过它
-    L_AEM_A23_TO_E = 0.49
-    # 【变机甲那一发 E】。抄启动轴那一格(O_AEM_E_*)的定稿值: 单发、不留窗口。
-    # 【这一发丢了后果最大】—— 后面所有机甲格子会变成人形态, 收尾也接不上
-    L_AEM_MECHA_E_PRESSES = 1
-    L_AEM_MECHA_E_WINDOW = 0.0
-    L_AEM_MECHA_E_INTERVAL = 0.0
-    # E 发完到切千咲之间。【不能压到 0】: 技能的起手会被切人键打断
-    # (千咲 E2 那格实测过, 见 O_CHI_E2_TO_SWITCH) —— 压没了就是变不了机甲
-    L_AEM_MECHA_E_TO_SWITCH = 0.05
-    # 千咲 a4a5: 切人(2.00) -> 到场(~2.2) -> 连点到 3.40 -> Q(3.44)
-    L_CHI_A45_WINDOW = 1.20
-    # Q 之后到"开始等强化E"之间。轴的总纲是"没明说要等的一律越快越好", 归零
-    L_CHI_Q_GAP = 0.0
-
-    # ---- SEG2: 电锯 ----
-    # 【边A边等强化E亮的上限】(用户 2026-08-26: "A45以后继续A到强化E亮起")。
-    # 【回路条是普攻打出来的, 跟大招无关】—— 这是这一版最关键的认识:
-    # 改之前电锯整个挂在 R 上(Q->R->演出里连发E->长按), 实机 R 没转好那一轮
-    # (`chiR_NOFIRE icon lit=False`)连锁塌掉。现在电锯只等回路条。
-    # 3.0 -> 6.0 (实机 `chiPre(E-x1,...,3.02s)`: 指示器正好在窗口最后一刻才亮,
-    # 按下一发就到点走了)。【是上限不是时长】: 配 break_on='e'(真放出去了才走)
-    L_CHI_E_FORTE_CAP = 6.0
-    # 【强化E 起手到长按电锯之间必须留一点】(实机 `chiForteE@6.18 chiSaw_down@6.18`
-    # 零间隔)。长按是【后续输入】, 会把刚起手的技能顶掉 —— 跟 O_CHI_E2_TO_SWITCH
-    # 同一条规律, 只是这次顶它的是鼠标不是数字键
-    L_CHI_FORTE_E_TO_SAW = 0.25
-    # 【强化E 的判据: 回路条右边那一格】(用户: "跟西格莉卡那里一样")。
-    # 那一格是框架里 mouse_forte / e_forte 两个模板轮流显示:
-    # 鼠标图标 = 能打强化重击, 变成字母 E = 能放强化E。
-    # 【两条取或】(西仇守那条轴的定稿形状): e_forte 模板命中, 或者 E 图标变黄。
-    # 黄色按【通道差】算不用绝对色值区间 —— 泛光会把图标的芯吹成白色,
-    # 绝对区间一旦被蓝通道顶出去就整片不算数(那边同一状态两场实机差过一倍多)
-    CHI_FORTE_YELLOW_RB = 35        # 红 - 蓝 至少差这么多
-    CHI_FORTE_YELLOW_GB = 20        # 绿 - 蓝
-    CHI_FORTE_YELLOW_MIN_R = 140    # 太暗的像素不算
-    CHI_FORTE_YELLOW_MIN = 0.10
-    # 守护循环里问一次强化E指示器的间隔(要读屏, 别太密)
-    L_CHI_FORTE_PROBE = 0.10
-    # "按过 E 之后指示器连着灭这么多次"才算这一发真被吃进去了。
-    # 【连着两次】: 单次读数会抖, 一抖就误判成"放出去了", 后面就不再补发
-    L_CHI_FORTE_DARK_CONFIRM = 2
-    # 【早成保护】 强化E 的"完成"判据(按过 + 指示器
-    # 连灭两次)有个盲区: 按键发出去但被动画吞掉时, 指示器照样会灭 —— 判据
-    # 照样成立, 这一格半秒内"完成"并提前退场, 后面的电锯从错误状态起跑,
-    # 整段输出作废。对策: 完成判定设时间下限, 这格至少守满 1.2 秒才允许
-    # 宣布完成 —— 期间指示器若回亮(=刚才那按没生效), 循环会自动补发;
-    # 指示器真不亮(=强化E 本来就没攒好)则到点照常走, 不多等。
-    # 正常轮这一格都要 4~5 秒才完成, 下限不会碰到
-    L_CHI_EARLY_DONE_MIN = 1.2
-    # 【电锯: 改成点按, 不再长按】(用户 2026-08-27: "把长按换成点按吧,
-    # 这样一来如果被打断还能尽快续上, 如果最后协奏不够还能马上跟上A尽快打满协奏")。
-    # 视频里作者是长按 3.19 秒(按下 3.94 -> 松手 7.13), 但他自己也说这一格
-    # 【长按打满伤害 / 短按加快启动速度】, 两种都行。
+    # 【多按是安全的】: E2 一旦放出去, 它自己有 2.32 秒动画(实机量的),
+    # 这期间多余的 E 键全部被游戏【丢掉、不排队】, 烧不到后面的充能。
+    # 危险只存在于"按键流长过动画"的情况 —— 0.70 << 2.32, 差得很远。
+    # 【总时长不变】: 按键流 +0.40, 下面 L_AEM_EE_ANIM 相应 -0.40
+    # 0.80/8下(间隔0.10) -> 0.80/16下(间隔0.05)
+    # (用户 2026-08-19: "爱弥斯EE之间可不可以更快一点 频率更高一点")。
+    # 【为什么要单独给 interval】: spam_key 里 interval = max(interval, 窗口/次数),
+    # 不传就用全局 KEY_INTERVAL=0.10 当下限 —— 那是这一格现在的地板。
+    # 【不能只把窗口砍小来加密】: 流长必须盖过第一发 E 的动画,
+    # 否则就回到了"第二个E没按出来"那个毛病。所以次数翻倍、流长不变:
+    #   8下 × 0.10 = 0.70 流长  ->  16下 × 0.05 = 0.75 流长
+    # 【密到 0.05 是安全的】: E2 一放出去就是 2.32 秒动画, 期间多余的
+    # E 键全被丢掉、不排队, 烧不到后面的充能
+    L_AEM_EE_WINDOW = 0.80
+    L_AEM_EE_PRESSES = 16
+    L_AEM_EE_INTERVAL = 0.05
+    # 【EE 之后的强化E动画, 全程持续普攻】(用户 2026-08-19: "这里A2没有A出来
+    # 应该是按了第二个E以后 在这个强化E动画过程中就开始持续攻击 等结束马上A出去切达")。
     #
-    # 【长按的两个实机代价, 都是这一版要治的】:
-    #   - 按住期间【一下点击都没有】(mouse_down 补按会投 WM_ACTIVATE 把按住
-    #     状态打断), 所以那 3.2 秒里协奏全靠长按本身涨 —— 实机见过一轮
-    #     协奏一路从 0.89 掉到 0.81、达尼娅没吃到变奏;
-    #   - 被打断的话按住就白按了, 而点按下一下立刻续得上。
-    # 【窗口长度不变】: 还是这么久, 只是把"按住"换成"这段时间里一直点"
-    L_CHI_SAW_WINDOW = 3.19
-    # 松手之后的 a2 a3(短按)。视频: 7.29~8.05 五下, 然后 8.10 变奏达尼娅。
-    # 【电锯终结是这一段打出来的】—— 轴上单独画了一格, 实机没有单独的键
-    L_CHI_SAW_A23 = 0.80
-    # 【R 从主线上摘下来, 变成整段电锯期间的背景任务】
-    # (用户: "R等CD好了就按, 虽然可能会打断电锯动作但是没关系")。
-    # 盲发的间隔 —— 【没转好时按 R 是空操作, 一分钱代价都没有】, 所以不读图标
-    L_CHI_LIB_KEY_INTERVAL = 0.20
-    # 电锯打完还有没做完的(强化E / R), 再边A边盯这么久的【上限】。到点就走
-    L_CHI_LIB_WAIT = 2.50
-    # 千咲 R 演出结束之后的连点尾巴(抄启动轴 O_CHI_R_TAIL 的量级)
-    L_CHI_R_TAIL = 0.10
-    # 【协奏一满就走, 别把剩下的窗口跑满】(用户 2026-08-27: "千咲有时候协奏满了
-    # 但还在跑流程没有马上切人")。
-    # 【只开在电锯终结和收尾等待那两格】: 前面 chiPre(要把强化E放出去)和
-    # chiSaw(长按本身就是电锯的输出时间)不能被它掐掉 —— 那两格已经因为
-    # 提前退出栽过一次(3.19 秒的长按被截成 0.66)。
-    # 读协奏要读屏, 所以隔这么久问一次
-    L_CHI_CON_PROBE = 0.15
-    # 【con_exit 至少要等这么久才允许生效】(2026-08-27 实机:
-    # `chiSawA23(A x3,con!0.19s)` —— 电锯终结那一格 0.19 秒就退出去切人了,
-    # 紧接着 `>DenFAIL`, 前 0.75 秒游戏一直拒绝换人)。
-    # 【从一段动作的正中间抽身去切人是最差的时机】: 游戏在角色动作期间拒绝换人,
-    # 那几百毫秒白等; 而这一格本身就是电锯终结的输出。
-    # 满协奏不会自己掉太快, 晚这零点几秒交棒不亏
-    L_CHI_CON_EXIT_MIN = 0.35
-    # 【A 到协奏满再变奏达尼娅】(用户明写)。旧版假设"千咲刚放完 R, 协奏一定满",
-    # 那是把它当断言用; 现在这一格是【真的在等条涨】, 上限要给够。
-    # 【等的期间照样普攻】, 所以多等的时间不是干等, 会接着推协奏
-    # 3.0/1.5 -> 6.0/3.0 (用户 2026-08-27: "千咲协奏值没满就切人了")。
-    # 【实机是真的没攒满, 不是判据的问题】: 失败那轮的读数是
-    #   0.02:0.89 0.42:0.85 0.90:0.84 1.35:0.82 1.48:0.81 ... (never filled)
-    # —— 【一路在往下掉】。协奏【必须打中才涨】, 而且不打就会衰减,
-    # 所以掉说明那一段的点击没落到怪身上, 不是等得不够久。
-    # 成功那轮同一格是 0.88 -> 0.97 -> 0.99 -> 满, 一秒半就过了。
-    # 【加长只是买时间, 买不来命中】—— 命中那一头 2026-08-27 已经动过了:
-    # 电锯那一格从长按改成了点按(见 L_CHI_SAW_WINDOW), 那 3.2 秒现在一直在点,
-    # 协奏不再只靠长按本身涨。还是攒不满的话就是真打空了, 往上游查
-    L_CHI_CON_WAIT = 6.0
-    L_CHI_CON_STALL = 3.0
-
-    # ---- SEG3: 达尼娅 ----
-    # 【变奏入场动画: 这一段的点击全被吞】(用户: "达尼娅变奏进场那下A没A出来,
-    # 参考一下清达莫那里, 是一样的")。抄清达莫的形状(S_DEN_INTRO_ANIM /
-    # S_DEN_A1_LEAD): 分成两句 —— 先把入场动画【点掉】(照点不误, 只是打不出连段),
-    # 那一下 A 才落在动画【之后】。
-    # 0.28 -> 0.70 (实机 `denIntroAnim(x3)@16.09 denA4(x1)@16.22`, 到场 15.81 ——
-    # 那一下 A 落在 +0.28~+0.41, 还在动画里)。
-    # 【清达莫的 0.28 能用不代表这里能用】: 那个 0.28 是从 0.80 一路砍下来的,
-    # 砍的是"A 之后到 R 之间的空档", 不是"动画有多长"。爱弥斯的变奏入场逐帧量
-    # 出来是 1.23 秒不放行, 同一个机制。
-    # 【还不出就往 1.00 走, 别按 0.05 的刻度爬】。
-    # 【给长了的症状】: 她多打两下(动画结束之后的点击是算数的), 连段冲过 a4、
-    # E/Q/R 整体推迟
-    L_DEN_INTRO_ANIM = 0.70
-    # 【A 窗口的尾巴】: spam_segments 一段的窗口就只有 lead
-    L_DEN_A4_LEAD = 0.20
+    # 【这个数是实机量出来的, 不是估的】(2026-08-19 日志, 连续三轮一模一样):
+    #   aemEE@7.50 -> aemA2窗口0.20(x3)@7.70 -> >Den(2.32|A x16)@10.01
+    # 切达【被游戏拒绝了 2.32 秒】—— 那就是强化E的动画长度。
+    # 从 aemEE 结束算起 = 2.51。
+    #
+    # 【为什么原来那 16 下点击是白点的】: 切人键一发出去, 离场角色就【不再接受
+    # 新的动作输入】, 只有已经起手的动作会演完(这条在达尼娅 R1 那格实测过)。
+    # 所以那 2.32 秒虽然一直在点, 一下 A 都出不来。
+    # 【改法就是把这段时间挪到切人键【之前】】—— 总时长几乎没变(2.51 -> 2.50+0.20),
+    # 但 A2 能落到了
+    # 2.50 -> 2.10 (配合上面按键流从 0.30 拉到 0.70, 两边抵消, 总时长不变)。
+    # 【为什么可以直接减】: 这个窗口量的是"E2 放出去之后还剩多少动画",
+    # 而 E2 现在平均会在按键流里更晚一点才放出去
+    L_AEM_EE_ANIM = 2.10
+    # 【A23 之后到发 EE 之间的等待】。
+    # 用户 2026-08-19: "这里E按快 慢0.1s" -> "这里E还是快 在加0.2"
+    # -> "实际上A3还没打到怪身上 再加0.5s"
+    # -> "加的有点多了 减0.2"。 0 -> 0.10 -> 0.30 -> 0.80 -> 0.60。
+    # 【这个数量的不是"等一等"而是【A3 打中怪】】 —— 用户看的是命中,
+    # 不是抬手。这是这条轴上少见的【不适用"抬手即算数"】的位置:
+    # 后面的 EE 要吃到 A3 的伤害/能量, 所以必须等它真落地。
+    # 因为期间照样普攻, 多出来的时间不是干等, 会接着往下打段
+    # 等的期间照样普攻(macro_gap 跟随 self.poking)
+    L_AEM_A23_TO_EE = 0.60
     L_DEN_E_WINDOW = KEY_WINDOW
-    # E 按下要隔一点再按 Q/R, 不然小技能被吞 —— 跟启动轴 O_DEN_E_TO_Q 同一条规律,
-    # 【但各自标定, 别合并成一个常量】
-    L_DEN_E_TO_Q = 0.10
+    # 【循环轴 达 E -> R1 之间的间隔】(用户 2026-08-19: "E-R中间要隔0.1s")。
+    # 原来是 E 发完立刻 fire_lib —— 用户要留出这一段。
+    # 用 macro_gap, 所以【等的期间照样普攻】(跟随 self.poking, 此刻开着)
+    L_DEN_E_TO_R = 0.10
+    L_AEM_E2_WINDOW = KEY_WINDOW
+    # 千咲 Q -> R。R 之后"在动画结束前就开始点E" —— 所以 E 是连发着穿过演出的。
+    # 同上, 归零(用户: 没提的等待一律越快越好)
+    L_CHI_Q_TO_R = 0.0
+    # E 连发的【上限】, 不是固定时长: 正常盯着 HUD 回来就提前收手
+    # (spam_key_through_lib)。上限按最坏情况给 —— R 在窗口末尾才出手 + 演出 4 秒
+    L_CHI_RE_MAX = 7.0
+    # 千咲长按普攻。用户: "从切到千咲开始长按时间大概是2.2S,
+    # 记得在切人的同时就开始长按预输入"
+    # 2.20 -> 1.77 (用户 2026-08-19: "这里千的持续时间太长 实机从29S47-27S70
+    # 持续这么长时间就可以切了" —— 游戏内计时器倒数, 29.47-27.70 = 1.77)。
+    # 【这个数就是她的站场时长】: hold_into_switch 里 macro_wait(hold) 是在
+    # quick_switch 之后才跑的, 所以 hold == 到场到松手。
+    # 实机对照(2026-08-19): chiHold_down@19.81 -> up@22.47 共 2.66
+    #   = 预按 0.10 + 切人 0.36 + 按住 2.20, 站场那段正好是 2.20
+    L_CHI_HOLD = 1.77
+    L_DEN_E1_WINDOW = KEY_WINDOW
+    # 【循环轴 SEG3: 切爱弥斯 -> 按下 E3 的总时长】。
+    # 用户 2026-08-19 逐帧: "这是实机切爱以后从 A 到最后按下 E 瞬间的
+    # 时间 28s11-27S14" = 0.97 秒(游戏内计时器倒数, 百分秒)。
+    # 实机基线(2026-08-19 日志): aemA23b[2seg] 窗口 0.55 (x8) —— 短了 0.42。
+    #
+    # 【这一格用显式窗口, 不用段数模型】: 用户量的就是【到场 -> 按E】
+    # 这个总长, 而纯段数算出来只有 0.55(1段 0.35 + lead 0.20) ——
+    # 多出来的 0.42 是入场过渡那一段, 段数模型里没有它。
+    # 锚点一样(都是到场那一帧), 只是长度改成用户实测值
+    # 0.97 -> 0.82 (用户 2026-08-19: "E的时机晚了 快0.15s")
+    # -> 0.90 -> 1.00 (用户: "改成0.90试试" -> "加到1.0试试")。
+    # 路径: 逐帧量的 0.97 -> 砍到 0.82("E的时机晚了") -> 0.90 -> 1.00。
+    # 【已经反向越过逐帧值了】: 1.00 > 0.97, 也就是比你自己量的那一帧
+    # 还晚一点按 E —— 下次再往上加前先确认下一格的 E2 还跟不跟得上
+    # 窗口的结尾就是按 E 的时刻, 所以"E 提前 X"就是这个数减 X
+    L_AEM_A23B_WINDOW = 1.00
+    # 【变奏入场动画: 这段时间她根本不能出招】
+    # 用户 2026-08-19: "这里根本没打出A34 因为小爱变奏入场有段时间
+    # 不能A 是不是被吞了" —— 就是被吞了。
+    #
+    # 【实机量出来的】(2026-08-19 日志, 两轮一致):
+    #   >Aem^ 到场@24.29 -> aemA34 窗口 0.55(x8)@24.84 -> >Den(0.68) 被拒
+    #   -> 25.52 才切成。到场 -> 游戏肯放行 = 1.23 (另一轮 1.24)
+    # 那 8 下全落在入场动画里, 一下也没出去。
+    #
+    # 【跟强化E 那格同一个形状】: 先把动画点完(切人键还没按,
+    # 她还能接受新动作), 动画一完 A34 自然就出去了, 再切达。
+    # 【净多花的时间只有 A34 那 0.55】—— 原来那 1.23 里已经有 0.68
+    # 花在"按着切人键等游戏放行"上了
+    L_AEM_INTRO_ANIM = 1.23
+    # 【入场动画之后那段 A34 的 lead】。
+    # 用户 2026-08-19: "0.55不够 加到0.75" -> "还是短了加到0.9"。
+    # 窗口 0.55 -> 0.75 -> 0.90。
+    # spam_segments 的窗口 = (2-1)×SEG_AEM(0.35) + lead, 所以 lead 0.20 -> 0.40
+    # 就是窗口 0.55 -> 0.75。【不能改全局 A_LEAD】—— 那个还管着别的格子
+    L_AEM_A34_LEAD = 0.55
+    L_AEM_E3_WINDOW = KEY_WINDOW
+    L_DEN_E2_WINDOW = KEY_WINDOW
+    # 【Q 和 R2 之间不留间隔】(用户 2026-08-19: "QR一起就行 QR之间不需要等")。
+    # 已经是 0.0, macro_wait(0.0) 是空操作 —— 这一行留着只是当旋钮。
+    # 启动轴的 O_DEN_Q_TO_R 同样是 0.0
     L_DEN_Q_TO_R = 0.0
-    # R1 演出结束(HUD 回来)之后还要连点多久才算她能出招。抄启动轴 O_DEN_R1_TAIL
-    L_DEN_R1_TAIL = 0.15
-    # 【R1 之后那一大段 4A】。视频: HUD 回来后一直连点到 13.07, 强化E 在 13.26 ——
-    # 2.70 秒、十五下点击。
-    # 【这一段是在给强化E 攒条, 不是在凑段数】: 条没满的话下面那两发 E 打出来是
-    # 【普通 E】, 白烧充能。
-    # 【是上限不是时长】: 走 wait_forte_full(回路条读满就走)。
-    # 【但必须有下界】(实机 `den4A(full,A x0,0.02s)` —— 进来第一帧就读到满,
-    # 一下普攻都没打)。判"某状态出现"之前要先确认它消失过, 这一格拿不到那个信号,
-    # 所以用最小连点时长兜底
-    L_DEN_4A_WINDOW = 2.70
-    L_DEN_4A_MIN = 1.20
-    # 【EE 之前的协奏保底】(用户: "达尼娅要加个保底, R1变身后至少A到协奏圈的75
-    # 再EE接R切人, 确保满协奏切爱弥斯")。
-    # 【门槛不是"满"】: R2 自己还会把圈推上去一截, 起手 75% 就够她离场时是满的;
-    # 等满再开 EE 等于把那一截白等掉。这一格保的是【爱弥斯的变奏入场】——
-    # 而收尾爆发整段都建立在她变奏进场这一下上。
-    # 【清达莫那边同一格是 75% + Q + R2 两个来源, 我们这一格只有 R2】——
-    # 要是变奏爱还是偶尔不成立, 先抬这个数, 别去动后面
-    L_DEN_CON_MIN = 0.75
-    L_DEN_CON_CAP = 2.0          # 等它的上限。被打断得太狠时别把整条轴卡在这
-    # 【两段强化E】。0.55/4发 -> 1.10/间隔0.12/不限发数
-    # (用户: "达尼娅EE第二个E没放出来, 清达莫的时候也遇到过")。
-    # 【直接抄清达莫那条轴的定稿值】(S_DEN_EE_WINDOW/INTERVAL), 那边逐轮调过:
-    #   presses=2 + 中间等 0.20 -> "停顿太长", 第二发被推到她已经能接下一个动作之后
-    #   间隔 0.06               -> 十下挤在一个动画窗口里, 第二发多半被吞
-    #   窗口 1.10 / 间隔 0.12   -> 定稿。要调只在 0.10~0.15 之间动
-    # 【多按不花钱】: E 是充能技能, 充能用完之后多出来的按键是空操作 ——
-    # 拉长只是多给它几次"没被动画吞掉"的机会。
-    # 【poke=False 也是抄那边的】: 点击会把她的连段推起来, 反而顶掉第二发的起手
-    L_DEN_QE_WINDOW = 1.10
-    L_DEN_QE_INTERVAL = 0.12
-    L_DEN_QE_TO_R = 0.10
-    # 【R2 必须真的放出去了才准切人】(用户 2026-08-27: "达尼娅由于被打断EE,
-    # R没好就切人了, 这里要加一个保底")。
-    # 【形状抄清达莫】(S_DEN_R2_*): 没放出来就【接着打 + 有 E 就放 E】再重试 ——
-    # 大招是能量门控, 而能量靠打和放技能攒, 干等一秒攒不到任何东西。
-    # 【退出条件是"R2 真的放出去了", 不是重试几次】, 下面这个只是兜底上限。
-    # 【上限怎么取】: 清达莫那边调到 10.0, 但那条轴上达尼娅是主 C、场上时间长;
-    # 我们这一圈总共才 ~27 秒, 拖太久下一圈所有人更饿。8.0 是折中 ——
-    # 老是 `denR2 never fired` 就往 10 抬, 觉得拖圈就往下压
-    L_DEN_R2_CAP = 8.0
-    # 重试间隙里补的那一发 E(拿来攒能量的)。【只补一小段就走】: 铺太长的话
-    # 能量中途攒够了也发现不了
-    L_DEN_R2_RETRY_E = 0.30
-    # 重试间隙里打普攻的窗口。【边打边盯能量环, 亮了就立刻退出去发 R】——
-    # 打满固定窗口才回去看一眼的话, 中间亮起来的那一秒多就白等了
-    L_DEN_R2_RETRY_A = 0.60
-
-    # ---- 收尾爆发(爱弥斯) ----
-    # 【变奏入场 -> 机甲 a3a4 的总连点窗口】。视频: 到场(~15.2) -> 声骸(15.46)
-    # -> 一路连点到 17.9 -> R1(~18.0)。
-    # 【这 2.30 里有一半是入场动画】: 旧轴实测过变奏入场后【1.23 秒游戏根本不放行】,
-    # 那段时间的点击全被吞。真正打出 a3a4 的是后面那一秒。
-    # 【所以不能用段数模型算】(段数算出来只有 0.58, 少了整整一段入场动画)
-    L_AEM_BURST_A_WINDOW = 2.30
+    # 收尾那一格 "变奏爱A3R1..." 的 A3: 变奏入场自带的那一下算 A1、她自己起手 A2,
+    # 所以【只补一段】就是 A3(爱琳莫那边同一个形状, 用户 2026-08-13 确认过)
+    L_AEM_BURST_A_SEGS = 1
 
     # ---- 长按 ----
     # 按下沿要先被【离场的】角色吃掉再切人。按住 = 先普攻、续按才变重击, 所以
@@ -915,12 +933,7 @@ class Denia(NativeDenia):
     CON_WAIT_TIME_OUT = 2.0
     CON_POLL_INTERVAL = 0.05
     CON_ENOUGH = 1.0
-    # 24→200 —— 采样条数太少时轨迹常常没记到判决那一刻, 事后没法复盘
-    # "是真跳满还是误判"。采样只用于打日志, 不影响门的行为
-    CON_SAMPLE_MAX = 200
-    # c4: 满后宽限 —— 判满后再持续普攻这么久才允许切(让 99.5~100% 的最后一线
-    # 伤害真正落地)。0.25s = 三起实测误判的对策值
-    CON_FULL_GRACE = 0.25
+    CON_SAMPLE_MAX = 24
     # 读数一动不动这么久就别等满超时了。协奏本来就会在 0.99 上卡一下再跳满
     # (实测能卡 0.6 秒), 所以取它的两倍
     CON_STALL_GIVE_UP = 1.2
@@ -1049,20 +1062,12 @@ class Denia(NativeDenia):
     def macro_start(self):
         self.macro_t0 = time.time()
         self.macro_marks = []
-        self.macro_walls = []  # log12: 每个 mark 的墙钟时刻, 时间线里打出步长
 
     def macro_mark(self, name):
-        self.macro_walls.append(time.time())  # log12
         self.macro_marks.append(f'{name}@{time.time() - self.macro_t0:.2f}')
 
     def macro_timeline(self, since=0):
-        # log12: 每个标记自带 +步长(距上一标记的墙钟秒数) —— "每一步用了多久"
-        # 由机器打在行里, 读日志的人不需要做减法, 更不需要推断
-        parts = []
-        for i in range(since, len(self.macro_marks)):
-            step = '' if i == 0 else f'+{self.macro_walls[i] - self.macro_walls[i - 1]:.2f}'
-            parts.append(self.macro_marks[i] + step)
-        return ' '.join(parts)
+        return ' '.join(self.macro_marks[since:])
 
     def macro_spam(self, window, interval=None, tag='A', sample=None, sample_every=2,
                    max_clicks=None):
@@ -1793,17 +1798,6 @@ class Denia(NativeDenia):
 
     # ==================== 变奏(等协奏) ====================
 
-    def _forte_pct_probe(self):
-        """log14: 场上角色回路条(白色占比) —— 与协奏环同源(都靠攻击落地涨)。
-        门等待期间环/回路条是否同涨, 用来裁决"连点被吞(攻击没落地)"还是
-        "游戏不记账(攻击落地但不给环)"。读的是当前帧, 零额外抓帧。"""
-        try:
-            box = self.task.box_of_screen_scaled(
-                3840, 2160, 2251, 1993, 2311, 2016, name='forte_probe', hcenter=True)
-            return self.task.calculate_color_percentage(forte_white_color, box)
-        except Exception:
-            return -1.0
-
     def wait_con_for_intro(self, char, next_name, poke=True, poke_after=0.0,
                            time_out=None, stall_give_up=None):
         """等协奏结算到满再交棒 —— 满协奏离场, 下一个人才有变奏入场。
@@ -1820,53 +1814,19 @@ class Denia(NativeDenia):
         start = time.time()
         samples = []
         full = False
-        first_con = None   # log13: 进场值(量化"这场攒条慢不慢"的起点)
-        last_con = None    # log13: 末值(涨率用)
-        deciding_con = None  # log13: 触发"满"的那一帧读数
-        recheck_con = None   # log13: 判决后立刻复核的一帧(直读task层)
         stalled_at = None
         stalled_since = start
         next_click = 0.0
         time_out = self.CON_WAIT_TIME_OUT if time_out is None else time_out
         stall_give_up = (self.CON_STALL_GIVE_UP if stall_give_up is None
                          else stall_give_up)
-        forte0 = self._forte_pct_probe()  # log14: 与协奏环同源的"攻击落地"旁证
         while time.time() - start < time_out:
             con = char.get_current_con()
-            if first_con is None:
-                first_con = con
-            last_con = con
             if len(samples) < self.CON_SAMPLE_MAX:
                 samples.append(f'{time.time() - start:.2f}:{con:.2f}')
             if con >= self.CON_ENOUGH:
-                deciding_con = con
-                # log13: 【复核帧】刷一帧后直读任务层 —— 绕开 BaseChar.get_current_con
-                # 的粘性缓存(BaseChar.py:768: 读过1就永远返回1)。
-                # 【满后宽限】环的形状判满("圆环闭合")比游戏内部真满来得略早,
-                # 读到满立刻切人会偶发"机器说满了、游戏不给变奏"。
-                # 对策: 判满后继续普攻 CON_FULL_GRACE 秒再终读一次 ——
-                # 假满会被最后一线伤害真正填满; 真满只多花 0.25s 买三重确认。
-                # 终读不过就继续等, 不切
-                try:
-                    self.task.next_frame()
-                    recheck_con = self.task.get_current_con()
-                except Exception:
-                    recheck_con = -1.0
-                if recheck_con < self.CON_ENOUGH:
-                    continue  # 复核都没过, 不算满
-                grace_end = time.time() + self.CON_FULL_GRACE
-                while time.time() < grace_end:
-                    self.click()
-                    self.macro_wait(self.A_INTERVAL)
-                try:
-                    self.task.next_frame()
-                    recheck_con = self.task.get_current_con()  # 宽限后终读
-                except Exception:
-                    pass
-                if recheck_con >= self.CON_ENOUGH:
-                    full = True
-                    break
-                # 终读掉回 = 那一口是假满, 继续循环等真满(超时兜底还在)
+                full = True
+                break
             # 【读数一动不动就别等满超时了】: 真不涨的时候多等的那一秒纯亏。
             # 阈值不能太小 —— 协奏会在 0.99 上卡一下再跳满
             if stalled_at is None or abs(con - stalled_at) > 0.005:
@@ -1883,21 +1843,6 @@ class Denia(NativeDenia):
                 next_click = now + self.A_INTERVAL
             self.macro_wait(self.CON_POLL_INTERVAL)
         self.macro_mark(f'con({"full" if full else "timeout"})')
-        # log13: 【门卡】一行量化这场攒条 —— 进场值/涨率/判决/复核, 与视频对照用
-        # log14: 增补回路条起止 —— 环停而回路条涨=游戏不记账; 两者同停=攻击没落地(连点被吞)
-        forte1 = self._forte_pct_probe()
-        elapsed = time.time() - start
-        if first_con is None:
-            first_con = last_con = 0.0
-        rate = (last_con - first_con) / elapsed if elapsed > 0.3 else None
-        verdict = f'判决帧{deciding_con:.2f} 复核帧{recheck_con:.2f}' if full else '未满'
-        if full and recheck_con is not None and recheck_con < self.CON_ENOUGH:
-            verdict += ' ← 复核不一致, 疑单帧误判!'
-        self.logger.info(
-            f'[轴] 门卡({char.name}→{next_name}): 进{first_con:.2f} 末{last_con:.2f} '
-            f'回路条{forte0:.2f}→{forte1:.2f} '
-            f'{"涨率%+.2f/s " % rate if rate is not None else ""}用时{elapsed:.1f}s '
-            f'{verdict}')
         # 轨迹是判断"上一下打没打中"的唯一手段:
         #   一跳到顶(相邻两个采样 0.8 -> 1.00) = 打中了, 这段等待是伤害飞行时间
         #   一路慢爬 = 那一下打空了, 协奏是补刀的普攻蹭上去的 —— 位置问题, 不是时机问题
@@ -1963,16 +1908,6 @@ class Denia(NativeDenia):
             f'denia opener entry: {self.cur.name} '
             f'({"passed in by caller" if entry_char else "read off screen"}) | '
             f'in_team={raw_in_team} index={raw_index} count={raw_count} | flags: {flags}')
-        # log12: 战斗围栏 + 谱面参照 + 读法 —— 日志自带"应该是什么", 对照零推断
-        fight_no = getattr(self.task, '_axis_fight_no', 0) + 1
-        self.task._axis_fight_no = fight_no
-        self.task._axis_loop_no = 0
-        self.logger.info(f'[轴] === 战斗#{fight_no} 启动轴起跑 ===')
-        self.logger.info('[轴] 谱面参照: 千eqra3-爱a2-达eqr1a1-爱a3e-千a4-达a2a3-千a5跳aE'
-                         '-达a4-机兵a2a3-千a2-达a1a2E1-千a3-机兵a4e-达E2-千a4-变奏爱-达r2'
-                         '-变奏爱qr1 (qr1之后到R2演出结束是代码扩展的收尾爆发)')
-        self.logger.info('[轴] 读法: 名字@轴时+步长 | xN=发出的点击数(普攻段位是开环连点,'
-                         '日志只记指令不记执行) | fired/hit/lit/full=有画面确认')
         try:
             self.macro_start()
             self.check_f_on_switch = False
@@ -2013,30 +1948,10 @@ class Denia(NativeDenia):
             marks = len(self.macro_marks)
             if hasattr(aem, 'perform_denia_burst'):
                 self.logger.info('direct burst -> aemeath.perform_denia_burst')
-                # 【mecha_e=False】: 启动轴交出去的下一棒是【新循环轴】, 而它的
-                # 第一个动作是变奏千咲、爱弥斯要保持人形态(变机甲的 E 在循环轴
-                # 中段才按)。R2 演出里连发 E 是【旧】循环轴的接口, 见 perform_loop
-                # 【增量修复】a_window=0 时 Q 砸进变奏入场
-                # 动画吞掉出场技能, 启动轴 R2 场场放不出; 借循环轴同款连点窗
-                # 穿透入场动画(循环轴本就是这个参数, 实测启动轴 R2 全出)
-                aem.perform_denia_burst(self, echo=True,
-                                        a_window=self.L_AEM_BURST_A_WINDOW,
-                                        mecha_e=False)
+                aem.perform_denia_burst(self, echo=True, a_window=0.0)
             else:
                 self.logger.warning('Aemeath has no perform_denia_burst, closing burst skipped')
             self.logger.info(f'opener BURST timeline: {self.macro_timeline(marks)}')
-            # log12: 启动轴里程碑 —— 轴时全部取自【已打出来的】标记, 取不到就明说, 不推算
-            def _axis_time(sub):
-                for m in reversed(self.macro_marks):
-                    if sub in m and '@' in m:
-                        return m.split('@')[1]
-                return '未见'
-            self.logger.info(
-                f'[轴] 里程碑: 谱面完(收尾爆发起点aemQ) @{_axis_time("aemQ")} | '
-                f'爱R1 @{_axis_time("R1_fired")} | 爱R2 @{_axis_time("R2_fired")} | '
-                f'R2演出完 @{_axis_time("R2anim")} | 全程墙钟 '
-                f'{time.time() - self.macro_t0:.1f}s '
-                f'(freeze {self.time_elapsed_accounting_for_freeze(self.macro_t0):.1f}s)')
         finally:
             # 长按跨了好几个方法, 中途抛异常的话鼠标会一直按着, 下一个角色上场就是
             # 一直按住普攻。这里是唯一保证松手的地方
@@ -2165,10 +2080,8 @@ class Denia(NativeDenia):
         # 她一下都不打就走 —— 所以先点一下把动作起起来
         self.quick_switch(chisa)          # 切到千咲
         # 切达; 【千咲的 A4 就是这一步的并行点击打出来的】
-        self.macro_mark('谱5:千a4(切达并行)')  # log12: 这格没有自己的点击窗口, 补语义标记
         self.quick_switch(self, click_interval=self.O_CHI_A4_INTERVAL, click_first=True)
         # 切千; 【达尼娅的 A2A3 就是这一步的并行点击打出来的】
-        self.macro_mark('谱6:达a2a3(切千并行)')  # log12
         self.quick_switch(chisa, click_interval=self.O_DEN_A23_INTERVAL, click_first=True)
         # A5 —— 窗口砍到 0.10 让跳跃提前(用户 2026-08-16: 这里跳的晚了)
         self.spam_segments(self.SEG_CHI, 1, tag='chiA5',
@@ -2443,17 +2356,8 @@ class Denia(NativeDenia):
         # 【到这里可以暂时停止持续普攻】(用户明写)
         self.poking = False
         # 变奏爱弥斯: 千咲满协奏离场, 爱弥斯才有变奏入场。
-        # 【增量修复】原来"不读协奏直接狂按"——实测这一步
-        # 经常在协奏没满时就把人切走, 0.6~0.7s 的普通切人(真变奏只要 0.06~0.2s),
-        # 爱弥斯没有变奏入场。修法借作者自己在循环轴 08-27 的同一个修复:
-        # wait_con_for_intro 原语原样(满了立刻走, 超时/停滞降级普通切)。
-        # 耐心旋钮: 原版 6.0/3.0 → 4.2/2.0。
-        # 实测能自己攒满的条最长要爬 ~4 秒, 4.2 兜住且留一线余量;
-        # 攒不动的条(环基本不涨)等多久都没用, 4.2 秒止损、按原版方式降级
-        # 普通切。耐心给太少会掐死慢条, 得不到变奏。
-        # 还原 = time_out 6.0 / stall_give_up 3.0
-        self.wait_con_for_intro(chisa, 'aemeath', poke=True,
-                                time_out=4.2, stall_give_up=2.0)
+        # 【不读协奏, 直接狂按】—— 见 O_AEM_INTRO_SWITCH_TIME_OUT 那段:
+        # 千咲刚上场、换人 CD 还在转, 所以能生效的只有"协奏满 -> 变奏无视CD"那条路。
         # click_during 显式给 True: 边按边打, 既不浪费时间又把协奏推快一点
         # (self.poking 此刻是 False, 后面 switch_into_lib 还指望它是 False)
         self.quick_switch(aem, assume_con=True, click_during=True,
@@ -2474,352 +2378,19 @@ class Denia(NativeDenia):
 
         # 【演出期间就开始疯狂切】(用户明写)。切人键会一直重发到演出结束那一帧,
         # 所以这一步不用先等演出、再切 —— 两件事是重叠的。
-        # 【增量修复】实测盲 assume 立即切时此交接恒 ~2.8s
-        # 且 A x0(爱没吃到延奏→出场技能缺→R2 链断)。先等演出结束再读协奏;
-        # 门失败且 HUD 还不在=演出没完不算打空, 补等 HUD 再试一次
-        self.poke_until_hud_back(tag='denR2anim', time_out=12.0)
-        if not self.wait_con_for_intro(self, 'aemeath', poke=True,
-                                       time_out=6.0, stall_give_up=3.0):
-            try:
-                hud_visible = self.task.in_team()[0]
-            except Exception:
-                hud_visible = False
-            if not hud_visible:
-                self.poke_until_hud_back(tag='denR2anim2', time_out=8.0)
-                self.wait_con_for_intro(self, 'aemeath', poke=True,
-                                        time_out=6.0, stall_give_up=3.0)
         # 【assume_con】: 刚放完大招协奏必满, 而演出期间能量环读数不可信
         self.quick_switch(aem, assume_con=True, click_during=False,
                           time_out=self.SWITCH_THROUGH_LIB_TIME_OUT)
 
-    def forte_e_ready(self, char):
-        """强化E 亮没亮 —— 回路条右边那一格的 e_forte 模板, 或者 E 图标变黄。
-
-        【两条取或】(用户 2026-08-26 指到这一格, 跟西仇守那条轴同一个判据)。
-        模板 e_forte 时灵时不灵; 颜色判据按【通道差】算而不是绝对色值区间 ——
-        泛光会把图标的芯吹成白色, 绝对区间一旦被蓝通道顶出去就整片不算数
-        (西仇守那边同一个状态两场实机差过一倍多)。金色不管多亮蓝总是明显偏低,
-        纯白三通道齐平, 自然排除。
-        """
-        try:
-            self.task.next_frame()
-        except Exception:
-            pass
-        try:
-            if char.is_e_forte_full():
-                return True
-        except Exception:
-            pass
-        try:
-            box = self.task.get_box_by_name('box_resonance')
-            if box is None:
-                return False
-            img = box.crop_frame(self.task.frame)
-            if img is None or img.size == 0:
-                return False
-            b = img[:, :, 0].astype(int)
-            g = img[:, :, 1].astype(int)
-            r = img[:, :, 2].astype(int)
-            hit = float((((r - b) >= self.CHI_FORTE_YELLOW_RB)
-                         & ((g - b) >= self.CHI_FORTE_YELLOW_GB)
-                         & (r >= self.CHI_FORTE_YELLOW_MIN_R)).sum()) / float(r.size)
-            return hit >= self.CHI_FORTE_YELLOW_MIN
-        except Exception:
-            return False
-
-    def chi_tail_watch(self, char, window, hold=False, e_done=False, r_done=False,
-                       want_e=True, want_r=True, tag='chiTail', interval=None,
-                       break_on='both', con_exit=False):
-        """千咲收尾段的【守护循环】: 一边打, 一边一直盯着强化E 和大招。
-
-        用户 2026-08-26: "千咲放了R但是没有放出强化E, 可能被吞了, R和强化E要一直检测"。
-
-        【为什么必须合成一个循环】: 强化E 和 R 各自什么时候能用是浮动的, 而且
-        两个都可能被动画吞掉。写成"先等E、再等R"那种串行的话, 任何一步被吞
-        整段就塌 —— 这个形状实机连栽两次(先是电锯挂在 R 上, 后来是 E 被吞了没人补)。
-        合成一个循环之后, 两件事各自"亮了就做、做成了就不再做", 谁先谁后都行。
-
-        判据:
-          强化E —— 亮了就按(forte_e_ready); 按过之后指示器【连着灭两次】才算吃进去了。
-          大招   —— 盲发(没转好时按 R 是空操作, 零代价), 队伍 HUD 掉下去就是演出开始了。
-
-        Args:
-            hold: True 就是按住不放(电锯那一格), 期间【不能】再补 mouse_down ——
-                那会投一条 WM_ACTIVATE 把按住状态打断, 所以点击那条流整个关掉。
-            break_on: 什么时候可以提前退出。
-                'e'    —— 强化E 真的放出去了就走(等电锯变身的那一段);
-                'both' —— 两件事都做完才走;
-                None   —— 【窗口跑满】。电锯长按和电锯终结那两段必须给 None:
-                    那两个窗口本身【就是电锯的输出时间】, 提前退出等于把伤害砍掉
-                    (实机见过 3.19 秒的长按被截成 0.66, 终结那一格 0.00 秒)。
-            con_exit: 协奏一满就退出去切人(用户 2026-08-27: "千咲有时候协奏满了
-                但还在跑流程没有马上切人")。【跟 break_on 是【或】的关系】——
-                break_on=None 的格子也照样会被它提前结束, 因为"协奏满了"意味着
-                这一棒该交出去了, 再打下去是把下一个人的变奏往后推。
-                【别开在 chiPre 上】: 那一格的任务是把强化E放出去, 提前走就没电锯了。
-
-        Returns: (e_done, r_done) —— 带到下一段接着盯。
-        """
-        interval = self.A_INTERVAL_FAST if interval is None else interval
-        if not want_e:
-            e_done = True
-        if not want_r:
-            r_done = True
-        start = time.time()
-        clicks = ekeys = rkeys = 0
-        dark = 0
-        con_full = False
-        next_click = next_r = next_e = next_con = 0.0
-        if hold:
-            self.task.mouse_down()
-            self.holding_attack = True
-            self.macro_mark(f'{tag}_down')
-        try:
-            while time.time() - start < window:
-                if break_on == 'e' and e_done:
-                    break
-                if break_on == 'both' and e_done and r_done:
-                    break
-                now = time.time()
-                # 【协奏满了就交棒】—— 优先于 break_on, 见 con_exit。
-                # 【但不在一段动作的正中间抽身】, 见 L_CHI_CON_EXIT_MIN
-                if (con_exit and now >= next_con
-                        and now - start >= self.L_CHI_CON_EXIT_MIN):
-                    next_con = now + self.L_CHI_CON_PROBE
-                    try:
-                        if float(char.get_current_con()) >= self.CON_ENOUGH:
-                            con_full = True
-                            break
-                    except Exception:
-                        pass
-                if not hold and now >= next_click:
-                    self.click()
-                    clicks += 1
-                    next_click = now + interval
-                # ---- 大招: 盲发, HUD 掉下去就算放出去了 ----
-                if not r_done and now >= next_r:
-                    char.send_liberation_key()
-                    rkeys += 1
-                    next_r = now + self.L_CHI_LIB_KEY_INTERVAL
-                    self.task.next_frame()
-                    if not self.task.in_team()[0]:
-                        r_done = True
-                        self.lib_press_at = now
-                        char.record_liberation_use()
-                        continue        # 演出里读不到指示器, 这一轮别去问强化E
-                # ---- 强化E: 亮了就按, 按过之后连着灭两次才算吃进去 ----
-                if not e_done and now >= next_e:
-                    next_e = now + self.L_CHI_FORTE_PROBE
-                    if self.forte_e_ready(char):
-                        char.send_resonance_key()
-                        ekeys += 1
-                        dark = 0
-                    # 【演出期间读到的"灭了"不算数】: 大招演出里 HUD 整个不在,
-                    # 指示器自然读不到 —— 不挡这一下的话, R 一放出去就会把
-                    # 还没放的强化E 误判成"已经吃进去了", 后面再也不补
-                    elif ekeys and self.task.in_team()[0]:
-                        dark += 1
-                        if dark >= self.L_CHI_FORTE_DARK_CONFIRM:
-                            # 早成保护: 按键被吞时灯照样会灭, 太快走完的"完成"
-                            # 不可信 —— 没到下限就不确认、继续守着, 灯若回亮
-                            # 会走上面的分支自动补发。见常量处的完整注释
-                            if time.time() - start >= self.L_CHI_EARLY_DONE_MIN:
-                                e_done = True
-                                char.record_resonance_use()
-                self.macro_wait(0.02)
-        finally:
-            if hold:
-                self.release_attack()
-                self.macro_mark(f'{tag}_up')
-        self.macro_mark(f'{tag}(E{"+" if e_done else "-"}x{ekeys},'
-                        f'R{"+" if r_done else "-"}x{rkeys},A x{clicks},'
-                        f'{"con!" if con_full else ""}{time.time() - start:.2f}s)')
-        return e_done, r_done
-
-    def wait_forte_full(self, char, tag='forte', cap=None, poke=True, interval=None,
-                        min_window=None):
-        """边打边等【回路条满】。到上限也往下走, 不把轴卡死。
-
-        【从清达莫那条轴原样搬过来的】(那边是"达尼娅变奏动画后 A 一下, 回路条满了
-        再开 R1")。这里用在达尼娅的 4A 上: 那一段不是在凑段数, 是在给强化E攒条 ——
-        条没满的话后面那两发 E 打出来是【普通 E】, 白烧充能。
-        【读数滞后动作约 0.7~0.8 秒】, 所以读到满的时候实际早就满了。
-        """
-        cap = self.L_DEN_4A_WINDOW if cap is None else cap
-        interval = self.A_INTERVAL_FAST if interval is None else interval
-        min_window = self.L_DEN_4A_MIN if min_window is None else min_window
-        start = time.time()
-        n = 0
-        full = False
-        next_click = 0.0
-        while self.time_elapsed_accounting_for_freeze(start) < cap:
-            self.task.next_frame()
-            try:
-                full = bool(char.is_forte_full())
-            except Exception:
-                full = False
-            # 【读到满也要先把下界打完】: 见 L_DEN_4A_MIN
-            if full and time.time() - start >= min_window:
-                break
-            now = time.time()
-            if poke and now >= next_click:
-                self.click()
-                n += 1
-                next_click = now + interval
-        self.macro_mark(f'{tag}({"full" if full else "CAP"},A x{n},'
-                        f'{time.time() - start:.2f}s)')
-        return full
-
-    def attack_until_lib(self, char, window, tag='waitR', interval=None):
-        """边打边盯大招能量环, 【一亮就立刻返回】。
-
-        【从清达莫那条轴原样搬过来的】。大招重试的间隙如果是 macro_spam(固定窗口),
-        就得打满了才回去看一眼能量 —— 能量在这一段刚打完第一下就攒够的轮次,
-        要一直等到窗口跑完才发得出 R。
-        改成边打边看: 亮了当场退出去发 R, 没亮就把窗口打满 —— 打的这几下本来就是
-        在攒能量, 不是干等。
-
-        【读能量环不便宜】但比"白等一秒"便宜多了; 一轮点击一次读屏, 跟得上。
-        """
-        interval = self.A_INTERVAL if interval is None else interval
-        start = time.time()
-        n = 0
-        lit = False
-        next_click = 0.0
-        while self.time_elapsed_accounting_for_freeze(start) < window:
-            now = time.time()
-            if now >= next_click:
-                self.click()
-                n += 1
-                next_click = now + interval
-            self.task.next_frame()
-            try:
-                if char.liberation_available():
-                    lit = True
-                    break
-            except Exception:
-                pass
-            self.macro_wait(0.01)
-        self.macro_mark(f'{tag}({"lit" if lit else "cap"},A x{n},'
-                        f'{time.time() - start:.2f}s)')
-        return lit
-
-    def fire_lib_persist(self, char, cap=None, retry_a=None, retry_e=None,
-                         tag='R2'):
-        """把大招放出去为止 —— 没放出来就【接着打 + 有 E 就放 E】再重试。
-
-        用户 2026-08-27: "达尼娅由于被打断EE, R没好就切人了, 这里要加一个保底"。
-        【形状抄清达莫】(那边同一个位置调过好几轮), 三条要点:
-          1) 【重试的间隙必须在输出】: 没放出来最常见的两个原因是"能量还差一点"
-             和"键被上一个动作的动画吞了", 打几下对两者都有帮助(攒能量 + 让动画走完);
-             干等一秒攒不到任何东西。
-          2) 【第二次起先看能量环亮没亮, 亮了才发】: 实机见过连着三轮
-             `denR2_NOFIRE(x24)` —— 每轮白按 24 下 R、白花一秒多, 兜底时间全耗在
-             对着没能量的大招按键上。
-          3) 【退出条件是"真的放出去了", 不是重试次数】。
-
-        Returns: 放出去了没有。
-        """
-        cap = self.L_DEN_R2_CAP if cap is None else cap
-        retry_a = self.L_DEN_R2_RETRY_A if retry_a is None else retry_a
-        retry_e = self.L_DEN_R2_RETRY_E if retry_e is None else retry_e
-        fired = False
-        attempt = 0
-        start = time.time()
-        while self.time_elapsed_accounting_for_freeze(start) < cap:
-            ready = attempt == 0
-            if not ready:
-                try:
-                    ready = bool(char.liberation_available())
-                except Exception:
-                    ready = True      # 读不到就照发, 别因为读屏失败把大招丢了
-            if ready:
-                attempt += 1
-                if self.fire_lib(char, tag=tag if attempt == 1 else f'{tag}r{attempt}'):
-                    fired = True
-                    break
-                self.logger.info(f'{tag}: {char.name} did not fire (try {attempt}), '
-                                 f'attacking + using E, then retrying')
-            # 没能量: 接着打 + E 好了就放 —— 两个都攒能量
-            try:
-                has_e = bool(char.resonance_available())
-            except Exception:
-                has_e = False
-            if has_e:
-                self.spam_key(char.send_resonance_key, retry_e,
-                              interval=self.L_DEN_QE_INTERVAL,
-                              tag=f'{tag}retryE{attempt}', poke=False)
-                char.record_resonance_use()
-            self.attack_until_lib(char, retry_a, tag=f'{tag}waitR{attempt}')
-        if not fired:
-            self.logger.warning(
-                f'{tag}: {char.name} never fired in {cap:.1f}s ({attempt} tries) — '
-                f'这一轮的收尾大招丢了; 先看 denCon 那行(协奏够不够)和 fire_lib 记的 '
-                f'icon lit=(能量够不够), 两个都够就是被动画吞了')
-        return fired
-
-    def wait_con_at_least(self, char, level, tag='con', cap=None, interval=None,
-                          poke=True):
-        """边打边等协奏圈涨到 level 以上(0~1)。到上限也往下走, 不把轴卡死。
-
-        【从清达莫那条轴原样搬过来的】。跟 wait_con_for_intro 的区别:
-        那个是"等满(CON_ENOUGH)才交棒", 这个是【等到某个门槛才做下一个动作】。
-
-        【等的期间必须继续打】: 圈是靠【打中】涨的(回路条是递出去就涨, 两条规则
-        不一样, 别混), 干站着等只会等到超时。
-        【读协奏不便宜】(能量环连通域分析), 所以轮询间隔别调太小。
-        """
-        cap = self.CON_WAIT_TIME_OUT if cap is None else cap
-        interval = self.CON_POLL_INTERVAL if interval is None else interval
-        start = time.time()
-        n = 0
-        con = 0.0
-        hit = False
-        samples = []
-        next_click = 0.0
-        while self.time_elapsed_accounting_for_freeze(start) < cap:
-            try:
-                con = float(char.get_current_con())
-            except Exception:
-                con = 0.0
-            if len(samples) < self.CON_SAMPLE_MAX:
-                samples.append(f'{time.time() - start:.2f}:{con:.2f}')
-            if con >= level:
-                hit = True
-                break
-            now = time.time()
-            if poke and now >= next_click:
-                self.click()
-                n += 1
-                next_click = now + self.A_INTERVAL
-            self.macro_wait(interval)
-        self.macro_mark(f'{tag}({con:.2f},{"ok" if hit else "CAP"},A x{n},'
-                        f'{time.time() - start:.2f}s)')
-        if not hit:
-            self.logger.info(f'{tag}: con only reached {con:.2f} (< {level:.2f}) in '
-                             f'{cap:.1f}s — {" ".join(samples)}')
-        return hit
-
-    # ==================== 循环轴 (2026-08-25 视频轴) ====================
+    # ==================== 循环轴 ====================
 
     def perform_loop(self, entry_char=None, cold=False):
-        """循环轴。入口是【爱弥斯】—— 她放完 R2 就在场上, 由她的 do_perform 调进来。
+        """循环轴。入口是爱弥斯 —— 她放完 R2 就在场上(机甲形态), 由她的 do_perform
+        调进来。
 
-        【但她这一轮开头什么都不做】: 轴上她那一格是空的, 第一个动作就是
-        【变奏千咲】。这是新旧两版循环轴最关键的区别 —— 旧轴开头是
-        "爱弥斯 E 变机甲", 而且那一发 E 是在【上一轮 R2 的演出里】预输入的;
-        新轴把变机甲的 E 挪到了 SEG1 中间(她 a2a3 之后)。
-
-        【推论: 收尾爆发不能再在 R2 的演出里连发 E】——
-        她要是带着机甲形态进这一轮, SEG1 那格 a2a3 打出来是机甲连段,
-        而变机甲的那一发 E 也没得放, 整轮的形态从这里就错位了。
-        所以两个 perform_denia_burst 的调用点都传 mecha_e=False。
-        证据: 视频轴开头(上一轮 R2 -> 变奏千咲)那一段【一次 E 都没按】。
-
-        Args:
-            cold: 旧的"开场直接跑循环轴"分支留下的参数(USE_LOOP_AS_OPENER)。
-                【新轴不支持冷启动】: 第一步就是变奏千咲, 开场没有满协奏,
-                变奏不成立, 达尼娅后面也吃不到变奏。传 True 只会多打一条日志。
+        【第一步"爱E变机甲"不在这里】: 那一发 E 已经在 Aemeath.spam_e_through_animation
+        里发过了 —— R2 的演出期间一直点 E, HUD 一回来就落地变机甲。这里再发一次
+        就是第二发, 会把轴后面要用的 E 提前按掉。
 
         Returns: 是否跑完(中途切人失败也照样往下走, 只有队伍不全才返回 False)。
         """
@@ -2827,20 +2398,12 @@ class Denia(NativeDenia):
         chisa = self.teammate('Chisa')
         if aem is None or chisa is None:
             return False
-        if cold:
-            self.logger.warning('loop: cold start is not supported by the video axis '
-                                '(第一步就是变奏千咲, 开场没有满协奏), running anyway')
-
-        # log12: 轮次编号 + 起跑围栏(战斗编号在启动轴入口处发)
-        loop_no = getattr(self.task, '_axis_loop_no', 0) + 1
-        self.task._axis_loop_no = loop_no
-        loop_wall0 = time.time()
-        self.logger.info(f'[轴] —— 轮#{loop_no} 起跑 ——')
 
         previous = getattr(self.task, 'skip_combat_check', False)
         self.task.skip_combat_check = True
-        # 【入口角色】: 正常路径是爱弥斯(她放完 R2 就在场上)。不传的话交接记账
-        # 会把不在场的人当成离场角色
+        # 【入口角色】: 正常路径是爱弥斯(她放完 R2 就在场上);
+        # 开场直接跑循环轴时场上是千咲, 由调用方传进来 ——
+        # 不传的话交接记账会把不在场的爱弥斯当成离场角色
         self.cur = entry_char or aem
         self.poking = False
         try:
@@ -2849,7 +2412,7 @@ class Denia(NativeDenia):
             aem.check_f_on_switch = False
             chisa.check_f_on_switch = False
 
-            self.loop_seg1(chisa, aem)
+            self.loop_seg1(chisa, aem, cold=cold)
             marks = len(self.macro_marks)
             self.logger.info(f'loop SEG1 timeline: {self.macro_timeline()}')
             self.loop_seg2(chisa, aem)
@@ -2863,200 +2426,277 @@ class Denia(NativeDenia):
 
             marks = len(self.macro_marks)
             if hasattr(aem, 'perform_denia_burst'):
-                # 【收尾那一格轴上写的是 Q-机a3a4-处决-R1-强化E-4A-强化E-机甲重击-R2】,
-                # 正好就是 perform_denia_burst 那一串。跟启动轴的差别只有两个:
-                #   a_window —— 这里要连点过变奏入场动画再打出机甲 a3a4;
-                #   mecha_e  —— 【必须关掉】, 见 perform_loop 的说明
-                aem.perform_denia_burst(self, echo=True,
-                                        a_window=self.L_AEM_BURST_A_WINDOW,
-                                        mecha_e=False)
+                # 循环轴的收尾没有 Q, 但 R1 之前先补一段 A(打出来是 A3);
+                # 启动轴那边是变奏入场直接 Q + R1。两段的差别只有这个前缀
+                aem.perform_denia_burst(
+                    self, echo=False,
+                    a_window=self.segment_window(self.SEG_AEM, self.L_AEM_BURST_A_SEGS))
             else:
                 self.logger.warning('Aemeath has no perform_denia_burst, loop burst skipped')
             self.logger.info(f'loop BURST timeline: {self.macro_timeline(marks)}')
-            # log12: 轮次卡 —— 两个时钟口径都由机器打印, 供肉眼复盘
-            self.logger.info(
-                f'[轴] 轮#{loop_no} 卡: 墙钟{time.time() - loop_wall0:.1f}s '
-                f'(freeze {self.time_elapsed_accounting_for_freeze(loop_wall0):.1f}s)')
         finally:
             self.release_attack()
             self.poking = False
             self.task.skip_combat_check = previous
         return True
 
-    def loop_seg1(self, chisa, aem):
-        """变奏千 E+a3 -> 爱 a2a3+E(变机甲) -> 千 a4a5 + Q。"""
-        # ---- 1 变奏千咲: E + a3 ----
-        # 【爱弥斯刚放完 R2, 协奏必满】—— assume_con 直接按满协奏记账, 不读屏
-        # (演出期间能量环读数不可信)。演出可能还没演完, 所以超时给长的:
-        # 切人键会一直重发到演出结束那一帧
-        self.quick_switch(chisa, assume_con=True, click_during=False,
-                          time_out=self.SWITCH_THROUGH_LIB_TIME_OUT)
-        # 【从这里开始持续普攻】, 一路开到电锯长按那一格才关
-        self.poking = True
-        # 【先记一笔她的 E 到底可不可用】: "E 没放出来"有两种完全不同的病因 ——
-        # 【在 CD 上】(能量/上游的事, 加窗口没用)和【被变奏入场动画吞了】
-        # (窗口的事)。只有这一笔读数能把两者分开, 别靠猜
-        try:
-            self.macro_mark(f'chiEready({1 if chisa.resonance_available() else 0})')
-        except Exception:
-            pass
-        # E 和普攻【同一个窗口里一起发】, 见 L_CHI_INTRO_EA_WINDOW。
-        # 【stop_when 是这一格的关键】: 窗口是【上限】不是时长, E 一进 CD
-        # (= 这一发被吃进去了)就立刻走, 所以窗口给多长都不花钱
-        self.spam_key(chisa.send_resonance_key, self.L_CHI_INTRO_EA_WINDOW,
-                      tag='chiEA', poke=True,
-                      stop_when=lambda: self.resonance_gone(chisa))
+    def loop_seg1(self, chisa, aem, cold=False):
+        """变奏达 A4 -> 千 E+A3 -> 爱 A123 -> 千 A4 -> 达 A123 -> 爱 A4+E
+        -> 千 A5+跳+A -> 达 A。"""
+        # ===== 冷启动前置: 开场没有 R2, 所以那发"变机甲的 E"要在这里补 =====
+        # (用户 2026-08-19: "开始还是小爱E ... 现在直接从小爱E切达开始")
+        # 正常一圈里这发 E 是在上一圈 R2 的演出期间发出去的
+        # (Aemeath.spam_e_through_animation), 开场没有那段演出, 也没人在场上,
+        # 所以先把她切上来、把 E 敲进去, 再接回循环轴的正常起点(等协奏 -> 切达)。
+        # 【E 期间不点普攻】: 跟循环轴里那段一致(Aemeath.MECHA_CLICK=False)。
+        # 【敲到 E 进 CD 就停】: 发出去和吃进去是两回事; 进了 CD 说明这一发被消耗掉了,
+        # 也就是变机甲成功, 再敲只是白花时间并把后面要用的那发 E 提前按掉
+        # 【判据是调用方传的 cold, 不是"她在不在场"】(用户 2026-08-19:
+        # "我现在开局就是小爱在场") —— 拿在不在场当判据的话,
+        # 她本来就在场时整段跳过, 那发变机甲的 E 就没了
+        if cold:
+            # 【死代码, 保留作记录】: USE_LOOP_AS_OPENER 已改回 False,
+            # 正常流程走启动轴, 不会带 cold=True 进来。
+            # 这段前奏想用"A 到协奏满 -> E"凑出机甲, 实测 E 会变成强化E ——
+            # 详见 USE_LOOP_AS_OPENER 上面那段
+            if self.cur is not aem:
+                self.logger.info('cold start: switching to Aemeath for the mecha E')
+                self.quick_switch(aem, click_during=False)
+            else:
+                self.logger.info('cold start: Aemeath already on field, sending the mecha E')
+            # 【先 A 到协奏满, 再发 E】(用户 2026-08-19: "这样达尼娅吃不到变奏 ...
+            # 你先A到协奏值满 然后E切达 这样开始")。
+            # 正常一圈里协奏是上一圈打出来的, 冷启动没有 —— 不补这一段的话
+            # 后面切达尼娅拿不到变奏, 而变奏入场那一下正是她 A4 的来源。
+            # 【上限给长】: 这是开场攒协奏, 本来就要打几秒; 而且它只在冷启动跑一次,
+            # 不影响后面每一圈(那边用的是 L_LOOP_CON_WAIT=0.25)
+            if not self.wait_con_for_intro(aem, 'denia', poke=True,
+                                           time_out=self.L_COLD_CON_WAIT,
+                                           stall_give_up=self.L_COLD_CON_STALL):
+                self.logger.warning('cold start: Aemeath con never filled in '
+                                    f'{self.L_COLD_CON_WAIT:.0f}s —— 达尼娅这一圈吃不到变奏, '
+                                    '多半是 A 打空了(协奏必须打中才涨)')
+            for _ in range(self.L_COLD_E_PRESSES):
+                aem.send_resonance_key()
+                try:
+                    self.task.next_frame()
+                    if not aem.resonance_available():
+                        break
+                except Exception:
+                    pass
+                self.macro_wait(self.L_COLD_E_INTERVAL)
+            aem.record_resonance_use()
+            self.macro_mark('coldE')
+        # 变奏达尼娅: 爱弥斯变机甲那一下之后协奏该满了
+        # 【最快速度切达】(用户 2026-08-19: "循环轴第一步小爱E切达 切慢了")。
+        # 这一格唯一的耗时就是等爱弥斯协奏满, 而默认上限 2.0 / 停滞放弃 1.2 是按
+        # "真的在攒" 给的 —— 实机日志里这里读到的是 `con stuck at 0.00`, 也就是
+        # 【机甲形态下这个读数根本不动】(要么读不到, 要么她刚放完 R2 就是满的)。
+        # 等一个不会动的读数纯亏, 所以这里单独把上限压到 L_LOOP_CON_WAIT。
+        # 【压到 0 就是完全不等】: 那样变奏靠 read_con 那一次读屏定, 满就有、不满就没有
+        # 【等协奏这一小段也不点】: 此刻场上是爱弥斯, 而她 E 期间不普攻
+        # (见 Aemeath.MECHA_CLICK)。点击统一从【切达那一刻】开始
+        self.wait_con_for_intro(aem, 'denia', poke=False,
+                                time_out=self.L_LOOP_CON_WAIT,
+                                stall_give_up=self.L_LOOP_CON_STALL)
+        # 【切达的瞬间开始连续普攻】(用户 2026-08-19)。click_during 显式给 True,
+        # 不跟全局开关 —— 循环轴走到这里 self.poking 还是 False
+        # 【E 和切人同时进行, 同时持续攻击】(用户 2026-08-19)。
+        # E 只在 HUD 还读得到爱弥斯时才发 —— 她一消失就停, 免得那一发落到
+        # 达尼娅头上(切人期间的技能键会被带过换人边界, 达E1 那格烧过一次)
+        self.switch_out_while_key(self, aem, aem.send_resonance_key,
+                                  click=True, read_con=True, tag='>Den+aemE')
+        # 用户: "应该是达尼娅变奏入场直接第一发A就是A4" —— 一段
+        # 【这一格特意放长, 用来看达尼娅什么时候出手】(用户 2026-08-19:
+        # "达切千的时候稍微调长一点, 我要确认达什么时候出手")。
+        # 观察完把 L_DEN_A4_LEAD 调回 A_LEAD(0.20) 就行
+        self.spam_segments(self.SEG_DEN, 1, tag='denA4',
+                           lead=self.L_DEN_A4_LEAD, interval=self.A_INTERVAL_FAST)
+
+        # 千 E + A3 —— E 之后那一下【就是】A3, 一段(不是从 A1 打到 A3)
+        self.quick_switch(chisa)
+        # 【E 窗口期间也点】(用户 2026-08-19: "达切千 EA 没A出来")。
+        # 原来 poke=False, 于是她到场后头 0.10 秒一下都不点, 点击只覆盖 0.10~0.30;
+        # 而千咲"到场后能出招"的下界在 千A2 那格量过是 0.22 —— 窗口尾巴刚够到,
+        # 一抖就没了。开点之后覆盖 0~0.30, 【不多花一秒】。
+        # 【跟跳跃那格不一样】: 那里不能点是因为她在空中, 多点会变下落攻击;
+        # 这里是地面放 E, 没有那个机制
+        # 【E 和 A 同时按, 一段到底】(用户 2026-08-19: "E和A同时按就好了啊")。
+        # 原来是两段: E 窗口 0.10 + A 窗口 0.20, 而且 E 那段的 poke 跟随全局开关 ——
+        # 循环轴走到这里持续普攻【还没打开】(要到后面 爱A123 才开), 所以实机日志是
+        # chiE(x2,A x0): 头 0.10 秒一下没点, 点击只覆盖 0.10~0.30, 而千咲"到场后
+        # 能出招"的下界是 0.22, 窗口尾巴刚够到、一抖就没。
+        # 现在合成一段: 整个 L_CHI_EA_WINDOW 里 E 和普攻一起发, poke 【显式给 True】
+        # 不跟全局开关。总时长跟原来两段之和一样, 不多花时间
+        self.spam_key(chisa.send_resonance_key, self.L_CHI_EA_WINDOW,
+                      tag='chiEA', poke=True)
         chisa.record_resonance_use()
-        # E 之后那一下就是 a3(不是从 a1 打到 a3) —— 轴上那个 a3 是段位, 不是次数。
-        # 【必须单独给一段】: 上面被 stop_when 在 E 落地那一刻切断了, 后面没有点击了
-        self.macro_spam(self.L_CHI_INTRO_A3, self.A_INTERVAL_FAST, tag='chiA3')
 
-        # ---- 2 爱弥斯 a2a3 + E(变机甲) ----
-        # 【普通切人, 不是变奏】: 千咲刚上场, 协奏还没攒起来。切人的并行点击
-        # 一直点到到场那一帧, 所以 a1 是白送的, 这里只补 a2 a3
+        # 爱 A123 —— 三段。用户: "A的期间一直狂点切人, 从这里开始持续普攻"
+        self.poking = True
         self.quick_switch(aem, click_during=True)
-        self.macro_spam(self.L_AEM_A23_WINDOW, self.A_INTERVAL_FAST, tag='aemA23')
-        self.macro_gap(self.L_AEM_A23_TO_E, tag='aemA23toE')
-        # 【单发】: 后面紧跟切千咲, 而切人期间发出去的技能键会落在【新上场的】
-        # 角色身上 —— 多发一下就可能变成千咲放的 E, 把她后面要用的那发烧掉
-        self.spam_key(aem.send_resonance_key, self.L_AEM_MECHA_E_WINDOW,
-                      interval=self.L_AEM_MECHA_E_INTERVAL, tag='aemMechaE',
-                      presses=self.L_AEM_MECHA_E_PRESSES)
-        aem.record_resonance_use()
-        # 【E 起手和切人之间必须留一点】: 技能的起手会被切人键打断(普攻不会,
-        # 抬手即算数)。压没了的症状就是"E 按了但没变机甲"
-        self.macro_gap(self.L_AEM_MECHA_E_TO_SWITCH, tag='aemMechaEgap')
+        # 【机甲爱持续普攻的同时, 不停尝试切千咲】(用户 2026-08-19)。
+        # 这一格不再是「先打满 3 段 A 再切」—— A 由并行点击打出来, 切人键从第一帧
+        # 就每轮发, 游戏放行那一刻就走(她动作期间会拒绝切人, 那正是这种写法
+        # 不掐掉 A 的原因)。跟启动轴 千A4 / 达A2A3 是同一个写法。
+        # 【click_first】: 她刚到场还没起手时, 切人键没东西挡着会当场生效、
+        # 一下都不打就走 —— 先点几下把动作起起来(千咲 A2 那格就是这么栽的)。
+        # 【风险】: 打出几段由游戏什么时候放行决定, 不由我们控制。段数不够就把
+        # L_AEM_A123_PRECLICKS 加大, 或者改回 spam_segments 那种固定窗口
+        self.quick_switch(chisa, click_during=True,
+                          click_first=self.L_AEM_A123_PRECLICKS,
+                          click_interval=self.A_INTERVAL_FAST)
+        self.spam_segments(self.SEG_CHI, 1, tag='chiA4', interval=self.A_INTERVAL_FAST)
 
-        # ---- 3 千咲 a4a5 + Q ----
-        # 【Q 随时可以按】(用户 2026-08-26), 所以就放在 a4a5 后面、不跟任何东西对齐
-        self.quick_switch(chisa, click_during=True)
-        self.macro_spam(self.L_CHI_A45_WINDOW, self.A_INTERVAL_FAST, tag='chiA45')
-        chisa.click_echo(time_out=0)
-        self.macro_mark('chiQ')
-        self.macro_gap(self.L_CHI_Q_GAP, tag='chiQgap')
+        # 达 A123 —— 三段。用户: "A3是个后撤步, 需要在后撤同时切" ——
+        # 所以只量到 A3 递出去, 后撤那段由下一句切人的 click_during 盖住
+        self.quick_switch(self)
+        self.spam_segments(self.SEG_DEN, 3, tag='denA123', interval=self.A_INTERVAL_FAST)
+
+        # 爱 A4 —— 一段 + E
+        self.quick_switch(aem)
+        self.spam_segments(self.SEG_AEM, 1, tag='aemA4', interval=self.A_INTERVAL_FAST)
+        self.macro_gap(self.L_AEM_A4_TO_E, tag='aemA4toE')
+        self.spam_key(aem.send_resonance_key, self.L_AEM_E_WINDOW, tag='aemE')
+        aem.record_resonance_use()
+
+        # 千 A5 —— 一段 + 跳 + A(一段, 空中)。用户: "这里的流程要非常非常快"
+        self.quick_switch(chisa)
+        self.spam_segments(self.SEG_CHI, 1, tag='chiA5', interval=self.A_INTERVAL_FAST)
+        self.spam_key(self.task.jump, self.L_CHI_JUMP_WINDOW, tag='chiJump', poke=False)
+        self.spam_segments(self.SEG_AIR, 1, tag='chiAirA')
+
+        # 达 A —— 一段
+        self.quick_switch(self)
+        self.spam_segments(self.SEG_DEN, 1, tag='denA', interval=self.A_INTERVAL_FAST)
 
     def loop_seg2(self, chisa, aem):
-        """千 A到强化E亮 -> 强化E(变身电锯) -> 长按+a2a3(期间 R 一转好就放)
-        -> A 到协奏满 -> 变奏达。
+        """爱 A23+EE+A2 -> 达 E+R1+A12 -> 爱 A3+E -> 千 Q+R+E -> 达 A34
+        -> 千 长按普攻2.2s。"""
+        # 爱 A23 —— 两段 + EE + A2 —— 一段(EE 之后连段重新起手)。
+        # 用户: "EE就是连续点按两次E技能"
+        self.quick_switch(aem)
+        self.spam_segments(self.SEG_AEM, 2, tag='aemA23', interval=self.A_INTERVAL_FAST)
+        # 【presses=2 而不是连发满窗口】: 这一格的次数本身有意义, 连发会把两发挤成
+        # 一发(第二发落在第一发的动画里被丢掉), 而发太多又会把后面那几发 E 提前按掉
+        self.macro_gap(self.L_AEM_A23_TO_EE, tag='aemA23toEE')
+        self.spam_key(aem.send_resonance_key, self.L_AEM_EE_WINDOW, tag='aemEE',
+                      presses=self.L_AEM_EE_PRESSES, interval=self.L_AEM_EE_INTERVAL)
+        aem.record_resonance_use()
+        # 先把强化E的动画点完(键还没按, 所以她还能接受新动作), 再让 A2 出去
+        self.macro_spam(self.L_AEM_EE_ANIM, self.A_INTERVAL_FAST, tag='aemEEanim')
+        self.spam_segments(self.SEG_AEM, 1, tag='aemA2', interval=self.A_INTERVAL_FAST)
 
-        【这一段按用户口述整个改成"条件驱动"】, 原话:
-          "A45以后继续A到强化E亮起, Q可以随时按, R等CD好了就按,
-           虽然可能会打断电锯动作但是没关系, 持续A就好, A到协奏满切达"
-          "千咲放了R但是没有放出强化E, 可能被吞了, R和强化E要一直检测"。
+        # 达 E + R1 + A12 —— R1 之后那两下是 A1 A2, 两段。
+        # 【窗口到 A2 递出去就结束, 不等它演完】(用户 2026-08-16: "达A2动作比较慢,
+        # 如果抬手就切人那么她会在场上相对滞留比较长的时间")—— 这正是要的:
+        # 她留在场上把 A2 演完的这段时间, 我们已经在别人身上做完了 爱A3E + 千QRE。
+        # 【但这条链是有时限的】: 后面那格 达A34 要接在 A2 后面变成 A3, 中间的流程
+        # 【慢了就会断】(用户: "这里很考验前面达A12 A2这下的衔接速度")——
+        # 连段超时会退回 A1, 表现是 达A34 打出来的其实是 A1A2。
+        # 所以这一段【不要往里加任何等待】, 出问题先查中间几次切人的耗时
+        self.quick_switch(self)
+        self.spam_key(self.send_resonance_key, self.L_DEN_E_WINDOW, tag='denE')
+        self.record_resonance_use()
+        self.macro_gap(self.L_DEN_E_TO_R, tag='denEtoR')
+        fired = self.fire_lib(self, tag='denR1')
+        if fired:
+            self.note_lib1()
+        # 同启动轴: 只等"抬手", 不等打中; 窗口短 + 点击加密
+        self.poke_until_hud_back(tag='denR1anim', tail=self.O_DEN_R1_TAIL)
+        # 【这一格用 macro_spam 而不是 spam_segments】(2026-08-19 改回)。
+        # O_DEN_R1_A_LEAD 这个名字里虽然写着 lead, 但它是【窗口】——
+        # 上面那段标定记录里的 "窗口 0.24, 尾 0.15" 说的就是它。
+        # 之前写成 spam_segments(SEG_DEN, 2, lead=0.24) 等于 1段(0.35)+0.24 = 0.59,
+        # 【凭空多了一段 0.35】, HUD 后总时长从标定好的 0.39 涨到 0.74 ——
+        # 用户 2026-08-19 报的 "达切爱要快0.35s" 就是这一段。
+        #
+        # 【为什么这一格不适用段数模型】: 上面记着 "HUD 回来之后她还要 0.47 秒
+        # 才能出招"。窗口里绝大部分点击是废的, 能落到的就最后那几下 ——
+        # 所以这里量的是【什么时候可以切人】, 不是【打几段】。
+        # 轴上写 A12, 实际出得来的只有 A1(A2 要 0.47+0.35=0.82, 够不到)。
+        # 【别再改回 spam_segments】: 段数模型在这一格是错的
+        self.macro_spam(self.O_DEN_R1_A_LEAD, self.O_DEN_R1_A_INTERVAL, tag='denA12')
 
-        【最关键的一条: 强化E 不依赖大招】—— 回路条是普攻打出来的。
-        改之前这一段是 "Q -> R -> 演出里连发E -> 长按", 也就是把整个电锯
-        挂在了 R 上; 实机 R 没转好那一轮(`chiR_NOFIRE icon lit=False`)
-        连锁塌掉。现在 R 从主线上摘下来变成【背景任务】, 电锯只等回路条。
-        """
-        # ---- 4/5 守护循环: 一边打一边【一直盯着】强化E 和大招 ----
-        # 【第一段先点按, 一直打到强化E 真的放出去为止】(break_on='e')。
-        # 【不能拿 R 当退出条件】: R 先转好的轮次会把这一段提前掐掉,
-        # 电锯还没变出来就去长按了 —— 那就是"强化E没按出来"的现场
-        e_ok, r_ok = self.chi_tail_watch(chisa, self.L_CHI_E_FORTE_CAP,
-                                         tag='chiPre', break_on='e')
-        # 【长按不能贴着 E 发】: 长按是"后续输入", 会把刚起手的强化E 顶掉 ——
-        # 跟启动轴 O_CHI_E2_TO_SWITCH 是同一条规律, 只是这次顶它的是鼠标
-        self.macro_gap(self.L_CHI_FORTE_E_TO_SAW, tag='chiForteEgap')
+        # 爱 A3 —— 一段 + E。用户: "从这里开始持续普攻"(已经在持续, 这里只是确认不关)
+        self.poking = True
+        self.quick_switch(aem)
+        self.spam_segments(self.SEG_AEM, 1, tag='aemA3', interval=self.A_INTERVAL_FAST)
+        self.spam_key(aem.send_resonance_key, self.L_AEM_E2_WINDOW, tag='aemE2')
+        aem.record_resonance_use()
 
-        # ---- 电锯: 点按 + a2a3(电锯终结) ----
-        # 【这一格现在是点按不是长按】, 见 L_CHI_SAW_WINDOW ——
-        # 被打断能立刻续上, 而且整段一直在推协奏。
-        # 【break_on=None】: 这个窗口是电锯的输出时间, 强化E/R 做完了也不提前走。
-        # 【但 con_exit 例外】: 协奏一满就交棒 —— 再打下去是把达尼娅的变奏往后推,
-        # 而变奏入场那一下正是她 a4 的来源
-        e_ok, r_ok = self.chi_tail_watch(chisa, self.L_CHI_SAW_WINDOW,
-                                         e_done=e_ok, r_done=r_ok, tag='chiSaw',
-                                         break_on=None, con_exit=True)
-        # 【同上, 这一格是电锯终结的输出, 也必须跑满】——
-        # 但协奏一满就不等了(con_exit), 那时候再打是把变奏往后推
-        e_ok, r_ok = self.chi_tail_watch(chisa, self.L_CHI_SAW_A23,
-                                         e_done=e_ok, r_done=r_ok, tag='chiSawA23',
-                                         break_on=None, con_exit=True)
+        # 千 Q + R + E。用户: "在动画结束前就开始点E"
+        self.quick_switch(chisa)
+        chisa.click_echo(time_out=0)
+        self.macro_mark('chiQ')
+        self.macro_gap(self.L_CHI_Q_TO_R)
+        self.fire_lib(chisa, tag='chiR')
+        # 【演出还没结束就连发 E, 一直发到演出真的结束】: 演出期间的按键被丢掉不排队,
+        # 连发保证演出结束的第一个合法帧就有一发落进去 —— 这正是用户说的
+        # "在动画结束前就开始点E"。
+        # 【不用固定窗口】: R 哪一刻出手是浮动的, 固定时长要么白发要么发不到,
+        # 爱琳莫那边为此栽过一次(症状是"R完不接E")
+        self.spam_key_through_lib(chisa.send_resonance_key, tag='chiRE',
+                                  time_out=self.L_CHI_RE_MAX)
+        chisa.record_resonance_use()
 
-        # ---- 6 还有没做完的就接着边A边盯(上限), 然后 A 到协奏满 -> 变奏达 ----
-        if not (e_ok and r_ok):
-            e_ok, r_ok = self.chi_tail_watch(chisa, self.L_CHI_LIB_WAIT,
-                                             e_done=e_ok, r_done=r_ok, tag='chiWait',
-                                             con_exit=True)
-        if r_ok:
-            # 演出期间的点击被丢掉不花钱, 演出一结束就有一下落进去
-            self.poke_until_hud_back(tag='chiRanim', tail=self.L_CHI_R_TAIL)
-        # 【A 到协奏满再切】(用户明写)。满协奏离场, 达尼娅才有变奏入场 ——
-        # 而她的第一下 a4 正是变奏入场那一下
-        self.wait_con_for_intro(chisa, 'denia', poke=True,
-                                time_out=self.L_CHI_CON_WAIT,
-                                stall_give_up=self.L_CHI_CON_STALL)
-        self.quick_switch(self, read_con=True, click_during=True,
-                          time_out=self.SWITCH_THROUGH_LIB_TIME_OUT)
+        # 达 A34 —— 两段。她的连段停在 A2(上面那格留下的), 所以这两段正好是 A3 A4。
+        # 【打出来是 A1A2 就说明中间的流程太慢, 连段超时退回去了】, 不是这一格的问题
+        self.quick_switch(self)
+        self.spam_segments(self.SEG_DEN, 2, tag='denA34', interval=self.A_INTERVAL_FAST)
+
+        # 千 长按普攻 2.2 秒。用户: "这里开始暂停点按要长按, 从切到千咲开始长按时间
+        # 大概是2.2S, 记得在切人的同时就开始长按预输入"
+        self.poking = False
+        self.hold_into_switch(chisa, self.L_CHI_HOLD, tag='chiHold')
 
     def loop_seg3(self, chisa, aem):
-        """达 a4+E+Q+R1 -> 4A -> 两段强化E -> R2 -> 变奏爱。"""
-        # ---- 7 达尼娅 a4 + E + Q + R1 ----
-        # 【先把变奏入场动画点掉】—— 那一段的点击全被吞, 照点不误, 只是打不出连段;
-        # 分成两句是为了让 denA4 那个窗口量的是"A 递出去", 而不是"动画 + A"。
-        # 形状抄清达莫那条轴的 denIntroAnim + denA1(见 L_DEN_INTRO_ANIM)
-        self.macro_spam(self.L_DEN_INTRO_ANIM, self.A_INTERVAL, tag='denIntroAnim')
-        # 变奏入场之后那一下打出来就是 a4(旧轴同一结论), 所以只补一段
-        self.spam_segments(self.SEG_DEN, 1, tag='denA4', lead=self.L_DEN_A4_LEAD)
-        # 【这一格停普攻】: 下面是 E/Q/R 三个技能键连着发, 点击会把连段推起来,
-        # 反而让技能起手更晚(启动轴同一格的结论)
-        self.poking = False
-        self.spam_key(self.send_resonance_key, self.L_DEN_E_WINDOW, tag='denE', poke=False)
+        """达 E1 -> 爱 A23+E -> 达 E2 -> 千 A -> 变奏爱 A34 -> 达 Q+R2 -> 变奏爱。"""
+        # 达 E1
+        self.poking = True
+        self.quick_switch(self)
+        self.spam_key(self.send_resonance_key, self.L_DEN_E1_WINDOW, tag='denE1')
         self.record_resonance_use()
-        # E 按下要隔一点再按 Q/R, 不然小技能会被后续输入顶掉
-        self.macro_wait(self.L_DEN_E_TO_Q)
+
+        # 爱 A23 —— 两段 + E。用户: "继续持续点按普攻"
+        self.quick_switch(aem)
+        self.macro_spam(self.L_AEM_A23B_WINDOW, self.A_INTERVAL_FAST, tag='aemA23b')
+        self.spam_key(aem.send_resonance_key, self.L_AEM_E3_WINDOW, tag='aemE3')
+        aem.record_resonance_use()
+
+        # 达 E2
+        self.quick_switch(self)
+        self.spam_key(self.send_resonance_key, self.L_DEN_E2_WINDOW, tag='denE2')
+        self.record_resonance_use()
+
+        # 千 A —— 一段
+        self.quick_switch(chisa)
+        self.spam_segments(self.SEG_CHI, 1, tag='chiA', interval=self.A_INTERVAL_FAST)
+
+        # 变奏爱 A34 —— 两段(变奏入场那一下算 A1、她自己起手 A2, 我们只补 A3 A4)。
+        # 用户: "A4后撤开始切人" —— 所以只量到 A4 递出去, 后撤那段由下一句切人的
+        # click_during 盖住
+        self.poking = False
+        self.wait_con_for_intro(chisa, 'aemeath', poke=True)
+        self.quick_switch(aem, read_con=True)
+        self.poking = True
+        # 先点完变奏入场动画(这段里的 A 全被吞), 再让 A34 出去
+        self.macro_spam(self.L_AEM_INTRO_ANIM, self.A_INTERVAL_FAST, tag='aemIntroAnim')
+        self.spam_segments(self.SEG_AEM, 2, tag='aemA34',
+                           lead=self.L_AEM_A34_LEAD, interval=self.A_INTERVAL_FAST)
+
+        # 达 Q + R2
+        self.poking = False
+        self.quick_switch(self)
         self.click_echo(time_out=0)
         self.macro_mark('denQ')
         self.macro_wait(self.L_DEN_Q_TO_R)
-        # 【R1 期间恢复持续普攻】: 演出期间的点击被丢掉不花钱, 演出一结束
-        # 就有一下落进去, 后面那一大段 4A 立刻接上
-        self.poking = True
-        if self.fire_lib(self, tag='denR1'):
-            self.note_lib1()
-        self.poke_until_hud_back(tag='denR1anim', tail=self.L_DEN_R1_TAIL)
-
-        # ---- 8 4A -> 两段强化E -> R2 ----
-        # 【边打边等回路条满, 满了立刻走】—— 条没满的话下面那两发 E 打出来是普通 E
-        self.wait_forte_full(self, tag='den4A', cap=self.L_DEN_4A_WINDOW)
-        # 【协奏保底: 没到 75% 就接着打再 EE】(用户 2026-08-26)。
-        # 这一格保的是后面【爱弥斯的变奏入场】—— 她要是变奏不成立,
-        # 整段收尾爆发就打在一个没有变奏加成的身上。
-        # 【两道门是两种能量, 都要过】: 上面那道是回路条(给强化E), 这道是协奏圈
-        # (给下一个人的变奏)。两道都边打边等, 所以不是干等
-        self.wait_con_at_least(self, self.L_DEN_CON_MIN, tag='denCon',
-                               cap=self.L_DEN_CON_CAP)
-        # 【两段强化E: 连发一整个窗口, 不按次数发】(清达莫那条轴的定稿形状)。
-        # 【poke=False】: 点击会把她的连段推起来, 反而顶掉第二发 E 的起手
-        self.spam_key(self.send_resonance_key, self.L_DEN_QE_WINDOW,
-                      interval=self.L_DEN_QE_INTERVAL, tag='denForteE', poke=False)
-        self.record_resonance_use()
-        self.macro_gap(self.L_DEN_QE_TO_R, tag='denEtoR2')
-        # 【R2 没放出来就不准往下走】(用户 2026-08-27: EE 被打断、R 没好就切人了)。
-        # 【重试的间隙在输出, 不是干等】—— 见 fire_lib_persist。
-        # 【这一格丢了的代价特别大】: 后面爱弥斯的变奏入场和整段收尾爆发都建立在
-        # 达尼娅这一发 R2 上, 少了它伤害和协奏都接不上。
-        # 【达尼娅是双大招】: 记账要自己补, 否则宏一断、控制权回到原版轮换
-        # 她会拿着错状态乱放
-        if self.fire_lib_persist(self, tag='denR2'):
+        fired = self.fire_lib(self, tag='denR2')
+        if fired:
             self.note_lib2()
 
-        # ---- 9 变奏爱弥斯 —— 收尾爆发在 Aemeath.perform_denia_burst 里 ----
+        # 变奏爱 —— 收尾爆发在 Aemeath.perform_denia_burst 里。
         # 同启动轴: 演出期间切人键一直重发, 演出结束那一帧就换过去
-        self.poking = False
-        # 【增量修复】同启动轴: 先等 R2 演出结束再读协奏,
-        # 不盲 assume(实测盲切恒 ~2.8s 且 A x0, 爱吃不到延奏)
-        self.poke_until_hud_back(tag='denR2anim', time_out=12.0)
-        if not self.wait_con_for_intro(self, 'aemeath', poke=True,
-                                       time_out=6.0, stall_give_up=3.0):
-            try:
-                hud_visible = self.task.in_team()[0]
-            except Exception:
-                hud_visible = False
-            if not hud_visible:
-                self.poke_until_hud_back(tag='denR2anim2', time_out=8.0)
-                self.wait_con_for_intro(self, 'aemeath', poke=True,
-                                        time_out=6.0, stall_give_up=3.0)
         self.quick_switch(aem, assume_con=True, click_during=False,
                           time_out=self.SWITCH_THROUGH_LIB_TIME_OUT)
 

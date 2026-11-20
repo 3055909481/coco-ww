@@ -10,7 +10,7 @@
     "Kill Launcher After Start": true,
     "Create Start Menu Shortcut": true,
     "Create Desktop Shortcut": true,
-    "Enable MCP Server": false,
+    "Enable MCP Server": true,
     "Enable Blur": false,
     "Blur Algorithm": "Inpaint",
     "Blur Interval": 1

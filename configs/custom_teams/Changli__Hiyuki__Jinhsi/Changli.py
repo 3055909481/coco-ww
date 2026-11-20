@@ -22,8 +22,66 @@ F_LOG_DEBOUNCE = 1.0     # 按住不放时别刷日志
 F_TASK_NAME = 'FStartCombatTask'
 
 
-# 监视线程的实现在主程序 src/combat/AxisWatch.py (椰果版), 这里只导入
-from src.combat.AxisWatch import f_settings, start_f_watch
+# 监视线程: 椰果版用主程序 src/combat/AxisWatch.py 那份; 原版 OKWW 没有这个模块, 导入失败就用下面自带的同一份
+# (逻辑和 AxisWatch.py 一致, 写到 task 上的标记也一样, 线程按标记只起一次)
+try:
+    from src.combat.AxisWatch import f_settings, start_f_watch
+except ImportError:
+    def f_settings(task):
+        executor = getattr(task, 'executor', None)
+        for group in ('trigger_tasks', 'onetime_tasks'):
+            for other in getattr(executor, group, None) or ():
+                if type(other).__name__ == 'FStartCombatTask':
+                    try:
+                        return bool(other.enabled), float(getattr(other, 'f_start_delay', 0) or 0)
+                    except Exception:
+                        return True, 0.0
+        return True, 0.0
+
+    def start_f_watch(task, logger=None):
+        if getattr(task, '_f_watch_started', False):
+            return
+        task._f_watch_started = True
+        if not hasattr(task, '_f_last_press'):
+            task._f_last_press = -1
+
+        def watch():
+            try:
+                user32 = ctypes.windll.user32
+                user32.GetAsyncKeyState.restype = ctypes.c_short
+            except Exception as e:
+                task._f_watch_started = False
+                if logger:
+                    logger.error(f'f watch: GetAsyncKeyState unavailable ({e}), '
+                                 f'the "press F to re-arm the opener" shortcut stays off')
+                return
+            last_log = 0
+            was_down = False
+            while True:
+                try:
+                    # 只读高位: 低位读一次就清而且整个进程共享
+                    down = bool(user32.GetAsyncKeyState(0x46) & 0x8000)
+                    if down and not was_down and f_settings(task)[0]:
+                        now = time.time()
+                        if getattr(task, '_three_fire_macro_busy', False) or getattr(task, '_ww_macro_busy', False):
+                            if logger and now - last_log >= 1.0:
+                                last_log = now
+                                logger.info('physical F pressed while the macro is running '
+                                            '(manual execution) - opener NOT re-armed')
+                            was_down = down
+                            time.sleep(0.05)
+                            continue
+                        task._f_last_press = now
+                        task._f_pressed_at = now
+                        if logger and now - last_log >= 1.0:
+                            last_log = now
+                            logger.info('physical F pressed, opener re-armed')
+                    was_down = down
+                    time.sleep(0.05)
+                except Exception:
+                    return
+
+        threading.Thread(target=watch, name='ok_ww_f_watch', daemon=True).start()
 
 
 class AxisAbort(Exception):
@@ -64,7 +122,7 @@ class Changli(NativeChangli):
         21 绯雪 闪避 -> 居合                  0.65
         22 长离 征                           0.32
         23 今汐 A2                           0.74
-        24 绯雪 居合 E                       0.31
+        24 绯雪 居合 E                       0.31(作者是接 21 的连续居合; 我们到场直接闪避出刀 ~0.75, 见 G24_TRY_CONT)
         25 长离 E(打中、协奏满的那一帧就切, 离地之前)   0.14(我们 ~0.22)   满协奏离场
         26 今汐 变奏进场(QTE +10 协奏), QTE 里不点, 放人就走   1.10(我们 1.30)
         27 绯雪 变奏 A2 A3                   ~1.5
@@ -102,6 +160,10 @@ class Changli(NativeChangli):
     红字另外几处: L1-13 绯雪空中居合后补 E、L1-29 长离跳下落不按 E、L1-37 绯雪 A2A3 后先 E 再处决、
     循环2 开头红绯先放一个 E 把协奏补满再变奏长离、L3-20 绯雪不普攻直接按住 R(R 还差一点没转好, 按到它转好)。
     循环里大招图标没亮就不按(fire_r 里 round_no > 1 那道门), 其余照打。
+    循环里的协奏链(2026-11-19 矩阵实机 4 局查出来的): L1-15 长离必须带满协奏变奏今汐, 把长离协奏在这里清零;
+    没满的话长离协奏一路攒到 L1-22 大招后满, L1-23 绯雪被迫变奏(QTE 吞闪避) -> 居合少一刀 -> L1-25 没枯霜(没时停)
+    -> 凌霄撑不到 L1-30; 长离协奏在 L1-23 清零 -> L2-01 攒不满 -> L2-02 绯雪不变奏、心念不够拔不了刀 -> 循环2 全散。
+    L1-27 今汐 R 能量差一截时(没有 3.4s 时停)把凌霄第四段提前到 L1-27, L1-30 直接龙喷。
 
     ================= 这条轴的几个关键规则 =================
     - 【普攻段数跨切人保留】: 视频里"今汐A4""绯雪A3"都是上一次在场那条连段接着打。
@@ -335,9 +397,14 @@ class Changli(NativeChangli):
     # 21 看到出刀后, 从最后一下点击算至少留这么久再切长离。24 那刀"到场就出"的连续居合成不成, 35 局实机只跟这个有关:
     # 最后一下点击到切人键 0.03s 的 5 局成 1 局, 0.06s 的 19 局成 7 局, 0.09~0.10s 的 12 局成 10 局。
     # 接不上就得闪避重进架势补刀(+0.9s), 长离 25 那格也跟着变样(见 G25_CD_COVERS 上面)
-    G21_STAY_AFTER_CLICK = 0.14
+    # 2026-11-19 矩阵实机 4 局(v1.3.1): 停 0.14 之后 24 连续居合 4/4 都没接上, 白试 0.40s 再补刀,
+    # 24 整格 1.27s(作者 0.31), 28 的凌霄跟着超时(`28距17E2` 10.33~10.40, 4/4 `28今汐E4_NOHUDGONE`)。
+    # 24 改成到场直接闪避补刀(G24_TRY_CONT), 21 也就不用多站了
+    G21_STAY_AFTER_CLICK = 0.0
     G22_CL_ZHENG = 0.28
     G23_JX_A2 = 0.62             # 0.70 时 24 格离 21 那刀 1.3s, 连续居合接不上
+    # 24 先试连续居合(不闪避)。关掉 = 到场直接闪避进架势出刀: 慢作者 ~0.4s, 但不会白试 0.4s 再补(省 ~0.5s 给 28 的凌霄)
+    G24_TRY_CONT = False
     G24_CONT_CAP = 0.36          # 作者到场 0.23s 扣层
     G24_SEE = 0.12
     G24_HY_E = 0.08
@@ -515,6 +582,16 @@ class Changli(NativeChangli):
     # 2026-11-13 照作者完整文字轴新写, 全部没实机。能复用启动轴常量的格子直接用 Gxx_, 这里只放循环独有的。
     # 文字轴只有循环1 前 17 格在正常速度视频里有画面, 其余时长是按帧表和启动轴同类动作估的。
     LP_CON_CAP = 0.50            # 写着"变奏X"的切人: 等协奏读满的上限, 到了没满也切
+    # L1-15 长离 征 -> 变奏今汐: 这一下长离必须带满协奏走(在这里把协奏清零)。
+    # 2026-11-19 矩阵实机 4 局都只有 0.87~0.94(不点干等 0.50s) -> 没变奏、长离协奏留着一路攒,
+    # L1-22 大招后满了, L1-23 切绯雪被迫变奏(QTE 吞掉闪避, 居合没出) -> L1-25 淬寒不够没枯霜(没时停)
+    # -> 凌霄撑不到 L1-30 龙喷; 长离协奏在 L1-23 清零, L2-01 冲+E 只到 0.62~0.69 -> L2-02 绯雪没变奏拔不了刀。
+    # 唯一 L1-23 没变奏的那局(115111) L1-30 龙喷、L2-01 协奏都对。所以这里边点边等满
+    LP_CL_CON_CAP = 1.20
+    # 绯雪带变奏进来(QTE 前 ~1.0s 不响应输入)又要"闪避进架势"的格子: 先空等这么久再闪避, 不然闪避被吞、居合不出
+    LP_HY_QTE_IDLE = 0.90
+    # L2-01 长离 冲 + E 之后协奏还没满: 再边点边等这么久(都没满就普通切, L2-02 走补心念)
+    LP_CL_E_CON_POKE = 0.60
     LP_F_WAIT = 0.35             # 处决提示最多等这么久(提示出不出看当局谐度), 等的时候不点
     LP_F_TO_HOLD = 0.20          # 长离按 F 之后多久按住左键预输入焚身以火
     # ---- 长离 ----
@@ -1411,7 +1488,11 @@ class Changli(NativeChangli):
         if not ok:
             self.task.next_frame()
             if not self.task.in_team()[0]:
-                self.wait_hud_back(tag=f'>{target.name[:3]}等HUD', time_out=self.E4_ANIM_TIME_OUT)
+                if not self.wait_hud_back(tag=f'>{target.name[:3]}等HUD', time_out=self.E4_ANIM_TIME_OUT):
+                    # 切人超时 + 再等 5s HUD 还不在: 不是演出, 是结算/脱战界面。
+                    # 11-19 矩阵实机 Boss 184.6s 打完, 轴又在结算界面里按了 50 秒键(R、普攻、切人)才凑够 3 次失败
+                    raise AxisAbort(f'HUD gone for {self.SWITCH_TIME_OUT + self.E4_ANIM_TIME_OUT:.1f}s '
+                                    f'while switching to {target.name} (result screen / out of combat?)')
                 ok = self.quick_switch(target, **kwargs)
         return self.note_switch(ok, target.name)
 
@@ -1900,7 +1981,7 @@ class Changli(NativeChangli):
         # 24 绯雪 居合 E
         # 这一刀是接 21 那刀的连续居合: 作者到场 0.13~0.2s 就扣(不用闪避)。接不上就闪避重进架势补这一刀 ——
         # 少这一刀, 30 格那刀就没有武霜了(21/24/30 三刀各用一点武霜, 攒满 3 层淬寒)
-        if not self.iai_until_drop(self.G24_CONT_CAP, tag='24绯雪连续居合', see=self.G24_SEE):
+        if not (self.G24_TRY_CONT and self.iai_until_drop(self.G24_CONT_CAP, tag='24绯雪连续居合', see=self.G24_SEE)):
             self.dodge('24绯雪闪避')
             self.macro_wait(self.DODGE_TO_KENDO)
             self.iai_until_drop(self.IAI_CAP, tag='24绯雪补居合')
@@ -2563,8 +2644,14 @@ class Changli(NativeChangli):
 
     def lp_hy_iai(self, tag, dodge=True):
         """绯雪 [闪避进架势 ->] 居合一刀。有武霜看深蓝圆牌少一个, 没武霜(只剩发白的)按时刻。
-        闪避只按一下: 连按两下第二下会退出架势, 后面点的就成普攻了。"""
+        闪避只按一下: 连按两下第二下会退出架势, 后面点的就成普攻了。
+        刚带变奏进来(切人时读到前一个人协奏满)就先等过 QTE 再闪避, 否则闪避被 QTE 吞掉、架势没进去。"""
         if dodge:
+            hy = self.cur
+            arrive = getattr(hy, 'last_switch_in_time', 0.0) or 0.0
+            if getattr(hy, 'has_intro', False) and time.time() - arrive < self.LP_HY_QTE_IDLE:
+                self.macro_mark(f'{tag}变奏进场_等QTE')
+                self.wait_until_since(arrive, self.LP_HY_QTE_IDLE)
             self.dodge(f'{tag}闪避')
             self.macro_wait(self.DODGE_TO_KENDO)
         return self.iai_until_drop(self.IAI_CAP, tag=f'{tag}居合')
@@ -2575,8 +2662,9 @@ class Changli(NativeChangli):
         self.lp_hy_iai(f'{tag}2')
 
     def lp_hy_iai_cont(self, tag):
-        """上场接上一刀的连续居合(不闪避), 接不上就闪避重进架势补。和启动轴 24 格同一段, 只用在还有武霜的时候。"""
-        if not self.iai_until_drop(self.G24_CONT_CAP, tag=f'{tag}连续居合', see=self.G24_SEE):
+        """上场接上一刀的连续居合(不闪避), 接不上就闪避重进架势补。和启动轴 24 格同一段, 只用在还有武霜的时候。
+        G24_TRY_CONT 关着(11-19 矩阵实机 L1-25 4/4、L2-19 1/1 都没接上)就直接闪避出刀。"""
+        if not (self.G24_TRY_CONT and self.iai_until_drop(self.G24_CONT_CAP, tag=f'{tag}连续居合', see=self.G24_SEE)):
             self.lp_hy_iai(f'{tag}补', dodge=True)
 
     def lp_hy_kushuang(self, tag):
@@ -2663,9 +2751,9 @@ class Changli(NativeChangli):
         # L1-14 今汐 凌霄 A4(出手后 E 变惊龙破空, L1-16 才按)
         self.lp_jx_tap('L1-14今汐凌霄A4')
         self.sw(self)
-        # L1-15 长离 征 -> 协奏满变奏今汐
+        # L1-15 长离 征 -> 协奏满变奏今汐(没满就边点边等, 见 LP_CL_CON_CAP)
         self.lp_cl_zheng('L1-15长离征')
-        self.lp_intro(self, jx, tag='L1-15长离协奏')
+        self.lp_intro(self, jx, tag='L1-15长离协奏', cap=self.LP_CL_CON_CAP, poke=True)
         # L1-16 今汐 变奏 -> 龙喷 -> (同奏)变奏长离
         self.lp_jx_longpen(jx, 'L1-16今汐')
         self.sw(self, read_con=True)
@@ -2684,8 +2772,8 @@ class Changli(NativeChangli):
         # L1-21 今汐 A4(第四段, 给 5s 神霓飞芒)
         self.macro_spam(self.G15_JX_A4, self.G15_CLICK, tag='L1-21今汐A4')
         self.sw(self)
-        # L1-22 长离 R -> 焚身以火
-        self.cl_r_fenshen(hy, tag='L1-22长离')
+        # L1-22 长离 R -> 焚身以火。读协奏: 大招后长离协奏满了的话绯雪是变奏进场, L1-23 要先等过 QTE 再闪避
+        self.cl_r_fenshen(hy, tag='L1-22长离', read_con=True)
         # L1-23 绯雪 闪避 -> 居合
         self.lp_hy_iai('L1-23绯雪')
         self.sw(jx)
@@ -2703,8 +2791,15 @@ class Changli(NativeChangli):
         self.sw(jx)
         # L1-27 今汐 凌霄 A3 -> R -> E3 逐天取月 -> 协奏满变奏绯雪
         self.lp_jx_tap('L1-27今汐凌霄A3')
-        self.lp_jx_r(jx, 'L1-27今汐')
+        r_ok = self.lp_jx_r(jx, 'L1-27今汐')
         self.lp_jx_e3(jx, 'L1-27今汐E3')
+        # R 没转好(11-19 矩阵实机 4/4: 冷却好了、能量差一截, 图标外圈只到 ~80%)就没有大招那 3.4s 时停,
+        # L1-24 进的凌霄撑不到 L1-30(114830 局 L1-30 到场凌霄已经没了, E 是普通 E)。
+        # 这时把凌霄第四段挪到这里打: 出手 E 就变惊龙破空(不带逐天取月的冷却), 游龙廻光 5s 够撑到 L1-30
+        self.l127_a4 = False
+        if not r_ok:
+            self.l127_a4 = self.jx_a4_until_jinglong(jx, self.G28_A4_CAP, self.G28_A4_CAP,
+                                                     tag='L1-27今汐R没放_凌霄A4提前')
         self.lp_intro(jx, hy, tag='L1-27今汐协奏')
         # L1-28 绯雪 变奏 A2 A3
         self.macro_spam(self.G11_HY_INTRO_A2A3, tag='L1-28绯雪变奏A2A3')
@@ -2712,8 +2807,8 @@ class Changli(NativeChangli):
         # L1-29 长离 跳(冲) -> 下落(不按 E)
         self.lp_cl_jump_plunge('L1-29长离')
         self.sw(jx)
-        # L1-30 今汐 凌霄 A4 -> 龙喷
-        self.lp_jx_longpen(jx, 'L1-30今汐', a4=True)
+        # L1-30 今汐 凌霄 A4 -> 龙喷(L1-27 已经把第四段打了就直接按)
+        self.lp_jx_longpen(jx, 'L1-30今汐', a4=not getattr(self, 'l127_a4', False))
         self.sw(hy, read_con=True)
         # L1-31 绯雪 A4 A5
         self.macro_spam(self.G14_HY_A4A5, tag='L1-31绯雪A4A5')
@@ -2757,6 +2852,11 @@ class Changli(NativeChangli):
         e_at = time.time()
         self.lp_cl_e('L2-01长离E')
         full = self.cl_wait_e_hit(e_at, self.LP_CL_E_CON_CAP, tag='L2-01长离协奏')
+        if not full:
+            # 没满绯雪就是普通进场, 红绯 E 刚在上面用掉(冷却 ~20s), L2-02 心念凑不满 300、拔不了刀,
+            # 循环2 后面全散(11-19 矩阵实机 3/4 局 `L2-02绯雪R_NOFIRE`)。多点几下补
+            full = self.wait_con_at_least(self, self.CON_FULL_LEVEL, tag='L2-01长离补协奏',
+                                          cap=self.LP_CL_E_CON_POKE, poke=True)
         self.sw(hy, assume_con=full)
         # L2-02 绯雪(红) 变奏 A3 -> 闪避 -> 重击 -> R 拔刀 -> E
         self.lp_hy_red_burst(hy, 'L2-02绯雪')

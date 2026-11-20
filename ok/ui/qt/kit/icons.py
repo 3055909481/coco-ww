@@ -54,6 +54,7 @@ _PATHS = {
              '<circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
     "calendar": '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
     "code": '<path d="M8 7l-5 5 5 5M16 7l5 5-5 5"/>',
+    "home": '<path d="M3.5 11L12 4l8.5 7"/><path d="M5.5 9.5V20h4.5v-5.5h4V20h4.5V9.5"/>',
     "users": '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.4 3.4-5 6.5-5s5.7 1.6 6.5 5M16 4.5a3.5 3.5 '
              '0 0 1 0 7M18 15c2 .6 3.2 2.3 3.5 5"/>',
     "gamepad": '<rect x="2" y="7" width="20" height="11" rx="5"/><path d="M7 11v3M5.5 12.5h3M15.5 12h.01M18 14h.01"/>',

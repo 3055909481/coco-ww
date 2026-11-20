@@ -3,5 +3,6 @@
   "description": "露丽卜（露西/丽贝卡/卜灵）\n持宏：露西。露西、丽贝卡的流程同露丽维；卜灵照柯折卜：4a -> E -> a -> 长按重击(两段) -> Q -> R -> 打满协奏变奏丽贝卡\n处决：露西强化E后、回路重击打完后由宏按，其余手动",
   "author": "楽山",
   "version": "1.0.0",
-  "team": "Buling, Lucy, Rebecca"
+  "team": "Buling, Lucy, Rebecca",
+  "code_mode": "import"
 }

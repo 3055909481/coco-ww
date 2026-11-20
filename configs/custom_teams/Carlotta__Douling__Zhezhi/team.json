@@ -3,5 +3,6 @@
   "description": "柯折卜 —— 视频轴的「启动轴 + 循环轴」: 折枝(E+处决) → 卜灵(4a,E,a,长按重击x2,声骸,大招) → 折枝(E,预输入重击,重击,大招,3e,声骸) → 珂莱塔(双e,2a,强化重击,大招+4下死兆,双e,声骸) → 回折枝。卜灵靠艮震/震震两段重击凑阴阳相生, 大招给 24 秒开阵, 后面两次变奏把 +10%+15% 喂给珂莱塔。",
   "author": "",
   "version": "1.0",
-  "team": "Buling, Carlotta, Zhezhi"
+  "team": "Buling, Carlotta, Zhezhi",
+  "code_mode": "import"
 }

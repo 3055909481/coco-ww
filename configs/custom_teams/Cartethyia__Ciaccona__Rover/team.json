@@ -3,5 +3,6 @@
   "description": "卡夏风 —— 视频轴(双下落 4R): 卡提 4 次 R、2 次下落攻击, 风主/夏空各一发大招",
   "author": "",
   "version": "1.0",
-  "team": "Cartethyia, Ciaccona, Rover"
+  "team": "Cartethyia, Ciaccona, Rover",
+  "code_mode": "import"
 }

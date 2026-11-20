@@ -38,6 +38,7 @@ from ok.ui.qt.kit.theme import set_style_property
 from ok.ui.qt.shell.lazy_page import LazyPage
 from ok.ui.qt.shell.nav_icons import nav_icon
 from ok.ui.qt.shell.run_bar import RunBar
+from ok.ui.qt.shell.top_nav import TopNav
 from ok.ui.qt.util.Alert import alert_error
 from ok.ui.qt.util.pyappify_startup import display_version, get_startup_version_change
 from ok.util.GlobalConfig import basic_options, KILL_LAUNCHER_AFTER_START, NOTIFICATION_OPTION_NAME
@@ -133,6 +134,16 @@ class MainWindow(KitWindow):
         body.setSpacing(0)
         body.addWidget(self.run_bar)
         body.addLayout(pages, 1)
+
+        # 'top_nav' in the app config: page tabs in the title bar, no sidebar (see shell/top_nav.py).
+        self.top_nav = None
+        if top_nav_spec := config.get('top_nav'):
+            self.top_nav = TopNav(top_nav_spec, self)
+            self.top_nav.current_changed.connect(lambda key: self.switch_to(self._pages[key]))
+            self.navigation.hide()
+            bar_layout = self.title_bar.layout()
+            bar_layout.insertWidget(bar_layout.indexOf(self.title_bar.badge_label) + 1, self.top_nav.tabs_bar)
+            bar_layout.insertWidget(bar_layout.indexOf(self.title_bar.minimize_button), self.top_nav.right_bar)
         # Keep tips flush with the bottom edge of the title bar.
         set_toast_anchor(self, self.title_bar, gap=0)
 
@@ -152,7 +163,9 @@ class MainWindow(KitWindow):
                     before_custom_tabs.append(tab_obj)
 
         for tab_obj in before_custom_tabs:
-            self.add_page(tab_obj, tab_obj.icon, self.app.tr(tab_obj.name), SECTION_GAME)
+            # A custom tab may ask for another sidebar section, e.g. a home page at the top of Run.
+            section = getattr(tab_obj, 'nav_section', None) or SECTION_GAME
+            self.add_page(tab_obj, tab_obj.icon, self.app.tr(tab_obj.name), section)
 
         from ok import og
         self.imported_tabs = {}  # {file_name: tab_object}
@@ -168,7 +181,8 @@ class MainWindow(KitWindow):
             self.tasks_page = None
 
         for tab_obj in after_custom_tabs:
-            self.add_page(tab_obj, tab_obj.icon, self.app.tr(tab_obj.name), SECTION_GAME)
+            section = getattr(tab_obj, 'nav_section', None) or SECTION_GAME
+            self.add_page(tab_obj, tab_obj.icon, self.app.tr(tab_obj.name), section)
 
         if og.task_manager.has_custom:
             from ok.ui.qt.tasks.EditTaskTab import EditTaskTab
@@ -250,7 +264,13 @@ class MainWindow(KitWindow):
         version = display_version(version, pyappify)
         self.setWindowTitle(f'{title} {version} {profile} {dev if debug else ""}')
         self.title_bar.set_title(title)
-        self.title_bar.set_badge(" ".join(part for part in (version, profile, dev if debug else "") if part))
+        badge = " ".join(part for part in (version, profile, dev if debug else "") if part)
+        if self.top_nav is not None:
+            # The tabs need the room; the version stays in the tooltip and on the About page.
+            self.title_bar.set_badge("")
+            self.title_bar.title_label.setToolTip(badge)
+        else:
+            self.title_bar.set_badge(badge)
 
         start_page = self.startup_task_tab() or self.stack.widget(0)
         if start_page is not None:
@@ -293,6 +313,8 @@ class MainWindow(KitWindow):
         self._pages[key] = widget
         self.stack.addWidget(widget)
         self.navigation.add_item(key, text, nav_icon(icon), section, bottom=bottom)
+        if self.top_nav is not None:
+            self.top_nav.add_page(key, widget, text, nav_icon(icon), section, bottom=bottom)
         return key
 
     def remove_page(self, widget):
@@ -300,6 +322,8 @@ class MainWindow(KitWindow):
         if self._pages.get(key) is widget:
             del self._pages[key]
             self.navigation.remove_item(key)
+            if self.top_nav is not None:
+                self.top_nav.remove_page(key)
         self.stack.removeWidget(widget)
 
     def switch_to(self, widget):
@@ -310,6 +334,10 @@ class MainWindow(KitWindow):
             widget.page()
         self.stack.setCurrentWidget(widget)
         self.navigation.set_current(widget.objectName())
+        if self.top_nav is not None:
+            self.top_nav.set_current(widget.objectName())
+        # A page with its own connection chip and start buttons (the home page) hides the run bar.
+        self.run_bar.setVisible(getattr(widget, 'show_run_bar', True) is not False)
         if defer_build:
             # Building blocks the event loop, so let the selection highlight land first.
             QTimer.singleShot(NAV_INDICATOR_DURATION + 20, lambda: self._build_lazy_page(widget))
@@ -325,6 +353,17 @@ class MainWindow(KitWindow):
 
     def _set_about_update_available(self, available):
         self.navigation.set_badge(self.about_tab.objectName(), bool(available))
+        if self.top_nav is not None:
+            self.top_nav.set_badge(self.about_tab.objectName(), bool(available))
+
+    def open_connection_popover(self, anchor=None):
+        """Connection settings (game window, capture, input) under ``anchor``.
+
+        With the run bar hidden, the current page's ``connection_anchor`` is used.
+        """
+        if anchor is None and not self.run_bar.isVisible():
+            anchor = getattr(self.current_page(), 'connection_anchor', None)
+        self.run_bar.open_popover(anchor)
 
     def _game_starting_or_started(self):
         from ok import og
@@ -685,7 +724,7 @@ class MainWindow(KitWindow):
         # The run bar shows launch progress; failures open the connection settings.
         if error:
             alert_error(error, True)
-            self.run_bar.open_popover()
+            self.open_connection_popover()
 
     def config_validation(self, message):
         title = self.tr('Error')
@@ -714,7 +753,7 @@ class MainWindow(KitWindow):
     def navigate_tab(self, index):
         logger.debug(f'navigate_tab {index}')
         if index == "start":
-            self.run_bar.open_popover()
+            self.open_connection_popover()
         elif index in ("onetime", "trigger") and self.tasks_page is not None:
             self.switch_to(self.tasks_page)
             self.tasks_page.set_filter(index)
@@ -728,7 +767,10 @@ class MainWindow(KitWindow):
             self.switch_to(self.about_tab)
 
     def startup_task_tab(self):
-        """Return the Tasks page, falling back to imported plugin pages."""
+        """Return a custom page marked ``startup_page``, else the Tasks page, else imported plugin pages."""
+        for page in self._pages.values():
+            if getattr(page, 'startup_page', False) is True:
+                return page
         if self.tasks_page is not None:
             return self.tasks_page
         if self.imported_tabs:

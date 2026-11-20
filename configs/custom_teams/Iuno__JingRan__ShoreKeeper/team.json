@@ -3,5 +3,6 @@
   "description": "景月守 25 秒轮椅轴（视频：长风ei「景月守-25秒轮椅轴」）\n持宏：景燃。启动轴 守R-3A-E-2A重击闪-3A重击Q -> 尤诺 -> 景燃；循环轴每圈从守岸人变奏入场开始\n景燃大招后全程按住左键，只点 E / 闪避断A4 / 处决\n尤诺首位声骸按海之女（尤诺E之后放Q）；带无常凶鹭(轻云出月)改 JingRan.py 的 IU_QINGYUN = True（循环轴守岸人E后切尤诺点Q）",
   "author": "楽山",
   "version": "1.0.0",
-  "team": "Iuno, JingRan, Shorekeeper"
+  "team": "Iuno, JingRan, Shorekeeper",
+  "code_mode": "import"
 }

@@ -17,8 +17,34 @@ LOCK_THRESHOLD = 0.70
 ENABLE_POLL_INTERVAL = 0.2
 
 
-# 监视线程的实现在主程序 src/combat/AxisWatch.py (椰果版), 这里只导入
-from src.combat.AxisWatch import start_enable_watch
+# 监视线程: 椰果版用主程序 src/combat/AxisWatch.py 那份; 原版 OKWW 没有这个模块, 导入失败就用下面自带的同一份
+# (逻辑和 AxisWatch.py 一致, 写到 task 上的标记也一样, 线程按标记只起一次)
+try:
+    from src.combat.AxisWatch import start_enable_watch
+except ImportError:
+    import ctypes
+    def start_enable_watch(task, logger=None):
+        if getattr(task, '_ww_enable_watch_started', False):
+            return
+        task._ww_enable_watch_started = True
+        if not hasattr(task, '_ww_task_restarted_at'):
+            task._ww_task_restarted_at = -1
+
+        def watch():
+            was_on = None
+            while True:
+                try:
+                    now_on = bool(getattr(task, 'enabled', False))
+                    if was_on is False and now_on:
+                        task._ww_task_restarted_at = time.time()
+                        if logger:
+                            logger.info('auto combat re-enabled -> opener re-armed')
+                    was_on = now_on
+                    time.sleep(0.2)
+                except Exception:
+                    return
+
+        threading.Thread(target=watch, name='ok_ww_enable_watch', daemon=True).start()
 
 
 class Hiyuki(BaseChar):

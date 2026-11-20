@@ -17,13 +17,6 @@ class Aemeath(BaseChar):
     # 能量/E 永远不到就永远出不来
     CYCLE_READY_TIME_OUT = 6.0
     CYCLE_LIB1_TIME_OUT = 6.0
-    # 【R1 之前等能量满的上限】(用户 2026-10-02: "正常流程那里 R1 能量应该满,
-    # 如果不满应该 A 到满放 R1 再继续 R1 流程才对")。
-    # 【等的期间一直在点普攻, 不是干等】—— 跟原来 fire_lib_fast 白按 6 秒的
-    # 区别就在这里: 大招能量本来就是靠打攒的, 站着按 R 一点也攒不到。
-    # 【到上限还没满就照常往下按】: 怪死了/读不到能量环的轮次要能走掉,
-    # 不能把整条轴卡死
-    DENIA_BURST_R1_WAIT = 8.0
     CYCLE_E2_TIME_OUT = 8.0
     CYCLE_LIB2_TIME_OUT = 8.0
     R2_KEY_INTERVAL = 0.05      # 重击之后连按 R 的间隔
@@ -326,152 +319,26 @@ class Aemeath(BaseChar):
         self.logger.info(f'opener burst timeline: {macro.macro_timeline(mark0)}')
         return lib2
 
-    # ==================== 爱弥斯的官方帧数据 (2026-08-27) ====================
-    # 来源: 用户给的《鸣潮动作数据汇总.xlsx》→ sheet「角色-女」r2933~r3120。
-    # 【60fps, 帧 / 60 = 秒】。这份表是【下面所有窗口的事实依据】—— 再调数之前
-    # 先来这里对一眼, 别再从实机瞎二分。
-    #
-    # ---- 人形态 ----
-    #   QTE(变奏入场)  无敌 60F | 第48F 触发上一角色延奏 | QTE-1 命中 52F(0.87s)
-    #                  QTE-3 派生 58F(0.97s) 动作结束 80F(1.33s)
-    #                  ==> 【变奏入场后约 0.97 秒才接得上下一个动作】,
-    #                      跟旧轴实机量的"1.23 秒不放行"对得上(那是含读屏延迟的)
-    #   大招1(R1)      隐藏HUD 260F(4.33s) | 派生 262F(4.37s) | 动作结束 320F(5.33s)
-    #   大招2(R2)      隐藏HUD 338F(5.63s) | 动作结束 344F(5.73s)
-    #                  ==> 实机 R2anim 量到 5.09~5.13s, 对得上; QUIET_ANIM_TIME_OUT=8.0 够用
-    #                  ==> 【第1F 切换至爱弥斯】—— 这一条【证实了 mecha_e=False 是对的】:
-    #                      R2 自己就把她变回人形态, 演出里再敲 E 才会变成机甲
-    #   强化E(降临)    无敌/隐藏HUD 180F(3.0s) | 聚爆模态 动作结束 258F(4.3s)
-    #   处决(谐度破坏)  无敌 90F | 动作结束 100F(1.67s)
-    #                  ==> 【实际只要 1.67 秒】, 而框架的 f_break() 会阻塞到 5 秒 ——
-    #                      这就是它放在连点窗口里会把整段 A 吃掉的原因(见 DENIA_BURST_F_IN_A)
-    #
-    # ---- 机兵(机甲)形态 ----
-    #   A3 链  A3-1 起手 1F(地转空) -> A3-4 派生 52F(0.87s) 结束 80F(1.33s)
-    #   A4 链  A4-1 38F -> A4-2 71F 派生 60F 结束 90F(1.5s)
-    #          ==> 变奏入场(0.97) + 机A3(0.87) + 机A4(~1.0) ≈ 2.85s,
-    #              而 L_AEM_BURST_A_WINDOW 的下界给的是 2.30 —— 【这个下界本身是够的】,
-    #              因为后面还有"等强化E亮"那道门在兜, 见下一条
-    #   强化重击  动作结束 47F(0.78s); 蓄力一段派生 40F(0.67s)
-    #          ==> 轴上那个"机甲快速重击"就是它: 按住约 0.67 秒自动跳强化重击
-    #   强化E(登台)  隐藏HUD 144F(2.4s) —— 【第1F 切换至爱弥斯】
-    #
-    # ---- 资源规则 (表里"特殊能量"那一格, 【这几条解释了收尾为什么会塌】) ----
-    #   同步率  上限200; A/空中攻击/E2 命中获得; QTE +40, 大招1 +30, 强化E -100,
-    #           【速蓄状态下施放强化重击 +200】; 大招2 清空
-    #   共鸣率  上限4; 强化E +1, 大招1 +1; 大招2 清空
-    #   强化E解锁前置  【施放A4获得, 只持续5秒】; 前置期间同步率>=100 才解锁强化E
-    #           ==> 【"等强化E亮"这道门是有依据的】: 强化E 亮 ⇔ A4 真的打出去了 + 同步率够。
-    #               而且【超过5秒就要重新打一次A4】—— 所以补救那一段必须继续走完整连段
-    #               (我们本来就是连点, 会自然循环回 A4), 不能改成干等
-    #   大招2解锁前置  施放大招1后获得, 持续60秒; 【同步率和共鸣率都到上限才解锁大招2】
-    #           ==> 【E2heavy(miss) 为什么会连锁到 R2 放不出来】: 强化重击那 +200 同步率
-    #               没吃到, 同步率就到不了上限, 大招2 根本没解锁 —— 所以
-    #               `E2heavy(miss)` 后面必然跟着 `R2_FAIL`。修的是重击, 不是 R2
-
     # ---- 爱达千的收尾爆发 ----
-    # 两段收尾只有【前缀】不同, 后面是同一串:
-    #   启动轴:   变奏入场 -> Q ---------------> ┐
-    #   循环轴:   变奏入场 -> Q + 机甲a3a4 ----> ┤ (处决) -> R1 -> 强化E -> F处决
-    #                                            └-> A到强化E再亮 -> 强化E -> 蓄力重击 -> R2
-    #
-    # 【2026-08-25: 最后那一步"R2 演出期间连发 E 变机甲"现在是可选的】。
-    # 旧循环轴的第一个动作是"爱弥斯 E 变机甲", 所以那一发必须在 R2 的演出里
-    # 预输入; 【新循环轴不是】—— 她放完 R2 直接变奏千咲, 变机甲的 E 挪到了
-    # 循环轴中段(她 a2a3 之后)。带着机甲形态进新循环轴的话, 那一格
-    # a2a3 打出来是机甲连段、E 也没得放, 整轮形态从这里就错位。
-    # 所以两个调用点都传 mecha_e=False; 想跑回旧循环轴就把它改回 True。
+    # 两段收尾只有【前缀】不同, 后面是同一串(用户 2026-08-16 给的轴):
+    #   启动轴: 变奏入场 -> Q ------------> ┐
+    #   循环轴: 变奏入场 -> A到A3 --------> ┤ R1 -> 强化E -> F处决
+    #                                       └-> A到强化E再亮 -> 强化E -> 蓄力重击 -> R2
+    # 收尾的最后一步是【R2 演出期间连发 E】—— 演出一结束就变机甲, 那一下就是
+    # 循环轴的第一个动作("爱E"), 也是两条轴的接口。跟爱琳莫那条轴同一个形状
     DENIA_BURST_A_INTERVAL = 0.12
-    # 【处决不再有自己的窗口】(用户 2026-08-26: "可能被打断也可能没有处决,
-    # 总之一直A就行, 有处决就放没有就算了, 后面有了后面再放, 不要有停顿")。
-    # 改成在每一段连点里每隔这么久顺路问一次 —— 见 spam_a_probe_f / spin_until。
-    # 【0.35 是读屏的节流】: f_break() 提示没亮时会做一次找图, 太密就是在
-    # 连点流里插读屏; 太稀又会错过刚亮起的那一小段
-    DENIA_BURST_F_PROBE = 0.35
-    # 【机甲a3a4 那一格【不】问处决】(用户 2026-08-27: "爱弥斯在错误的时机按了
-    # F处决"; 同一条反馈里还说 "A34接R1那里有时候A会被打断" —— 那是同一件事)。
-    # 实机: `burstA3_start@29.71 burstF(hit)@33.27 burstA3_end(x1,F)@33.39` ——
-    # 【f_break() 一旦命中会自己阻塞 3~5 秒并接管左键】(见 CombatCheck.f_break:
-    # 循环里 send_key('f') + click(), 最长 5 秒), 于是 3.68 秒的窗口里
-    # 我们自己只点出【1 下】, 整段 a3a4 被它吃光。
-    # 【轴图上处决确实画在这一格】, 但那是人手打的时候顺手按的; 宏这边
-    # f_break 的阻塞代价太大, 放在这里等于拿整段 a3a4 换一次处决。
-    # 处决现在只留两处: spam_e_then_f 的 F 连发(落在第一个强化E的动画里,
-    # 那是原来就调好的位置)、以及 "A到强化E再亮" 那一大段的顺路问
-    DENIA_BURST_F_IN_A = False
-    # 【机甲a3a4 之后要等强化E亮起再开 R1】(用户 2026-08-27: "A到位了强化E会亮起,
-    # 如果没亮起要继续A, 亮了再R1")。
-    # a_window 是【下界】(轴上那两段 a3a4 的量), 打满之后要是还没亮就接着打,
-    # 到这个上限为止。
-    # 【为什么要下界不是纯条件】: 判"某状态出现"之前要先确认它消失过, 而这一格
-    # 拿不到那个信号 —— 她变奏进场那一刻回路条可能本来就是满的, 纯条件会让
-    # a3a4 一下都不打就直接 R1
-    DENIA_BURST_A_CAP = 5.0
 
-    def spam_a_probe_f(self, macro, window, tag='burstA', interval=None,
-                       until=None, cap=None, probe_f=False):
-        """连点。window 是【下界】; 给了 until 就接着打到它成立(或到 cap)。
-
-        Args:
-            until: 打满 window 之后的退出条件(这里是"强化E亮了")。
-                【下界不能省】: 判"某状态出现"之前要先确认它消失过, 而这一格拿不到
-                那个信号 —— 条件一进来就成立的话, 该打的那几段一下都不会打。
-            probe_f: 顺路问处决。【默认关】, 见 DENIA_BURST_F_IN_A ——
-                f_break() 命中之后自己会阻塞 3~5 秒并接管左键, 放在"那几下 A
-                必须落下去"的窗口里等于拿整段 A 换一次处决。
-        """
-        interval = self.DENIA_BURST_A_INTERVAL if interval is None else interval
-        cap = window if cap is None else max(cap, window)
-        start = time.time()
-        n = 0
-        fired = False
-        lit = False
-        next_f = 0.0
-        macro.macro_mark(f'{tag}_start')
-        while True:
-            waited = time.time() - start
-            if waited >= cap:
-                break
-            if waited >= window:
-                if until is None:
-                    break
-                try:
-                    if until():
-                        lit = True
-                        break
-                except Exception:
-                    break
-            self.click()
-            n += 1
-            now = time.time()
-            if probe_f and not fired and now >= next_f:
-                next_f = now + self.DENIA_BURST_F_PROBE
-                if self.f_break():
-                    fired = True
-                    macro.macro_mark('burstF(hit)')
-            self.sleep(interval, check_combat=False)
-        tail = ''
-        if fired:
-            tail += ',F'
-        if until is not None:
-            tail += ',E2lit' if lit else ',E2CAP'
-        macro.macro_mark(f'{tag}_end(x{n}{tail},{time.time() - start:.2f}s)')
-        return fired
-
-    def perform_denia_burst(self, macro, echo=True, a_window=0.0, mecha_e=True):
+    def perform_denia_burst(self, macro, echo=True, a_window=0.0):
         """爱达千的收尾爆发。
 
         Args:
             echo: 开头放不放声骸 Q。启动轴的轴上写了 Q(变奏爱q r1...), 循环轴没有。
-            a_window: 开 R1 之前先连点多久。新循环轴要"机甲a3a4"(连点窗口里
-                有一大半是变奏入场动画, 见 Denia.L_AEM_BURST_A_WINDOW),
-                启动轴是 0(变奏入场之后直接 Q + R1)。
-                【必须是连点窗口不是数点击数】: 变奏入场的演出 0.9~1.2 秒期间
-                点击全丢, 固定 stride 猜错一次这几段就整个没了。
-            mecha_e: R2 的演出里要不要连发 E 变机甲。见 DENIA_BURST_A_INTERVAL
-                上面那段 —— 【新循环轴要 False】。
+            a_window: 开 R1 之前先连点多久。循环轴要"A到A3", 启动轴是 0(变奏入场
+                之后直接 Q + R1)。
+                【必须是连点窗口不是数点击数】: 变奏入场的演出 0.9 秒期间点击全丢,
+                固定 stride 猜错一次这几段就整个没了。
 
-        Returns: R2 有没有放出去。
+        Returns: R2 有没有放出去(False 说明这一轮的循环轴接不上机甲)。
         """
         if macro is None:
             self.logger.warning('denia burst: no macro engine, falling back to perform_everything')
@@ -483,45 +350,7 @@ class Aemeath(BaseChar):
             self.click_echo(time_out=0)
             macro.macro_mark('aemQ')
         if a_window > 0:
-            # 【打满 a3a4 之后还要等强化E亮起才开 R1】(用户 2026-08-27)。
-            # 亮了 = 那几段 A 真的落到了; 没亮就是被打断了, 接着打到亮为止。
-            # 【这一格不问处决】, 见 DENIA_BURST_F_IN_A
-            self.spam_a_probe_f(macro, a_window, tag='burstA3',
-                                until=self.enhance_e_available,
-                                cap=self.DENIA_BURST_A_CAP,
-                                probe_f=self.DENIA_BURST_F_IN_A)
-        # ==================== R1 之前: 能量不满就边A边等到满 ====================
-        # (用户 2026-10-02。2026-10-01/10-02 两份外部实机日志的同一个毛病)
-        #
-        # 【病症】: `R1_FAIL(x70)@+6.07` —— 下面的 fire_lib_fast 是
-        # 【只发键、一下普攻都不补】的, 能量没满时它就变成【站着干按 6 秒 R】;
-        # 而且 R1 一丢, 后面 spam_e_then_f(5.0+3.1 秒) 和 cast_e2_into_heavy(5.6 秒)
-        # 照样全跑完 —— 一轮白扔约 20 秒。外部用户报的"爱弥斯会突然停手"就是这一段
-        # (录屏里她张着翅膀悬在空中不动, 怪身上的处决提示都亮着也不管)。
-        #
-        # 【为什么这一格值得专门兜】: R1 没放出来, 这一圈的收尾是【整条塌】的 ——
-        # 拿不到「大招2解锁前置」-> 没有速蓄状态 -> 蓄力不会自动跳强化重击
-        # -> E2heavy(miss) -> 吃不到强化重击那 +200 同步率 -> 大招2 没解锁
-        # -> R2 也放不出来 -> 这一圈少 20 秒输出 -> 下一圈能量更差。是个螺旋。
-        # 实机规律: 启动轴之后【第 1 圈必成, 第 2 圈起经常 R1=False】。
-        #
-        # 【等的期间在输出】: attack_until_lib 边点普攻边盯能量环, 一亮当场返回。
-        # 所以满得早的轮次一秒都不多花, 满不了的轮次那几秒也在攒能量 ——
-        # 两头都比原来站着按 R 强。
-        # 【只读一次屏做判据】: 能量本来就满的轮次(绝大多数)零成本跳过
-        r1_ready = True
-        try:
-            r1_ready = bool(self.liberation_available())
-        except Exception:
-            pass          # 读不到就当满, 照常往下走, 别因为读屏失败卡住整条轴
-        macro.macro_mark(f'R1ready({1 if r1_ready else 0})')
-        if not r1_ready:
-            lit = macro.attack_until_lib(self, self.DENIA_BURST_R1_WAIT,
-                                         tag='burstR1wait')
-            self.logger.info(
-                f'denia burst: R1 能量没满, 边A边等 -> '
-                f'{"攒满了, 继续 R1 流程" if lit else "到上限还没满, 照常往下按"}')
-
+            macro.macro_spam(a_window, self.DENIA_BURST_A_INTERVAL, tag='burstA3')
         # 【只发键, 一下普攻都不补】: spin_until(click_liberation) 每轮补一下普攻再睡
         # 0.1 秒, 那下普攻会顶掉正在演的动作(R1 要落在变奏/A4 的动作里), 而且
         # 0.1 秒一轮太粗卡不进窗口
@@ -531,49 +360,24 @@ class Aemeath(BaseChar):
         # 处决必须落在【第一个强化E 的动画里】。演出期间的按键被丢掉不排队,
         # 所以靠连发盖住整段, 不靠算准某一帧
         self.spam_e_then_f(macro, tag='R1')
-        # 【原来这里有一个 f_break_persist(0.6) 的兜底窗口, 已去掉】
-        # (用户 2026-08-26: "不要有停顿")。处决现在由 spam_e_then_f 的 F 连发
-        # 和下面 spin_until(probe_f=True) 一路顺路问 —— 没处决可打的轮次
-        # 一秒都不多花, 有的话后面那一大段 A 里照样能打出来
+        # 【处决必须有兜底】: 上面那段 F 连发被吞掉就再也没有第二次机会。
+        # E 不用补(连发已经放出去了, 补了反而白烧一个 CD)
+        self.f_break_persist(tag='burstF')
         # 【边 A 边等第二个强化E 亮】—— 轴上写的就是"A到强化E亮"。
         # 这里【不】先等第一个灭掉: 上面 F 连发已经过去 3 秒多, 第一个 E 早就消费完了,
         # 读数是干净的。(紧挨着放完 E 就查的地方才需要"先确认它灭过", 见 burst_tail)
-        # 【"A到强化E再亮"这一段一路顺路问处决】: 它本来就是一大段连点,
-        # 处决晚一点出来也接得住 —— 这正是用户要的"后面有了后面再放"
-        e2_relit = self.spin_until(self.enhance_e_available, self.CYCLE_E2_TIME_OUT, 'E2 relight',
-                                   probe_f=True)
+        self.spin_until(self.enhance_e_available, self.CYCLE_E2_TIME_OUT, 'E2 relight')
         macro.macro_mark('E2_lit')
         # 强化E -> 一路按住穿过整个演出 -> 蓄力重击; 按住期间一直补发 R,
         # 重击一出手 R2 就吃到第一个合法帧
-        heavy_fired = self.cast_e2_into_heavy(macro)
-        # 【增量修复】两道止损, 全部只做"少按", 不加速任何相位:
-        #  1) 双重否决: E2再亮等满超时(怪死实测指纹, 活局秒亮)且重击没确认命中
-        #     -> 场面已废, R2 一键不按(能量不消耗, 下一轮还能用)
-        #  2) 快速失败: 健康时 R2 在 1 下内出手; 前 10 下(重击 miss 时 5 下)
-        #     没按出去就停手
-        if not e2_relit and not heavy_fired:
-            macro.macro_mark('R2_HOLD(双否决)')
-            self.logger.info('R2双否决扣发: E2再亮超时+重击miss, 场面已废, 不按')
-            lib2 = False
-        else:
-            lib2 = self.fire_r2_fast(macro, max_presses=5 if not heavy_fired else 10)
-        if lib2 and mecha_e:
-            # 【旧循环轴的接口】: R2 演出期间一直点 E, 演出结束那一刻直接变机甲。
-            # 演出结束之后再发单发的 E 试过, 不生效。新循环轴【不走这条】
+        self.cast_e2_into_heavy(macro)
+        lib2 = self.fire_r2_fast(macro)
+        if lib2:
+            # 【R2 演出期间就一直点 E】: 演出结束那一刻直接变机甲, 那一下就是
+            # 循环轴的第一个动作。演出结束之后再发单发的 E 试过, 不生效
             self.spam_e_through_animation(macro, tag='mechaE')
-        elif lib2:
-            # 【不发 E 也【必须】把演出等完再返回】(2026-08-26 实机)。
-            # fire_r2_fast 是"演出一开始就返回"的; 这里一返回, perform_opener /
-            # perform_loop 的 finally 就把 skip_combat_check 放回去 —— 而
-            # 【R2 演出期间 has_target() 读不到目标】, 战斗判定当场 target lost,
-            # 3 秒后判脱战 -> 重进战斗 -> reset_state -> opener_armed 重新置 True
-            # -> 【又跑一遍启动轴, 循环轴永远轮不到】(而且第二遍所有大招都在
-            # CD 上, icon lit=False, 整条轴打空)。
-            # 【旧版没这毛病是因为 spam_e_through_animation 顺手把控制权按在了
-            #  演出里】—— 关掉 mecha_e 等于把那个副作用一起关掉了
-            self.wait_lib_anim_poke(macro, tag='R2anim')
         self.record_liberation(True)
-        self.logger.info(f'denia burst: R1={lib1} R2={lib2} mechaE={mecha_e} '
+        self.logger.info(f'denia burst: R1={lib1} R2={lib2} '
                          f'{self.time_elapsed_accounting_for_freeze(start):.1f}s')
         self.logger.info(f'denia burst timeline: {macro.macro_timeline(mark0)}')
         return lib2
@@ -722,64 +526,6 @@ class Aemeath(BaseChar):
         self.logger.info(f'burst: {tag} E+F spam x{n} in {time.time() - start:.2f}s '
                          f'(anim {"ended" if back else "TIMEOUT"})')
         self.record_resonance_use()
-        return back
-
-    # 等演出的上限 / 轮询间隔 / 点击间隔, 见 wait_lib_anim_poke
-    QUIET_ANIM_TIME_OUT = 8.0
-    QUIET_ANIM_POLL = 0.03
-    QUIET_ANIM_CLICK = 0.12
-
-    def wait_lib_anim_poke(self, macro, tag='anim', time_out=None, poll=None):
-        """等大招演出结束(队伍 HUD 回来), 期间【一直点普攻】, 不发任何技能键。
-
-        用在"演出之后没有预输入要做, 但控制权不能交回框架"的地方 ——
-        见 perform_denia_burst 里 mecha_e=False 那一支。
-
-        【为什么不用 wait_lib_animation_end】: 那个是【裸的 in_team 判据】——
-        没有"先确认它消失过"这道门。这里是【交棒点】, 判早了的代价就是
-        控制权在演出中途还回框架, 也就是这个方法本来要治的那个 bug。
-        (顺带澄清: 不是因为 settle_time —— 本项目 config.py:173 把
-        wait_until_settle_time 设成了 0, 那 1 秒的惩罚在这里不存在。)
-
-        【2026-08-27: 从"一下都不点"改成"一直点"】(用户: "等boss刷新的时候
-        爱弥斯会愣住不动, 即使锁定了也不打")。
-        实机 `R2anim(timeout,x162,8.02s)` 紧接着 `break out of combat` ——
-        那就是【怪打完了/换波了, HUD 一直读不回来】, 而这个方法当时是
-        【一个输入都不发的】, 于是整整 8 秒站着不动。
-        【原来不点的理由是"怕多打一下把她的连段推过头"】—— 那点代价跟站 8 秒
-        完全不在一个量级; 而且演出期间的点击本来就会被丢掉, 只有 HUD 回来那一下
-        才落得进去, 正好接上下一步。
-        """
-        time_out = self.QUIET_ANIM_TIME_OUT if time_out is None else time_out
-        poll = self.QUIET_ANIM_POLL if poll is None else poll
-        start = time.time()
-        gone = False
-        back = False
-        n = 0
-        clicks = 0
-        next_click = 0.0
-        while time.time() - start < time_out:
-            self.task.next_frame()
-            n += 1
-            now = time.time()
-            if now >= next_click:
-                self.click()
-                clicks += 1
-                next_click = now + self.QUIET_ANIM_CLICK
-            if not self.task.in_team()[0]:
-                gone = True
-            elif gone:
-                back = True
-                break
-            self.sleep(poll, check_combat=False)
-        # 演出期间游戏时钟是停的, 记进 freeze, 别让上游的耗时统计吃到它
-        self.add_freeze_duration(start, time.time() - start)
-        if macro is not None:
-            macro.macro_mark(f'{tag}({"ok" if back else "timeout"},x{n},'
-                             f'A x{clicks},{time.time() - start:.2f}s)')
-        if not back:
-            self.logger.warning(f'{tag}: team HUD never came back in {time_out:.1f}s '
-                                f'({n} frames) —— 多半是换波/怪打完了, 这一段一直在点普攻')
         return back
 
     def wait_lib_animation_end(self, macro, tag, time_out=8.0):
@@ -1089,10 +835,8 @@ class Aemeath(BaseChar):
         return False
 
     def do_denia_perform(self):
-        """爱达千队里爱弥斯是【循环轴的入口】: 她放完 R2 就在场上, 循环轴从她这里起跑。
-
-        【2026-08-25 起她在这一刻是人形态, 不是机甲】—— 收尾爆发的 mecha_e 关掉了,
-        R2 的演出里不再连发 E。新循环轴的第一步是变奏千咲, 变机甲的 E 在中段才按。
+        """爱达千队里爱弥斯是【循环轴的入口】: 她放完 R2 就在场上(机甲形态),
+        循环轴的第一步就是从她这里起跑。
 
         启动轴的入口不是她 —— 是千咲(轴第一个动作是千咲的 E)。所以启动轴还没跑的
         时候她要【立刻】把场子让出去, 不能在这里打两秒普攻(那两秒是白扔的)。
@@ -1375,7 +1119,6 @@ class Aemeath(BaseChar):
                                             spam_lib=self.HEAVY_SPAM_LIB)
         self.logger.info(f'aemeath burst: E2 sent={sent} fired={fired} '
                          f'(total {time.time() - t0:.2f}s)')
-        return fired  # 增量修复: 把重击确认结果交回调用方(R2 止损要用)
 
     def send_e2_verified(self, time_out=1.5, interval=0.12):
         """把强化E 发出去并确认它真的放出来了(图标灭掉)。
@@ -1396,12 +1139,10 @@ class Aemeath(BaseChar):
         self.logger.warning(f'aemeath burst: E2 icon still lit after {n} presses')
         return False
 
-    def fire_r2_fast(self, macro=None, max_presses=None):
-        # 增量修复: max_presses = 快速失败上限(None = 不限, 原行为)
-        return self.fire_lib_fast(macro, 'R2', self.CYCLE_LIB2_TIME_OUT,
-                                  max_presses=max_presses)
+    def fire_r2_fast(self, macro=None):
+        return self.fire_lib_fast(macro, 'R2', self.CYCLE_LIB2_TIME_OUT)
 
-    def fire_lib_fast(self, macro, tag, time_out, max_presses=None):
+    def fire_lib_fast(self, macro, tag, time_out):
         """不停发大招键, 直到演出开始(队伍 HUD 消失)。R1 R2 共用。
 
         【只发键, 一下普攻都不补】。spin_until(click_liberation) 那种写法每轮补一下
@@ -1423,13 +1164,6 @@ class Aemeath(BaseChar):
                 self.logger.info(f'aemeath burst: {tag} fired after {n} presses '
                                  f'({time.time() - start:.2f}s)')
                 return True
-            # 增量修复: 【快速失败】前 max_presses 下没按出去就停手(实测健康发
-            # x0~x1 就出手; 怪死/被打断场景 x36 空按 2.5s) —— 省下空按, 能量不消耗
-            if max_presses is not None and n >= max_presses:
-                if macro is not None:
-                    macro.macro_mark(f'{tag}_GIVEUP(x{n})')
-                self.logger.info(f'aemeath burst: {tag} fast-fail after {n} presses, stop')
-                return False
             self.send_liberation_key()
             n += 1
             self.sleep(self.R2_KEY_INTERVAL, check_combat=False)
@@ -1438,36 +1172,24 @@ class Aemeath(BaseChar):
         self.logger.warning(f'aemeath burst: {tag} never fired after {n} presses')
         return False
 
-    def spin_until(self, cond, time_out, name, probe_f=False):
+    def spin_until(self, cond, time_out, name):
         """边普攻边等条件成立。返回条件是否成立。
 
         每一步都过 self.sleep(), 战斗判定才有机会跑; 原来那三个裸 while 都没有。
-
-        Args:
-            probe_f: 顺路问一下有没有处决可打(用户 2026-08-26: "不要有停顿")。
-                【处决不再有自己的窗口】—— 折进本来就要打的这段连点里,
-                【一秒都不多花】: f_break() 在提示没亮时立刻返回。
         """
         # 【每帧查条件, 点击照旧 0.12 秒一次】(用户 2026-08-14: "第二个强化E亮了
         # 没有第一时间放")。原来是"点一下 -> 睡 0.1 -> 再查", 强化E 在那 0.1 秒
         # 中间亮起的话要等下一轮才发现, 加上点击本身的开销最坏晚 0.2 秒以上。
         # 拆开之后【出手频率没变, 只是发现得更早】
         start = time.time()
-        next_click = next_f = 0.0
-        macro_f = False
+        next_click = 0.0
         while self.time_elapsed_accounting_for_freeze(start) < time_out:
             if cond():
-                if macro_f:
-                    self.logger.info(f'aemeath burst: {name} 期间顺路打出了处决')
                 return True
             now = time.time()
             if now >= next_click:
                 self.click()
                 next_click = now + self.SPIN_CLICK_INTERVAL
-                if probe_f and now >= next_f:
-                    next_f = now + self.DENIA_BURST_F_PROBE
-                    if self.f_break():
-                        macro_f = True
             self.task.next_frame()
         self.logger.warning(f'aemeath burst: {name} not ready after {time_out:.1f}s, moving on')
         return False

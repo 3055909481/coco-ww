@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ok import Box, ConfigOption, Icon
 from ok.util.GlobalConfig import create_basic_options
+from src.foreground_input import Pynput
 from src.game_launcher import get_game_launch_arguments
 from src.task.process_feature import process_feature
 from src.task.task_icons import task_icon
@@ -215,7 +216,8 @@ config = {
         'launch_arguments': get_game_launch_arguments,
         'exe': 'Client-Win64-Shipping.exe',
         'hwnd_class': 'UnrealWindow',
-        'interaction': 'PostMessage',
+        # 默认后台 PostMessage; Pynput 是前台 SendInput (同上游 v3.8.3), 见 src/foreground_input.py
+        'interaction': ['PostMessage', Pynput],
         'capture_method': ['WGC', 'WGC_HDR','BitBlt_RenderFull'],  # Windows版本支持的话, 优先使用WGC, 否则使用BitBlt_Full
         'check_hdr': False,
         'force_no_hdr': False,
@@ -278,8 +280,21 @@ config = {
         ["src.task.MouseResetTask", "MouseResetTask"],
         ["src.combat.FKeyStart", "FStartCombatTask"],
     ], 'custom_tabs': [
+        # 主页: 背景图 + 自动战斗/刷4C 两张卡片, 放在「运行」分组最上面, 打开程序先显示它
+        ["src.gui.HomeTab", "HomeTab"],
+        # 详细面板: 队伍谁在场、场上时间线、延迟、每圈用时、实时日志; 在「运行」分组里跟在「任务」后面
+        ["src.gui.DashboardTab", "DashboardTab"],
         ["src.gui.CharacterCodeTab", "CharacterCodeTab"],
         ["src.recorder.RecorderTab", "AxisRecorderTab"],
-    ], 'scene': ["src.scene.WWScene", "WWScene"],
+    ],
+    # 页面放在标题栏顶部一排, 不用左边侧栏 (主页设计稿的样子)。按类名对应页面:
+    # tabs 是左边的标签, actions 是右边的按钮, 其余页面 (角色设置/游戏快捷键/通知/诊断/设置/关于…) 收进右边齿轮菜单
+    'top_nav': {
+        'tabs': ['HomeTab', 'TasksPage', 'CharacterCodeTab', 'AxisRecorderTab', 'LogPage'],
+        'actions': ['DashboardTab'],
+        'labels': {'HomeTab': '首页', 'TasksPage': '任务设置'},
+        'accent': '#F2C14E',
+    },
+    'scene': ["src.scene.WWScene", "WWScene"],
 
 }

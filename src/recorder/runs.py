@@ -187,29 +187,34 @@ class ReadRow:
 
 
 class RunData:
-    def __init__(self, path):
+    def __init__(self, path, parsed=None):
+        """parsed=(开头, 结尾, 事件) 时不读文件, 直接用这些事件 (详细面板边追读边算, 见 live.RunTail)。"""
         self.path = path
         self.header = {}
         self.end = None
         self.events = []
         self.bad_lines = 0
-        with open(path, encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    self.bad_lines += 1
-                    continue
-                kind = event.get('e')
-                if kind == 'start':
-                    self.header = event
-                elif kind == 'end':
-                    self.end = event
-                else:
-                    self.events.append(event)
+        if parsed is not None:
+            header, end, events = parsed
+            self.header, self.end, self.events = header or {}, end, list(events)
+        else:
+            with open(path, encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        self.bad_lines += 1
+                        continue
+                    kind = event.get('e')
+                    if kind == 'start':
+                        self.header = event
+                    elif kind == 'end':
+                        self.end = event
+                    else:
+                        self.events.append(event)
         self.events.sort(key=lambda e: e.get('t', 0))
         last = max((e.get('t2', e.get('t', 0)) for e in self.events), default=0.0)
         self.duration = max(float((self.end or {}).get('t', 0) or 0), float(last or 0))
