@@ -161,20 +161,30 @@ def iter_source_files():
             yield path
 
 
-def rewrite_bat(out):
-    """启动脚本改指向 main.pyc / main_debug.pyc。"""
+def rewrite_bat(out, with_launcher=False):
+    """启动脚本改指向 main.pyc / main_debug.pyc；有启动器时改为直接调它（它自己提 UAC）。"""
     for name in ("启动 coco-ww.bat", "调试启动(带控制台).bat"):
         path = out / name
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8")
+        if with_launcher:
+            # 启动器 manifest 里已声明 requireAdministrator，双击即弹 UAC；bat 只做转发
+            if name.startswith("启动"):
+                path.write_text('@echo off\nstart "" "%~dp0coco-ww.exe"\n', encoding="utf-8")
+            else:
+                # 调试模式仍用带控制台的 python.exe，不经过启动器
+                changed = text.replace("main_debug.py", "main_debug.pyc").replace("main.py", "main.pyc")
+                if changed != text:
+                    path.write_text(changed, encoding="utf-8")
+            continue
         # 先替换更长的 main_debug.py，避免 main.py 把它的前缀改坏
         changed = text.replace("main_debug.py", "main_debug.pyc").replace("main.py", "main.pyc")
         if changed != text:
             path.write_text(changed, encoding="utf-8")
 
 
-def build(out_dir, compiler_spec=None, quiet=False):
+def build(out_dir, compiler_spec=None, quiet=False, launcher_path=None):
     out = Path(out_dir).resolve()
     if out == ROOT or out in {ROOT / name for name in COPY_DIRS} | {
             ROOT / name for name in OBFUSCATE_DIRS}:
@@ -239,7 +249,15 @@ def build(out_dir, compiler_spec=None, quiet=False):
     if leftovers:
         raise RuntimeError("输出目录仍残留明文源码: " + ", ".join(leftovers))
 
-    rewrite_bat(out)
+    # 启动器：把编译好的 exe 放进产物根目录，bat 改为调它（它自己弹 UAC）
+    with_launcher = False
+    launcher = Path(launcher_path).resolve() if launcher_path else (ROOT / "launcher" / "coco-ww.exe")
+    if launcher.is_file():
+        shutil.copy2(launcher, out / "coco-ww.exe")
+        with_launcher = True
+        if not quiet:
+            print(f"[构建] 已加入启动器: coco-ww.exe ({launcher.stat().st_size // 1024} KB)")
+    rewrite_bat(out, with_launcher=with_launcher)
 
     # 版本号不是敏感信息：写一份明文，供更新器/清单读取，避免 import config 触发重依赖
     version_match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']',
@@ -251,17 +269,18 @@ def build(out_dir, compiler_spec=None, quiet=False):
     if not quiet:
         print(f"[构建] 完成: {compiled} 个源码文件 -> .pyc，无明文 .py")
     return {"out": str(out), "compiled": compiled, "builtin_classes": len(builtin),
-            "compiler": compiler_desc}
+            "compiler": compiler_desc, "launcher": with_launcher}
 
 
 def main():
     parser = argparse.ArgumentParser(description="构建混淆后的 release 目录")
     parser.add_argument("--out", required=True, help="输出目录")
     parser.add_argument("--python", default="py -3.12", help="Python 3.12 解释器命令")
+    parser.add_argument("--launcher", default="", help="启动器 exe 路径（默认 launcher/coco-ww.exe，存在则加入）")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     try:
-        result = build(args.out, args.python, args.quiet)
+        result = build(args.out, args.python, args.quiet, args.launcher or None)
     except Exception as exc:
         print(f"[构建失败] {exc}", file=sys.stderr)
         return 1

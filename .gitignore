@@ -31,3 +31,8 @@ configs/custom_teams/*.backup/
 /build/
 /dist/
 /dist-test/
+
+# 启动器编译产物（CI 现场编译，不进版本库）
+/launcher/coco-ww.exe
+/launcher/rsrc.syso
+/launcher/rsrc

@@ -3,10 +3,11 @@
 # release 里分发的是"混淆 + 带运行环境"的整包，以及在线更新清单：
 #   1. 构建混淆产物到 build/release（src/ pyappify/ 全部变成 .pyc，内置角色源码加密另存）
 #   2. 把产物推到 obfuscated 分支（在线更新按提交号从该分支 raw 下载，拿到的就是 .pyc）
-#   3. 用混淆产物 + Python 3.12 运行环境打整包 coco-ww-vX.Y.Z.zip（含 Windows 专属依赖，
+#   3. 用 Go 编译独立启动器 coco-ww.exe（带新图标、UAC 提权、单实例、更新检查、错误提示）
+#   4. 用混淆产物 + Python 3.12 运行环境打整包 coco-ww-vX.Y.Z.zip（含 Windows 专属依赖，
 #      所以 runner 必须是 windows-latest）
-#   4. 清单基于产物目录生成，commit 指向 obfuscated 分支的提交
-#   5. Release 同时挂整包 zip 和 update-manifest.json
+#   5. 清单基于产物目录生成，commit 指向 obfuscated 分支的提交
+#   6. Release 同时挂整包 zip 和 update-manifest.json
 # 版本号没变（或这个 tag 已经有了）就什么都不做。
 name: Auto Release
 
@@ -63,6 +64,34 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Set up Go
+        if: steps.ver.outputs.skip == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: launcher/go.mod
+
+      - name: Build launcher exe
+        if: steps.ver.outputs.skip == 'false'
+        working-directory: launcher
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -e
+          # 先跑测试：此时还没有 requireAdministrator 的 syso，测试 exe 不会要求提权
+          go test ./...
+          go install github.com/tc-hib/go-winres@latest
+          NUMVER="${VERSION#v}.0"   # v1.0.5 -> 1.0.5.0
+          "$(go env GOPATH)/bin/go-winres.exe" simply \
+            --icon ../icons/icon.ico --manifest gui --admin --arch amd64 \
+            --out rsrc --no-suffix \
+            --file-version "$NUMVER" --product-version "$NUMVER" \
+            --file-description "coco-ww 启动器" --product-name "coco-ww" \
+            --original-filename "coco-ww.exe"
+          mv -f rsrc rsrc.syso
+          go build -trimpath -ldflags "-H=windowsgui -s -w -X main.repo=${{ github.repository }}" -o coco-ww.exe .
 
       - name: Build obfuscated release tree
         if: steps.ver.outputs.skip == 'false'

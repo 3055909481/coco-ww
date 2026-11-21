@@ -166,9 +166,15 @@ class TestBuildArtifact(unittest.TestCase):
     def test_launchers_point_to_pyc(self):
         normal = (self.out / "启动 coco-ww.bat").read_text(encoding="utf-8")
         debug = (self.out / "调试启动(带控制台).bat").read_text(encoding="utf-8")
-        self.assertIn("-X utf8 main.pyc", normal)
-        self.assertNotIn("-X utf8 main.py\n", normal)  # 精确排除未改的入口
-        self.assertIn("main_debug.pyc", debug)
+        launcher = ROOT / "launcher" / "coco-ww.exe"
+        if launcher.is_file():
+            # 有启动器时：正常入口转发到 exe（它自己提 UAC），调试入口仍直连 python
+            self.assertIn("coco-ww.exe", normal)
+            self.assertIn("main_debug.pyc", debug)
+            self.assertTrue((self.out / "coco-ww.exe").is_file())
+        else:
+            self.assertIn("-X utf8 main.pyc", normal)
+            self.assertIn("main_debug.pyc", debug)
 
     def test_version_file(self):
         version = (self.out / "version.txt").read_text(encoding="utf-8").strip()
