@@ -270,5 +270,15 @@ def main():
     return 0
 
 
+def _force_utf8_io():
+    """Windows 控制台默认 charmap，打印中文会崩；强制 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
 if __name__ == "__main__":
+    _force_utf8_io()
     sys.exit(main())
