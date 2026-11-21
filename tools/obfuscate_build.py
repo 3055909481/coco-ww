@@ -49,10 +49,6 @@ COPY_FILES = (
     "启动 coco-ww.bat", "调试启动(带控制台).bat",
 )
 
-# 含 nonlocal 的角色文件混淆时跳过局部变量重命名（obfuscate_source 内部已处理），
-# 这里列出仅用于日志提示。
-KNOWN_SKIP_HINTS = ("src/char/Linnai.py",)
-
 SKIP_SOURCE_NAMES = {"__pycache__"}
 
 

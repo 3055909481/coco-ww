@@ -56,7 +56,10 @@ class TestAstObfuscation(unittest.TestCase):
         self.assertEqual(left, right)
 
     def test_lambda_param_shadows_outer_local(self):
-        """回归：外层推导变量与 lambda 参数同名，曾导致 lambda 体被外层 _obf 名污染而 NameError。"""
+        """回归：外层推导变量与 lambda 参数同名（v1.0.6/v1.0.7 两次 NameError 的场景）。
+
+        现在靠"根本不改名"保证正确；保留此测试防止有人把局部重命名加回来。
+        """
         src = ("class C:\n"
                "    def __init__(self, last, index):\n"
                "        self.last = last\n"
@@ -68,7 +71,7 @@ class TestAstObfuscation(unittest.TestCase):
         self.assertEqual(*self._run_pair(src, call))
 
     def test_reassigned_parameter_not_renamed(self):
-        """回归：函数体对参数重新赋值时，参数名也不能改，否则关键字调用失败。"""
+        """回归：函数体对参数重新赋值时参数名不能改，否则关键字调用失败。"""
         src = ("def f(items, limit=10):\n"
                "    items = list(items)[:limit]\n"
                "    total = len(items)\n"
@@ -106,6 +109,23 @@ class TestAstObfuscation(unittest.TestCase):
                "    return data['a_very_long_dictionary_key_name']\n")
         self.assertEqual(*self._run_pair(src, "build()"))
 
+    def _identifier_names(self, tree):
+        """收集 AST 中出现的所有标识符（变量/参数/函数/类/属性名）。"""
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.arg):
+                names.add(node.arg)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Attribute):
+                names.add(node.attr)
+            elif isinstance(node, ast.alias):
+                if node.asname:
+                    names.add(node.asname)
+        return names
+
     def test_all_real_sources_compile(self):
         files = list((ROOT / "src").rglob("*.py")) + list((ROOT / "pyappify").rglob("*.py"))
         self.assertGreater(len(files), 50)
@@ -114,6 +134,64 @@ class TestAstObfuscation(unittest.TestCase):
                 source = path.read_text(encoding="utf-8")
                 obfuscated = obfuscate_source(source, KEY)
                 compile(obfuscated, str(path), "exec")
+
+    def test_no_identifier_is_ever_renamed(self):
+        """最强保证：混淆绝不改名任何标识符，从根上杜绝 _obfN NameError。
+
+        对全部真实源码验证：混淆后
+        1) 不含任何 _obfN 形式的名字；
+        2) 原始标识符集合是混淆后集合的子集（一个都没丢、没改）。
+        这样 lambda/推导式/闭包同名变量永远不可能再被污染。
+        """
+        import re
+        files = list((ROOT / "src").rglob("*.py")) + list((ROOT / "pyappify").rglob("*.py"))
+        self.assertGreater(len(files), 50)
+        obf_pattern = re.compile(r"^_obf\d+$")
+        for path in files:
+            with self.subTest(path=path):
+                source = path.read_text(encoding="utf-8")
+                original_names = self._identifier_names(ast.parse(source))
+                obfuscated = obfuscate_source(source, KEY)
+                result_names = self._identifier_names(ast.parse(obfuscated))
+                self.assertFalse([n for n in result_names if obf_pattern.match(n)],
+                                 f"{path}: 出现 _obfN 改名")
+                self.assertTrue(original_names <= result_names,
+                                f"{path}: 标识符丢失: {sorted(original_names - result_names)[:10]}")
+
+    def test_historical_nameerror_cases(self):
+        """v1.0.6 / v1.0.7 两次实机 NameError 的真实代码形状，永久回归。"""
+        class Unit:
+            def __init__(self, last, index, buff):
+                self.last_switch_in_time = last
+                self.index = index
+                self.buff_time = buff
+                self.is_main_dps = False
+
+        # v1.0.6: BaseCombatTask._oldest_switch_target
+        src1 = ("def oldest(candidates):\n"
+                "    chars = [char for char in candidates if char is not None]\n"
+                "    if not chars:\n"
+                "        return None\n"
+                "    return min(chars, key=lambda char: (char.last_switch_in_time, char.index))\n")
+        # v1.0.7: BaseCombatTask._lowest_buff_remaining_target
+        src2 = ("class Selector:\n"
+                "    def buff_remaining(self, char):\n"
+                "        return char.buff_time\n"
+                "    def lowest(self, candidates):\n"
+                "        buffers = [char for char in candidates if not char.is_main_dps and char.buff_time > 0]\n"
+                "        if not buffers:\n"
+                "            return None\n"
+                "        return min(buffers, key=lambda char: (self.buff_remaining(char), char.last_switch_in_time, char.index))\n")
+        items = [Unit(5, 1, 2.0), Unit(1, 2, 8.0)]
+        for label, src, call in (
+                ("v1.0.6-oldest", src1, lambda ns: ns["oldest"](items).index),
+                ("v1.0.7-lowest", src2, lambda ns: ns["Selector"]().lowest(items).index)):
+            with self.subTest(case=label):
+                o = {}
+                exec(compile(src, "<o>", "exec"), o)
+                b = {}
+                exec(compile(obfuscate_source(src, KEY), "<b>", "exec"), b)
+                self.assertEqual(call(o), call(b))
 
 
 class TestSecureSource(unittest.TestCase):

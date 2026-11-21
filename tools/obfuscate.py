@@ -1,16 +1,35 @@
 """源码 AST 混淆变换核心（纯标准库，供 obfuscate_build.py 和测试使用）。
 
-设计目标：在不改变程序行为的前提下，抹掉注释/docstring、打乱局部变量名、编码长字符串常量，
-让 release 里分发的 .pyc 即使被反编译也难以阅读。
+设计目标：在不改变程序行为的前提下，抹掉注释/docstring、编码长字符串常量，
+并把源码经 ast.unparse 重排后编译成 .pyc 分发，让 release 里没有明文源码。
 
-保守策略（功能正确优先）：
-- 只重命名函数/方法/lambda 的参数与局部变量；不碰模块级名、类名、函数/方法名、属性名、导入名。
-- 含 eval/exec/locals/globals/vars 调用的函数整体跳过重命名。
-- global/nonlocal 声明的名字在全部作用域禁用重命名。
+保守策略（功能正确优先，绝不改名字）：
+- **不重命名任何局部变量/参数**。这是刻意的设计决策，见下方说明。
+- 不碰模块级名、类名、函数/方法名、属性名、导入名。
 - 字符串只编码"数据性"长字符串：跳过 dict key、比较运算对象、下标键、f-string 片段、set 元素、
   标识符样式串、路径样式串。这样编码后解码还原，行为完全一致。
 
-被混淆后的源码用 ast.unparse 输出（注释与格式全部丢失，本身就是一层混淆）。
+═══════════════════════════════════════════════════════════════════════════
+为什么不重命名局部变量（重要，不要"优化"回来）
+═══════════════════════════════════════════════════════════════════════════
+曾经实现过 AST 级局部变量重命名，但连续两次引发生产环境 NameError：
+
+  v1.0.6: chars = [char for char in chars ...]; min(chars, key=lambda char: ...)
+          → lambda 体里的 char 被外层同名推导变量污染 → _obf62 未定义
+  v1.0.7: buffers = [char for char in candidates ...]; lambda char: ...
+          → self._buff_remaining(char) 被推导变量污染 → _obf70 未定义
+
+根因是 Python 的作用域规则极其微妙：推导式（ListComp/SetComp/DictComp/GeneratorExp）
+在 Python 3 是独立作用域，lambda/嵌套函数又各是一层，闭包 free 变量、global/nonlocal、
+walrus、match 绑定等都是独立的绑定来源。任何手写的 AST 作用域跟踪都难以穷尽这些边界，
+修补一个案例就会漏掉下一个。
+
+同时，局部变量重名的**防护收益几乎为零**：pyc 的 co_varnames 本来就明文保存所有变量名，
+任何反编译器都能直接读出；把 char 改成 _obf2 只是把名字变丑，挡不住逆向。
+真正有效的防护是：不分发明文 .py、去掉 docstring/注释、编码字符串常量、AST 重排——
+这些都完整保留。
+
+结论：正确性 > 边际混淆收益。此模块永久不做任何标识符改名。
 """
 
 import ast
@@ -21,10 +40,6 @@ DECODE_FUNC = "__coco_ww_dec__"
 B64_MODULE = "__coco_ww_b64__"
 
 _IDENTIFIER_LIKE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
-_FORBIDDEN_LOCAL_NAMES = {"__name__", "__file__", "__doc__", "__package__", "__class__", "__slots__"}
-_DYNAMIC_CALLS = {"eval", "exec", "locals", "globals", "vars", "compile"}
-# 保留：仅作文档说明——新名字现在由全局计数器生成，保证跨作用域唯一，
-# 避免嵌套函数里同名临时变量遮蔽外层变量。
 
 
 def encode_string(value: str, key: bytes) -> str:
@@ -43,176 +58,6 @@ def decode_helper_source(key: bytes) -> str:
         f"    return bytes(_c ^ _k[_i % len(_k)] for _i, _c in "
         f"enumerate({B64_MODULE}.b64decode(_s))).decode('utf-8')\n"
     )
-
-
-def _all_arg_nodes(arguments):
-    """列出一个 arguments 节点里的所有 arg（含 posonly/args/kwonly/vararg/kwarg）。"""
-    result = list(getattr(arguments, "posonlyargs", []))
-    result += list(arguments.args)
-    result += list(arguments.kwonlyargs)
-    if arguments.vararg:
-        result.append(arguments.vararg)
-    if arguments.kwarg:
-        result.append(arguments.kwarg)
-    return result
-
-
-def _arg_expressions(arguments):
-    """arguments 里在定义时求值、属于外层作用域的表达式（默认值/注解）。"""
-    exprs = list(arguments.defaults) + [d for d in arguments.kw_defaults if d]
-    for arg in _all_arg_nodes(arguments):
-        if arg.annotation:
-            exprs.append(arg.annotation)
-    return exprs
-
-
-class _LocalRenamer(ast.NodeTransformer):
-    """保守的函数内局部变量重命名。
-
-    只重命名函数体内 Store/Del 的纯局部变量，不碰参数名——参数是公开 API，
-    外部可能用关键字参数调用（如 RecentLogs(capacity=3)），改了会破坏调用方。
-    每次进入函数用全局唯一计数器分配新名，避免嵌套作用域同名遮蔽。
-    含 global/nonlocal 或 eval/exec/locals/globals/vars 的函数完全跳过重命名。
-    """
-
-    def __init__(self):
-        self.counter = 0
-        self.scope_stack = [_Scope()]  # 模块作用域：无绑定，作为查不到的终点
-
-    def _new_name(self):
-        self.counter += 1
-        name = f"_obf{self.counter}"
-        return name
-
-    def visit_Name(self, node):
-        # 从内到外找"绑定该名字"的作用域。关键：一旦某层绑定了名字（参数或局部变量），
-        # 就只能用它自己的映射，即使该名字没被改名（如参数）也不能穿透到外层——
-        # 否则 lambda 参数 char 会被外层的同名推导变量 _obf62 错误替换（NameError）。
-        for scope in reversed(self.scope_stack):
-            if node.id in scope.bound:
-                node.id = scope.mapping.get(node.id, node.id)
-                return node
-        return node
-
-    def _collect(self, body, arguments):
-        """返回 (可改名集合, 是否含危险构造)。不递归进嵌套函数体。"""
-        found = set()
-        state = {"danger": False}
-
-        class Collector(ast.NodeVisitor):
-            def visit_FunctionDef(inner, node):
-                for item in node.decorator_list:
-                    self.visit(item)
-                for expr in _arg_expressions(node.args):
-                    self.visit(expr)
-                if node.returns:
-                    self.visit(node.returns)
-
-            visit_AsyncFunctionDef = visit_FunctionDef
-
-            def visit_Lambda(inner, node):
-                for expr in _arg_expressions(node.args):
-                    self.visit(expr)
-
-            def visit_ClassDef(inner, node):
-                for item in node.decorator_list + node.bases:
-                    self.visit(item)
-                for kw in node.keywords:
-                    self.visit(kw)
-
-            def visit_Call(inner, node):
-                if isinstance(node.func, ast.Name) and node.func.id in _DYNAMIC_CALLS:
-                    state["danger"] = True
-                self.generic_visit(node)
-
-            def visit_Global(inner, node):
-                state["danger"] = True
-
-            def visit_Nonlocal(inner, node):
-                state["danger"] = True
-
-            def visit_Name(inner, node):
-                if isinstance(node.ctx, (ast.Store, ast.Del)):
-                    found.add(node.id)
-
-        collector = Collector()
-        # 参数名不加入 found：它们可能被外部以关键字参数调用，必须原样保留。
-        for stmt in body:
-            collector.visit(stmt)
-        if state["danger"]:
-            return set(), True
-        safe = {n for n in found if n not in _FORBIDDEN_LOCAL_NAMES}
-        return safe, False
-
-    def _visit_function(self, node):
-        # 定义时求值的表达式属于外层作用域，先处理
-        node.decorator_list = [self.visit(d) for d in node.decorator_list]
-        for expr in _arg_expressions(node.args):
-            self.visit(expr)
-        if node.returns:
-            self.visit(node.returns)
-
-        safe, danger = self._collect(node.body, node.args)
-        param_names = {arg.arg for arg in _all_arg_nodes(node.args)}
-        # 参数名绝不改名（外部可能用关键字参数调用），即使函数体里对它重新赋值。
-        # 因此从待改名集合里剔除参数名；但它们仍属于本作用域绑定，挡住外层穿透。
-        safe = safe - param_names
-        scope = _Scope(bound=param_names | safe)
-        if not danger:
-            for name in sorted(safe):
-                scope.mapping[name] = self._new_name()
-
-        self.scope_stack.append(scope)
-        node.body = [self.visit(stmt) for stmt in node.body]
-        self.scope_stack.pop()
-        return node
-
-    def visit_FunctionDef(self, node):
-        return self._visit_function(node)
-
-    def visit_AsyncFunctionDef(self, node):
-        return self._visit_function(node)
-
-    def visit_Lambda(self, node):
-        for expr in _arg_expressions(node.args):
-            self.visit(expr)
-        safe, danger = self._collect([node.body], node.args)
-        param_names = {arg.arg for arg in _all_arg_nodes(node.args)}
-        safe = safe - param_names  # lambda 参数也不改名
-        scope = _Scope(bound=param_names | safe)
-        if not danger:
-            for name in sorted(safe):
-                scope.mapping[name] = self._new_name()
-        self.scope_stack.append(scope)
-        node.body = self.visit(node.body)
-        self.scope_stack.pop()
-        return node
-
-    def visit_ClassDef(self, node):
-        # 类体不重命名类属性；但允许闭包引用外层已改名的局部变量。
-        node.decorator_list = [self.visit(d) for d in node.decorator_list]
-        node.bases = [self.visit(b) for b in node.bases]
-        node.keywords = [self.visit(k) for k in node.keywords]
-        node.body = [self.visit(stmt) for stmt in node.body]
-        return node
-
-
-class _Scope:
-    """一个函数作用域。
-
-    bound: 该作用域绑定的所有名字（参数 + 局部变量），含未改名的参数；
-    mapping: 其中被改名的 原名 -> 唯一新名。
-    visit_Name 只认最近的绑定层，未改名的绑定（参数）也必须挡住外层穿透。
-    """
-
-    __slots__ = ("mapping", "bound")
-
-    def __init__(self, bound=None):
-        self.mapping = {}
-        self.bound = set(bound or ())
-
-    def __contains__(self, name):
-        return name in self.bound
 
 
 class _DocstringStripper(ast.NodeTransformer):
@@ -240,7 +85,7 @@ class _StringEncoder(ast.NodeTransformer):
         self.encoded = 0
 
     def _mark(self, node):
-        # 字典里的 **展开元素其 key 为 None（Python 3.12+），直接跳过
+        # 字典里的 ** 展开元素其 key 为 None（Python 3.12+），直接跳过
         if node is None:
             return
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -292,23 +137,24 @@ class _StringEncoder(ast.NodeTransformer):
         )
 
 
-def obfuscate_source(source: str, key: bytes, *, rename_locals=True,
-                     strip_docstrings=True, encode_strings=True) -> str:
-    """把一份源码混淆后输出为新的源码字符串。"""
+def obfuscate_source(source: str, key: bytes, *,
+                     strip_docstrings: bool = True, encode_strings: bool = True) -> str:
+    """把一份源码混淆后输出为新的源码字符串。
+
+    注意：刻意不提供"重命名局部变量"选项，任何标识符都不会被改名。
+    详见模块文档顶部的决策说明。
+    """
     tree = ast.parse(source)
     if strip_docstrings:
         tree = _DocstringStripper().visit(tree)
-    if rename_locals:
-        # nonlocal 跨越作用域绑定：任一处存在就整体跳过本模块的重命名。
-        # 项目里仅 1 处（src/char/Linnai.py），正确性优先于混淆覆盖率。
-        has_nonlocal = any(isinstance(n, (ast.Nonlocal,)) for n in ast.walk(tree))
-        if not has_nonlocal:
-            tree = _LocalRenamer().visit(tree)
-    helper_header = ""
     if encode_strings:
         encoder = _StringEncoder(key)
         tree = encoder.visit(tree)
         if encoder.encoded:
             helper_header = decode_helper_source(key)
+        else:
+            helper_header = ""
+    else:
+        helper_header = ""
     ast.fix_missing_locations(tree)
     return helper_header + ast.unparse(tree) + "\n"
