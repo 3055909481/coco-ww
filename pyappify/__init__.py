@@ -45,7 +45,7 @@ pyappify_upgradeable = False
 pyappify_executable = None
 logger = None
 
-REPO = "wk321425/coco-ww"
+REPO = "3055909481/coco-ww"
 API_RELEASES = f"https://api.github.com/repos/{REPO}/releases?per_page=50"
 MANIFEST_ASSET = "update-manifest.json"
 MANIFEST_FORMAT = 1
@@ -60,7 +60,17 @@ DOWNLOAD_WORKERS = 6
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 STAGING_ROOT = APP_ROOT / "cache" / "update"
-HELPER_SCRIPT = Path(__file__).resolve().parent / "apply_update.py"
+def _find_helper():
+    """助手脚本：源码版是 apply_update.py，混淆 release 是 apply_update.pyc。"""
+    folder = Path(__file__).resolve().parent
+    for name in ("apply_update.py", "apply_update.pyc"):
+        candidate = folder / name
+        if candidate.is_file():
+            return candidate
+    return folder / "apply_update.py"
+
+
+HELPER_SCRIPT = _find_helper()
 
 RUNTIME_FILES = ("requirements.txt",)
 USER_DATA_PREFIX = "configs/"
@@ -105,13 +115,22 @@ def is_local_checkout():
 
 
 def installed_version():
-    """磁盘上 config.py 写的版本号: 删旧文件要按它找旧清单。"""
-    try:
-        text = (APP_ROOT / "config.py").read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
-    return match.group(1) if match else ""
+    """版本号: 混淆 release 读 version.txt；源码版从 config.py 文本读。"""
+    version_txt = APP_ROOT / "version.txt"
+    if version_txt.is_file():
+        try:
+            return version_txt.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    config_py = APP_ROOT / "config.py"
+    if config_py.is_file():
+        try:
+            text = config_py.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+        return match.group(1) if match else ""
+    return ""
 
 
 # --- 网络 ---------------------------------------------------------------------
@@ -404,7 +423,8 @@ def prepare_update(version, exit_event=None, restart=True):
             future.result()
 
     # 用当前版本的助手: plan.json 是当前代码写的, 格式对得上; 拷出去跑, 换掉 pyappify/ 也不影响它
-    helper = stage / "apply_update.py"
+    # 保留原扩展名：源码版是 .py，混淆 release 是 .pyc（pyc 必须保持 .pyc 才能被 python 执行）
+    helper = stage / HELPER_SCRIPT.name
     shutil.copyfile(HELPER_SCRIPT, helper)
     plan = {
         "app_root": str(APP_ROOT),

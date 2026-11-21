@@ -1,6 +1,11 @@
-# 推到 main 的提交里 config.py 的版本号变了 -> 自动发 Release, 只带在线更新清单 update-manifest.json。
-# 不打整包: 在线更新按提交号从仓库下文件, 用不到 zip。整包(带 python 运行环境)只在新装/换运行环境时
-# 才要, 还是本地用 pack_release.py 打了手动传。版本号没变(或这个 tag 已经有了)就什么都不做。
+# 推到 main 的提交里 config.py 的版本号变了 -> 自动发混淆版 Release。
+#
+# release 里分发的不是明文源码，而是 AST 混淆 + Python 3.12 编译后的 .pyc：
+#   1. 构建混淆产物到 build/release（src/ pyappify/ 全部变成 .pyc，内置角色源码加密另存）
+#   2. 把产物推到 obfuscated 分支（在线更新按提交号从该分支 raw 下载，拿到的就是 .pyc）
+#   3. 清单基于产物目录生成，commit 指向 obfuscated 分支的提交
+#   4. 只发清单不发整包：整包（带 python 运行环境）仍本地打包后手动上传
+# 版本号没变（或这个 tag 已经有了）就什么都不做。
 name: Auto Release
 
 on:
@@ -46,6 +51,38 @@ jobs:
           echo "prev=$prev" >> "$GITHUB_OUTPUT"
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Python 3.12
+        if: steps.ver.outputs.skip == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build obfuscated release tree
+        if: steps.ver.outputs.skip == 'false'
+        run: python tools/obfuscate_build.py --out build/release --python "python3"
+
+      - name: Publish obfuscated tree to branch
+        id: obf
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cd build/release
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b obfuscated
+          # .gitignore 里有 *.pyc；产物分支必须强制添加，否则 pyc 全被跳过
+          git add -A -f
+          git commit -q -m "obfuscated release ${{ steps.ver.outputs.version }}"
+          # obfuscated 分支每次整棵覆盖：用 force push，历史不需要保留
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push -q -f origin obfuscated
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "obfuscated 分支提交: $sha"
+
       - name: Find full package release
         id: full
         if: steps.ver.outputs.skip == 'false'
@@ -58,9 +95,14 @@ jobs:
 
       - name: Build manifest and notes
         if: steps.ver.outputs.skip == 'false'
+        # 清单输出到 build/release 之外，避免把清单文件本身算进清单
         run: |
-          python3 tools/release_manifest.py out --commit "$GITHUB_SHA" \
-            --prev-tag "${{ steps.ver.outputs.prev }}" --full-url "${{ steps.full.outputs.url }}"
+          python tools/release_manifest.py build/manifest \
+            --from-dir build/release \
+            --commit "${{ steps.obf.outputs.sha }}" \
+            --version "${{ steps.ver.outputs.version }}" \
+            --prev-tag "${{ steps.ver.outputs.prev }}" \
+            --full-url "${{ steps.full.outputs.url }}"
 
       - name: Create release
         if: steps.ver.outputs.skip == 'false'
@@ -68,5 +110,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           v="${{ steps.ver.outputs.version }}"
-          gh release create "$v" out/update-manifest.json \
-            --target "$GITHUB_SHA" --title "coco-ww $v" --notes-file out/notes.md --latest
+          gh release create "$v" build/manifest/update-manifest.json \
+            --target "$GITHUB_SHA" --title "coco-ww $v" --notes-file build/manifest/notes.md --latest

@@ -26,3 +26,8 @@ configs/custom_teams/*.backup/
 # 本机的队伍存档和手动备份 (TeamVariants 存档、改轴前的备份), 不进版本库
 /configs/custom_team_variants/
 /team_backup/
+
+# 混淆构建产物（CI 里用 git add -f 推到 obfuscated 分支，主仓库不跟踪）
+/build/
+/dist/
+/dist-test/

@@ -743,10 +743,20 @@ def read_builtin_char_code(char_cls):
     cached = _builtin_code_cache.get(char_cls)
     if cached is not None:
         return cached
-    path = inspect.getsourcefile(char_cls)
-    if not path:
-        raise RuntimeError(f"Cannot find source file for {char_cls.__name__}")
-    code = Path(path).read_text(encoding="utf-8")
+    # release 混淆版: 源码编译成了 .pyc, inspect 拿不到原文。从加密存储读取。
+    try:
+        from src.char._secure_source import get_builtin_source
+        secure = get_builtin_source(char_cls.__name__)
+    except (ImportError, OSError):
+        secure = None
+    if secure is not None:
+        code = secure
+    else:
+        # 源码开发状态: 保持原来的 inspect 行为
+        path = inspect.getsourcefile(char_cls)
+        if not path:
+            raise RuntimeError(f"Cannot find source file for {char_cls.__name__}")
+        code = Path(path).read_text(encoding="utf-8")
     _builtin_code_cache[char_cls] = code
     return code
 

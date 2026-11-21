@@ -42,6 +42,29 @@ def build_manifest(commit):
     return {"format": 1, "version": version, "commit": commit, "files": files}
 
 
+def build_manifest_from_dir(tree_dir, version, commit):
+    """从混淆产物目录生成清单（release 里的文件是 .pyc，不能从 git archive 读）。
+
+    tree_dir 里的相对路径就是清单路径；version 由调用方从源码 config.py 读出后传入；
+    commit 传 obfuscated 分支的提交号，pyappify 会按它从该分支 raw 下载这些 .pyc。
+    """
+    tree = os.path.abspath(tree_dir)
+    files = {}
+    for root, dirs, names in os.walk(tree):
+        dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git")]
+        for name in names:
+            full = os.path.join(root, name)
+            if not os.path.isfile(full):
+                continue
+            rel = os.path.relpath(full, tree).replace(os.sep, "/")
+            with open(full, "rb") as f:
+                data = f.read()
+            files[rel] = {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+    if not version:
+        sys.exit("混淆产物模式需要 --version（从源码 config.py 读）")
+    return {"format": 1, "version": version, "commit": commit, "files": files}
+
+
 def change_lines(prev_tag, commit):
     """上一版到这一版的提交标题, 去掉只改版本号的提交 (标题就是 vX.Y.Z)。"""
     if not prev_tag:
@@ -85,18 +108,33 @@ def main():
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--prev-tag", default="")
     parser.add_argument("--full-url", default="")
+    parser.add_argument("--from-dir", default="",
+                        help="从混淆产物目录生成清单（pyc 版），此时 --commit 传 obfuscated 分支提交号")
+    parser.add_argument("--version", default="", help="--from-dir 模式下显式指定版本号")
     args = parser.parse_args()
 
-    commit = git("rev-parse", args.commit)
-    manifest = build_manifest(commit)
+    if args.from_dir:
+        version = args.version
+        if not version:
+            version_file = os.path.join(args.from_dir, "version.txt")
+            if os.path.isfile(version_file):
+                with open(version_file, encoding="utf-8") as f:
+                    version = f.read().strip()
+        manifest = build_manifest_from_dir(args.from_dir, version, args.commit)
+        source_commit = None  # 变更日志仍用 main 分支的 HEAD
+    else:
+        commit = git("rev-parse", args.commit)
+        manifest = build_manifest(commit)
+        source_commit = commit
+
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "update-manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=0, sort_keys=True)
 
     runtime_changed = False
-    if args.prev_tag:
-        runtime_changed = bool(git("diff", "--name-only", args.prev_tag, commit, "--", "requirements.txt"))
-    notes = build_notes(manifest["version"], args.prev_tag, commit, args.full_url, runtime_changed)
+    if args.prev_tag and source_commit:
+        runtime_changed = bool(git("diff", "--name-only", args.prev_tag, source_commit, "--", "requirements.txt"))
+    notes = build_notes(manifest["version"], args.prev_tag, args.commit, args.full_url, runtime_changed)
     with open(os.path.join(args.out_dir, "notes.md"), "w", encoding="utf-8") as f:
         f.write(notes)
     print(f"version={manifest['version']}")
