@@ -295,6 +295,12 @@ class TestBuildArtifact(unittest.TestCase):
         self.assertIn("main.pyc", manifest["files"])
         self.assertIn("src/_builtin_sources.dat", manifest["files"])
         self.assertNotIn("main.py", manifest["files"])
+        # 回归：清单里不能有非 ASCII 路径（docs/中文.md、中文名 bat），
+        # 否则 jsdelivr 等 CDN 下载会 404/403，导致"更新失败/哈希校验不过"
+        non_ascii = [p for p in manifest["files"] if any(ord(ch) > 127 for ch in p)]
+        self.assertEqual(non_ascii, [], f"清单含非 ASCII 路径: {non_ascii}")
+        self.assertFalse(any(p.startswith("docs/") for p in manifest["files"]))
+        self.assertFalse(any(p.endswith(".bat") for p in manifest["files"]))
         for rel in ("main.pyc", "src/char/Aalto.pyc"):
             digest = hashlib.sha256((self.out / rel).read_bytes()).hexdigest()
             self.assertEqual(manifest["files"][rel]["sha256"], digest)

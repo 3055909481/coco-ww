@@ -75,6 +75,14 @@ HELPER_SCRIPT = _find_helper()
 RUNTIME_FILES = ("requirements.txt",)
 USER_DATA_PREFIX = "configs/"
 FORBIDDEN_PREFIXES = ("python/", ".git/", "cache/", "logs/")
+# 整包自带的入口/文档：不进在线更新清单（见 release_manifest.MANIFEST_EXCLUDE_*），
+# 老用户清单里有它们时应跳过下载与删除，否则旧清单→新清单会被误删。
+LOCAL_ONLY_FILES = ("启动 coco-ww.bat", "调试启动(带控制台).bat")
+LOCAL_ONLY_PREFIXES = ("docs/",)
+
+
+def _is_local_only(rel):
+    return rel in LOCAL_ONLY_FILES or any(rel.startswith(p) for p in LOCAL_ONLY_PREFIXES)
 
 # get_version_list 拉到的全部 Release (含测试版), 按 tag 存, 给 update_to_version 用
 _releases = {}
@@ -349,7 +357,7 @@ def plan_update(target, old=None, root=None):
     download = []
     for rel, info in target_files.items():
         local = root / rel
-        if rel.startswith(USER_DATA_PREFIX):
+        if _is_local_only(rel) or rel.startswith(USER_DATA_PREFIX):
             if rel in old_files or local.exists():
                 continue
         elif _local_sha(local) == info["sha256"]:
@@ -358,7 +366,7 @@ def plan_update(target, old=None, root=None):
 
     delete = []
     for rel, info in old_files.items():
-        if rel in target_files or rel.startswith(USER_DATA_PREFIX):
+        if _is_local_only(rel) or rel in target_files or rel.startswith(USER_DATA_PREFIX):
             continue
         if _local_sha(root / rel) == info.get("sha256"):
             delete.append(rel)

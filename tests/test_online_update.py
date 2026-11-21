@@ -193,8 +193,9 @@ class OnlineUpdateTest(unittest.TestCase):
     def test_update_applies_and_restarts(self):
         plan, plan_path, helper = pyappify.prepare_update("v1.0.1", restart=False)
         self.assertEqual(plan["from"], "v1.0.0")
+        # 启动 bat 是整包自带的本地入口，不进在线更新（中文名在 CDN 上会 404/403，且替换风险大）
         self.assertEqual(plan["replace"], ["config.py", "configs/custom_teams/New__Team__X/team.json",
-                                           "src/added/new.py", "src/change.py", "启动 coco-ww.bat"])
+                                           "src/added/new.py", "src/change.py"])
         self.assertEqual(plan["delete"], ["src/gone.py", "src/pkg/only.py"])
 
         env_file = self.temp / "restart_env.json"
@@ -213,6 +214,7 @@ class OnlineUpdateTest(unittest.TestCase):
         expected["configs/a.json"] = '{"user": 1}'          # 用户设置不覆盖
         del expected["configs/user_deleted.json"]           # 用户删掉的设置不补回来
         expected["src/gone_modified.py"] = "my edit"        # 用户改过的旧文件不删
+        expected["启动 coco-ww.bat"] = "old bat"            # 本地入口不被在线更新替换
         self.assertEqual(read_tree(self.app), expected)
         self.assertFalse((self.app / "src/pkg").exists())   # 删空的目录 (只剩 __pycache__) 一起删
         self.assertFalse(Path(plan["files_dir"]).exists())
@@ -235,7 +237,7 @@ class OnlineUpdateTest(unittest.TestCase):
         plan, plan_path, helper = pyappify.prepare_update("v1.0.1", restart=False)
         plan["pid"] = exited_pid()
         plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
-        (Path(plan["files_dir"]) / plan["replace"][-1]).unlink()  # 最后一个文件换不上
+        (Path(plan["files_dir"]) / "src/added/new.py").unlink()  # 新加的文件换不上
         result = self.run_helper(helper, plan_path)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(read_tree(self.app), before)
@@ -244,7 +246,31 @@ class OnlineUpdateTest(unittest.TestCase):
         self.assertEqual((Path(plan["files_dir"]) / "src/change.py").read_text("utf-8"), "new")
         self.github.requests.clear()
         pyappify.prepare_update("v1.0.1", restart=False)
-        self.assertEqual([p for p in self.github.requests if p.startswith("/raw/")], ["/raw/" + NEW_COMMIT + "/启动 coco-ww.bat"])
+        # 只需重新下载回滚时被清掉的那一个文件
+        self.assertEqual([p for p in self.github.requests if p.startswith("/raw/")],
+                         ["/raw/" + NEW_COMMIT + "/src/added/new.py"])
+
+    def test_local_only_bat_and_docs_not_deleted(self):
+        """回归：清单排除 bat/docs 后，老用户清单里的这些本地文件不能被误删。
+
+        否则从旧版更新到新版时，启动 bat 会被当作"新版删掉的文件"删除，程序无法启动。
+        """
+        import hashlib
+        gone_sha = hashlib.sha256((self.app / "src/gone.py").read_bytes()).hexdigest()
+        old = {"version": "v1.0.0", "commit": OLD_COMMIT, "files": {
+            "启动 coco-ww.bat": {"sha256": "0" * 64, "size": 10},
+            "调试启动(带控制台).bat": {"sha256": "0" * 64, "size": 10},
+            "docs/角色操作笔记.md": {"sha256": "0" * 64, "size": 10},
+            "src/gone.py": {"sha256": gone_sha, "size": 10},
+        }}
+        new = {"version": "v1.0.1", "commit": NEW_COMMIT, "files": {
+            "src/keep.py": {"sha256": "0" * 64, "size": 10},
+        }}
+        download, delete = pyappify.plan_update(new, old, root=self.app)
+        self.assertEqual(delete, ["src/gone.py"])  # 只删真正移除的程序文件
+        self.assertNotIn("启动 coco-ww.bat", delete)
+        self.assertNotIn("docs/角色操作笔记.md", delete)
+        self.assertNotIn("启动 coco-ww.bat", download)
 
     def test_runtime_change_needs_full_package(self):
         with self.assertRaisesRegex(RuntimeError, "运行环境"):

@@ -42,6 +42,23 @@ def build_manifest(commit):
     return {"format": 1, "version": version, "commit": commit, "files": files}
 
 
+# 不进在线更新清单的路径（整包 zip 里都有；在线更新时用不到）：
+# - docs/ 是开发/使用文档，与程序运行无关，纯文档无需增量更新；
+# - *.bat 是启动转发脚本，中文文件名在 CDN 镜像（jsdelivr 等）上会 404/403，
+#   而且它是整包自带的入口，在线替换风险大于收益。
+# 排除这些也保证清单里没有非 ASCII 路径，避免各下载源的中文路径兼容问题。
+MANIFEST_EXCLUDE_PREFIXES = ("docs/",)
+MANIFEST_EXCLUDE_SUFFIXES = (".bat",)
+
+
+def _is_manifest_excluded(rel):
+    if any(rel.startswith(prefix) for prefix in MANIFEST_EXCLUDE_PREFIXES):
+        return True
+    if any(rel.endswith(suffix) for suffix in MANIFEST_EXCLUDE_SUFFIXES):
+        return True
+    return False
+
+
 def build_manifest_from_dir(tree_dir, version, commit):
     """从混淆产物目录生成清单（release 里的文件是 .pyc，不能从 git archive 读）。
 
@@ -57,6 +74,8 @@ def build_manifest_from_dir(tree_dir, version, commit):
             if not os.path.isfile(full):
                 continue
             rel = os.path.relpath(full, tree).replace(os.sep, "/")
+            if _is_manifest_excluded(rel):
+                continue
             with open(full, "rb") as f:
                 data = f.read()
             files[rel] = {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
