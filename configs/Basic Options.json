@@ -1,0 +1,17 @@
+{
+    "Auto Start Game When App Starts": false,
+    "Exit App when Game Exits": false,
+    "Auto Resize Game Window": true,
+    "Mute Game while in Background": false,
+    "Launch with DX11": false,
+    "Start/Stop": "F9",
+    "Trigger Interval": 1,
+    "Minimize Window to System Tray when Closing": false,
+    "Kill Launcher After Start": true,
+    "Create Start Menu Shortcut": true,
+    "Create Desktop Shortcut": true,
+    "Enable MCP Server": true,
+    "Enable Blur": false,
+    "Blur Algorithm": "Inpaint",
+    "Blur Interval": 1
+}
