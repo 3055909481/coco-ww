@@ -21,6 +21,7 @@
 import argparse
 import ast
 import io
+import json
 import os
 import py_compile
 import re
@@ -75,32 +76,37 @@ def resolve_compiler(spec):
     raise RuntimeError("找不到 Python 3.12；发布包运行环境是 3.12，必须用同版本编译 pyc")
 
 
-_COMPILE_SNIPPET = r"""
-import py_compile, sys
-src = sys.stdin.buffer.read().decode('utf-8')
-dest = sys.argv[1]
-# 临时 .py 与目标 pyc 同目录同名，让 co_filename 是正确的源码路径（traceback 可读）；
-# 编译后删除，release 里不残留明文。UNCHECKED_HASH 保证内容确定、不依赖时间戳。
-tmp = str(dest)[:-4] + '.py'  # 去掉 .pyc 后缀（4 字符）
-try:
-    with open(tmp, 'w', encoding='utf-8', newline='') as f:
-        f.write(src)
-    py_compile.compile(tmp, cfile=dest, doraise=True,
-                       invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
-finally:
-    import os
-    os.unlink(tmp)
+# 批量编译：把 (源码, 目标 pyc, co_filename) 列表以 JSON 从 stdin 传给单个 3.12 进程，
+# 用 compile()+marshal 直接写 pyc。全程不产生临时 .py 文件，因此既能精确控制 co_filename，
+# 又不会在工作区里反复创建/删除文件。
+_BATCH_COMPILE_SNIPPET = r"""
+import importlib.util, json, marshal, os, sys
+items = json.loads(sys.stdin.buffer.read().decode('utf-8'))
+MAGIC = importlib.util.MAGIC_NUMBER
+for item in items:
+    code = compile(item['source'], item['filename'], 'exec')
+    dest = item['dest']
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, 'wb') as f:
+        f.write(MAGIC)
+        f.write((1).to_bytes(4, 'little'))  # flags: hash-based (UNCHECKED_HASH)
+        f.write(b'\0' * 8)                  # hash 占位；unchecked 模式运行时忽略
+        f.write(marshal.dumps(code))
+print('compiled', len(items))
 """
 
 
-def compile_to_pyc(compiler, source_code, dest_pyc, display_name):
-    """用目标 Python 把源码字符串编译成 hash-based pyc，写到 dest_pyc。"""
-    dest_pyc.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(compiler + ["-c", _COMPILE_SNIPPET, str(dest_pyc)],
-                          input=source_code.encode("utf-8"),
-                          capture_output=True, timeout=120)
+def compile_batch(compiler, items):
+    """items: [(source_code, dest_pyc, co_filename)]，一次性编译写出所有 pyc。"""
+    payload = [
+        {"source": source, "dest": str(dest), "filename": filename}
+        for source, dest, filename in items
+    ]
+    proc = subprocess.run(compiler + ["-c", _BATCH_COMPILE_SNIPPET],
+                          input=json.dumps(payload).encode("utf-8"),
+                          capture_output=True, timeout=300)
     if proc.returncode != 0:
-        raise RuntimeError(f"编译失败 {display_name}:\n{proc.stderr.decode('utf-8', 'replace')}")
+        raise RuntimeError("批量编译 pyc 失败:\n" + proc.stderr.decode("utf-8", "replace")[-2000:])
 
 
 def collect_builtin_sources():
@@ -194,34 +200,36 @@ def build(out_dir, compiler_spec=None, quiet=False):
     if not quiet:
         print(f"[构建] 内置源码加密: {len(builtin)} 个类 -> {data_path.name} ({data_path.stat().st_size} 字节)")
 
-    # 2) 混淆 + 编译
+    # 2) 先全部混淆（构建端解释器），收集批量编译任务
     files = list(iter_source_files())
     failures = []
-    compiled = 0
+    compile_items = []
     for index, path in enumerate(files, 1):
         rel = path.relative_to(ROOT)
         source = path.read_text(encoding="utf-8")
         try:
             obfuscated = obfuscate_source(source, b"coco-source-obfuscation-key-v1")
-            # 确保 AST 变换后语法仍有效（用构建端解释器即可）
-            ast.parse(obfuscated)
+            ast.parse(obfuscated)  # AST 变换后语法必须有效
         except Exception as exc:
             failures.append((str(rel), f"混淆失败: {exc}"))
             continue
         dest = out / rel.with_suffix(".pyc")
-        try:
-            compile_to_pyc(compiler, obfuscated, dest, str(rel))
-            compiled += 1
-        except Exception as exc:
-            failures.append((str(rel), str(exc)))
+        # co_filename 用模块对应的 .py 路径，traceback 可读；不落盘到输出目录
+        compile_items.append((obfuscated, dest, str(rel.with_suffix(".py")).replace("\\", "/")))
         if not quiet and index % 25 == 0:
-            print(f"[构建] 已处理 {index}/{len(files)} ...")
-
+            print(f"[构建] 已混淆 {index}/{len(files)} ...")
     if failures:
         msg = "\n".join(f"  - {name}: {err}" for name, err in failures)
         raise RuntimeError(f"混淆构建失败 {len(failures)} 个文件:\n{msg}")
 
-    # 3) 输出目录不应残留任何项目自身 .py
+    # 3) 用目标 Python 一次性批量编译成 pyc（无临时文件）
+    try:
+        compile_batch(compiler, compile_items)
+    except Exception as exc:
+        raise RuntimeError(f"批量编译失败: {exc}")
+    compiled = len(compile_items)
+
+    # 4) 输出目录不应残留任何项目自身 .py
     leftovers = []
     for dirname in OBFUSCATE_DIRS:
         leftover_dir = out / dirname

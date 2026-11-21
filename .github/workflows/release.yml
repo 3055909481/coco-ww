@@ -1,10 +1,12 @@
 # 推到 main 的提交里 config.py 的版本号变了 -> 自动发混淆版 Release。
 #
-# release 里分发的不是明文源码，而是 AST 混淆 + Python 3.12 编译后的 .pyc：
+# release 里分发的是"混淆 + 带运行环境"的整包，以及在线更新清单：
 #   1. 构建混淆产物到 build/release（src/ pyappify/ 全部变成 .pyc，内置角色源码加密另存）
 #   2. 把产物推到 obfuscated 分支（在线更新按提交号从该分支 raw 下载，拿到的就是 .pyc）
-#   3. 清单基于产物目录生成，commit 指向 obfuscated 分支的提交
-#   4. 只发清单不发整包：整包（带 python 运行环境）仍本地打包后手动上传
+#   3. 用混淆产物 + Python 3.12 运行环境打整包 coco-ww-vX.Y.Z.zip（含 Windows 专属依赖，
+#      所以 runner 必须是 windows-latest）
+#   4. 清单基于产物目录生成，commit 指向 obfuscated 分支的提交
+#   5. Release 同时挂整包 zip 和 update-manifest.json
 # 版本号没变（或这个 tag 已经有了）就什么都不做。
 name: Auto Release
 
@@ -23,9 +25,14 @@ concurrency:
   group: auto-release
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Windows 专属依赖（pywin32/comtypes/pycaw）只能在 Windows 上装，整包必须在这里打
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -59,7 +66,15 @@ jobs:
 
       - name: Build obfuscated release tree
         if: steps.ver.outputs.skip == 'false'
-        run: python tools/obfuscate_build.py --out build/release --python "python3"
+        # setup-python 装好的 3.12 就是 python，显式传入避免 py launcher 认不到
+        run: python tools/obfuscate_build.py --out build/release --python "python"
+
+      - name: Pack full release zip (with Python runtime)
+        id: pack
+        if: steps.ver.outputs.skip == 'false'
+        run: |
+          python tools/pack_release.py --obf-dir build/release --python "python" --out "build/coco-ww-${{ steps.ver.outputs.version }}.zip"
+          echo "zip=build/coco-ww-${{ steps.ver.outputs.version }}.zip" >> "$GITHUB_OUTPUT"
 
       - name: Publish obfuscated tree to branch
         id: obf
@@ -83,16 +98,6 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "obfuscated 分支提交: $sha"
 
-      - name: Find full package release
-        id: full
-        if: steps.ver.outputs.skip == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          url=$(gh api "repos/${{ github.repository }}/releases?per_page=50" \
-            --jq '[.[] | select(.draft | not) | select(any(.assets[]; .name | test("^coco-ww-.*[.]zip$")))][0].html_url // ""')
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-
       - name: Build manifest and notes
         if: steps.ver.outputs.skip == 'false'
         # 清单输出到 build/release 之外，避免把清单文件本身算进清单
@@ -102,8 +107,7 @@ jobs:
             --commit "${{ steps.obf.outputs.sha }}" \
             --source-commit "${{ github.sha }}" \
             --version "${{ steps.ver.outputs.version }}" \
-            --prev-tag "${{ steps.ver.outputs.prev }}" \
-            --full-url "${{ steps.full.outputs.url }}"
+            --prev-tag "${{ steps.ver.outputs.prev }}"
 
       - name: Create release
         if: steps.ver.outputs.skip == 'false'
@@ -111,5 +115,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           v="${{ steps.ver.outputs.version }}"
-          gh release create "$v" build/manifest/update-manifest.json \
+          gh release create "$v" \
+            "${{ steps.pack.outputs.zip }}" \
+            build/manifest/update-manifest.json \
             --target "$GITHUB_SHA" --title "coco-ww $v" --notes-file build/manifest/notes.md --latest

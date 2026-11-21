@@ -88,10 +88,8 @@ def build_notes(version, prev_tag, source_commit, full_url, runtime_changed):
         lines += ["⚠️ 这一版换了运行环境（requirements.txt 变了），在线更新补不了，要下载完整包。", ""]
     lines += [
         "1. 已经是 v1.0.2 及以上的：程序里会弹更新提示，点「更新」就行（也可以在「关于 → 应用更新」里手动检查）。",
-        "2. 新装：这一版只有在线更新清单，没有完整包。先到"
-        + (f" [完整包下载页]({full_url}) " if full_url else "带 zip 附件的版本 ")
-        + "下载 `coco-ww-vX.Y.Z.zip`，解压到**纯英文路径**（例如 `D:\\coco-ww`），双击 `启动 coco-ww.bat`，"
-        "再在程序里更新到这一版。",
+        "2. 新装：下载本页附件 `coco-ww-vX.Y.Z.zip`（自带 Python 运行环境），解压到**纯英文路径**"
+        "（例如 `D:\\coco-ww`），双击 `启动 coco-ww.bat`。",
         "",
         "附件 `update-manifest.json` 是在线更新用的文件清单，不用下载。",
         "",
