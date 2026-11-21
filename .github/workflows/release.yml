@@ -1,0 +1,72 @@
+# 推到 main 的提交里 config.py 的版本号变了 -> 自动发 Release, 只带在线更新清单 update-manifest.json。
+# 不打整包: 在线更新按提交号从仓库下文件, 用不到 zip。整包(带 python 运行环境)只在新装/换运行环境时
+# 才要, 还是本地用 pack_release.py 打了手动传。版本号没变(或这个 tag 已经有了)就什么都不做。
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'config.py'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: ver
+        run: |
+          version=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']+)["'"'"'].*/\1/p' config.py | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
+            echo "tag $version 已经有了, 不发"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          prev=$(git tag --merged HEAD --list 'v*' --sort=-v:refname | head -1)
+          newest=$(printf '%s\n%s\n' "$prev" "$version" | sort -V | tail -1)
+          if [ -n "$prev" ] && [ "$newest" != "$version" ]; then
+            echo "::error::版本号 $version 不比上一版 $prev 新, 不发"
+            exit 1
+          fi
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Find full package release
+        id: full
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url=$(gh api "repos/${{ github.repository }}/releases?per_page=50" \
+            --jq '[.[] | select(.draft | not) | select(any(.assets[]; .name | test("^coco-ww-.*[.]zip$")))][0].html_url // ""')
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Build manifest and notes
+        if: steps.ver.outputs.skip == 'false'
+        run: |
+          python3 tools/release_manifest.py out --commit "$GITHUB_SHA" \
+            --prev-tag "${{ steps.ver.outputs.prev }}" --full-url "${{ steps.full.outputs.url }}"
+
+      - name: Create release
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          gh release create "$v" out/update-manifest.json \
+            --target "$GITHUB_SHA" --title "coco-ww $v" --notes-file out/notes.md --latest
