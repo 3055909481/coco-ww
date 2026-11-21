@@ -1,5 +1,7 @@
 """主页: 背景是玩家自己选的图, 上面两张毛玻璃卡片放最常用的两件事 —— 自动战斗和刷4C。
 
+- 右上角的「启动 F9」是整个识别的总开关 (跟其他页运行栏右边那个按钮是同一个);
+  自动战斗卡片底下的开关只管自动战斗这一个任务, 不碰总开关
 - 细的设置还在「任务」页, 卡片右上角的齿轮直接跳过去
 - 运行时顶部有一条状态, 点「详细」或右上角「详细面板」去详细面板 (DashboardTab)
 - 背景图从卡片上沿开始往下渐变成深色, 卡片和队伍像放在图的「地面」上
@@ -136,36 +138,52 @@ def combat_chips(config, f_start_key='按 F 开始战斗', f_delay_key='F 之后
     return chips
 
 
-def combat_view(run_button, enabled, in_combat, farm_active):
-    """自动战斗卡片: (状态, 色调, 按钮动作)。
+def run_view(run_button, hotkey):
+    """右上角总开关: (文字, 图标, 按钮样式, 能不能点)。
 
-    run_button 是运行栏按钮现在的状态 (start / pause / cancel / disabled);
-    按钮动作: start 开启并开始, pause 暂停, cancel 取消启动游戏, disabled 不能点。
+    run_button 是运行栏按钮现在的状态 (start / pause / cancel / disabled), 点它就是按 F9。
+    """
+    suffix = f'  {hotkey}' if hotkey else ''
+    if run_button == 'pause':
+        return f'暂停{suffix}', 'pause', 'dark', True
+    if run_button == 'cancel':
+        return '取消启动', 'x', 'dark', True
+    if run_button == 'disabled':
+        return f'启动{suffix}', 'play', 'dark', False
+    return f'启动{suffix}', 'play', 'accent', True
+
+
+def combat_view(run_button, enabled, in_combat, farm_active):
+    """自动战斗卡片标题下的状态: (文字, 色调)。
+
+    enabled 是自动战斗自己的开关; run_button 是总开关 (运行栏按钮) 的状态, 见 run_view。
     """
     if run_button == 'disabled':
-        return '被其他程序接管中', 'warning', 'disabled'
+        return '被其他程序接管中', 'warning'
     if run_button == 'cancel':
-        return '正在启动游戏', 'accent', 'cancel'
+        return '正在启动游戏', 'accent'
     running = run_button == 'pause'
     if running and farm_active:
-        return '交给刷4C', 'accent', 'pause'
+        return '交给刷4C', 'accent'
     if not enabled:
-        return '已关闭', 'idle', 'start'
+        return '已关闭', 'idle'
     if not running:
-        return '未开始', 'idle', 'start'
+        return '等启动识别', 'warning'
     if in_combat:
-        return '战斗中', 'accent', 'pause'
-    return '待命 · 进战斗自动开打', 'success', 'pause'
+        return '战斗中', 'accent'
+    return '待命 · 进战斗自动开打', 'success'
 
 
-def combat_hint(status_tone, action, f_start, hotkey, farm_active=False):
-    if farm_active and action == 'pause':
+def combat_hint(run_button, enabled, f_start, hotkey, farm_active=False):
+    if farm_active and run_button == 'pause':
         return '刷4C 进本后自己打，这里不用管'
-    if action == 'pause' and status_tone == 'accent':
-        return f'按 {hotkey} 暂停' if hotkey else '点下面暂停'
+    if not enabled:
+        return '打开下面的开关，进战斗就自动打'
+    if run_button == 'start':
+        return f'识别还没启动，点右上角「启动」或按 {hotkey}' if hotkey else '识别还没启动，点右上角「启动」'
     if f_start:
-        return '开始后进战斗自动打，副本里按 F 直接开'
-    return '开始后进战斗自动打'
+        return '进战斗自动打，副本里按 F 直接开'
+    return '进战斗自动打'
 
 
 def farm_target(config, teleport_keys, tr=lambda s: s):
@@ -382,6 +400,72 @@ class _CardHeader(QWidget):
         self.dot.set_tone(tone)
 
 
+class SwitchKnob(QWidget):
+    """开关的样子, 只管画; 点击交给外面那一整行。"""
+
+    WIDTH = 40
+    HEIGHT = 22
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._on = False
+
+    def set_on(self, on):
+        if on != self._on:
+            self._on = on
+            self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        radius = self.HEIGHT / 2
+        painter.setBrush(QColor(ACCENT) if self._on else QColor(255, 255, 255, 46))
+        painter.drawRoundedRect(QRectF(0, 0, self.WIDTH, self.HEIGHT), radius, radius)
+        knob = self.HEIGHT - 6
+        x = self.WIDTH - 3 - knob if self._on else 3
+        painter.setBrush(QColor(ON_ACCENT) if self._on else QColor(255, 255, 255, 210))
+        painter.drawEllipse(QRectF(x, 3, knob, knob))
+
+
+class ToggleRow(QPushButton):
+    """卡片底下一整行的开关: 左边写开没开, 右边是开关, 点哪儿都算。"""
+
+    def __init__(self, height=46, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(height)
+        base, hover, pressed = BUTTON_STYLES['glass']
+        self.setStyleSheet(f'QPushButton {{ {base} border-radius: 12px; }}'
+                           f'QPushButton:hover {{ {hover} }} QPushButton:pressed {{ {pressed} }}')
+        row = QHBoxLayout(self)
+        row.setContentsMargins(16, 0, 14, 0)
+        row.setSpacing(10)
+        self.text = _label('', 15, 700)
+        self.knob = SwitchKnob()
+        self.text.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        row.addWidget(self.text)
+        row.addStretch(1)
+        row.addWidget(self.knob)
+        self._on = None
+
+    @property
+    def on(self):
+        return bool(self._on)
+
+    def set_on(self, on):
+        if on == self._on:
+            return
+        self._on = on
+        self.knob.set_on(on)
+        self.text.setText('已开启' if on else '已关闭')
+        color = WHITE if on else TEXT_SECONDARY
+        self.text.setStyleSheet(f'color: {color}; background: transparent; font-family: {FONT_FAMILY}; '
+                                'font-size: 15px; font-weight: 700;')
+
+
 # --- 主页 -----------------------------------------------------------------------------
 
 class HomeTab(QWidget):
@@ -389,7 +473,7 @@ class HomeTab(QWidget):
     add_after_default_tabs = False
     nav_section = 'run'
     startup_page = True
-    # 主页自己有连接状态和开始按钮, 主窗口在这页把顶上那条运行栏收起来
+    # 主页自己有连接状态 (左上) 和总开关 (右上), 主窗口在这页把顶上那条运行栏收起来
     show_run_bar = False
     icon = 'home'
 
@@ -404,7 +488,8 @@ class HomeTab(QWidget):
         self._blurred = None
         self._built_for = None
         self._stacked = None
-        self._combat_action = 'start'
+        # 点了开关但任务还没真的开/关 (开是在后台线程里开的): (想要的状态, 截止时间), 期间按想要的画
+        self._combat_wanted = None
         self._last_run_team = None
         self._last_run_read = 0.0
         self._team_code = (None, '')  # (队伍, 「队伍代码：自定义/内置」), 换队伍才重新比对代码文件
@@ -454,7 +539,7 @@ class HomeTab(QWidget):
         self.status_chip.setCursor(Qt.CursorShape.PointingHandCursor)
         self.status_chip.setToolTip('游戏窗口、截图和输入方式')
         self.status_chip.installEventFilter(self)
-        top.addWidget(self.status_chip, 0, Qt.AlignmentFlag.AlignTop)
+        top.addWidget(self.status_chip, 0, Qt.AlignmentFlag.AlignVCenter)
         top.addStretch(1)
 
         self.live_strip = GlassFrame(self, radius=17, alpha=0.72)
@@ -473,12 +558,22 @@ class HomeTab(QWidget):
         for widget in (self.live_dot, self.live_title, self.live_detail, self.live_button):
             strip_row.addWidget(widget)
         self.live_strip.hide()
-        top.addWidget(self.live_strip, 0, Qt.AlignmentFlag.AlignTop)
+        top.addWidget(self.live_strip, 0, Qt.AlignmentFlag.AlignVCenter)
         top.addStretch(1)
 
-        self.background_button = _button('换背景', 'dark', 30, 'image', radius=15, size=12, weight=600)
+        self.background_button = _button('', 'dark', 34, 'image', radius=17)
+        self.background_button.setFixedWidth(34)
+        self.background_button.setStyleSheet(
+            self.background_button.styleSheet().replace('padding: 0 14px;', 'padding: 0;'))
+        self.background_button.setToolTip('换背景')
         self.background_button.clicked.connect(self._open_background_menu)
-        top.addWidget(self.background_button, 0, Qt.AlignmentFlag.AlignTop)
+        top.addWidget(self.background_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        # 整个识别的总开关, 跟运行栏那个按钮、F9 是同一个动作; 自动战斗自己的开关在卡片里
+        self.run_button = _button('启动', 'accent', 34, 'play', ON_ACCENT, radius=17, size=14)
+        self.run_button.setMinimumWidth(112)
+        self.run_button.setToolTip('启动识别: 开着的功能 (自动战斗等) 开始工作, 游戏没开会先启动游戏')
+        self.run_button.clicked.connect(self._on_run_action)
+        top.addWidget(self.run_button, 0, Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(top)
         root.addStretch(1)
 
@@ -574,9 +669,11 @@ class HomeTab(QWidget):
         self.chip_row.addStretch(1)
         column.addLayout(self.chip_row)
         column.addStretch(1)
-        self.combat_button = _button('开始', 'accent', 46, 'play', ON_ACCENT)
-        self.combat_button.clicked.connect(self._on_combat_action)
-        column.addWidget(self.combat_button)
+        # 只开关自动战斗这个任务; 整个识别启不启动看右上角的总开关
+        self.combat_toggle = ToggleRow(46)
+        self.combat_toggle.setToolTip('只开关自动战斗; 整个识别用右上角的「启动」')
+        self.combat_toggle.clicked.connect(self._on_combat_toggle)
+        column.addWidget(self.combat_toggle)
         return card
 
     def _build_farm_card(self):
@@ -741,7 +838,9 @@ class HomeTab(QWidget):
         menu.addAction('选择图片…', self._choose_background)
         clear = menu.addAction('恢复纯色', self._clear_background)
         clear.setEnabled(self._background_path() is not None)
-        menu.exec(self.background_button.mapToGlobal(QPoint(0, self.background_button.height() + 4)))
+        # 按钮贴着右边, 菜单右边对齐按钮往左展开
+        button = self.background_button
+        menu.exec(button.mapToGlobal(QPoint(button.width() - menu.sizeHint().width(), button.height() + 4)))
 
     def _choose_background(self):
         path, _ = QFileDialog.getOpenFileName(self, '选择背景图片', '', '图片 (*.png *.jpg *.jpeg *.bmp *.webp)')
@@ -843,6 +942,7 @@ class HomeTab(QWidget):
     def refresh(self):
         try:
             self._refresh_connection()
+            self._refresh_run()
             self._refresh_team()
             farm_active = self._refresh_farm()
             self._refresh_combat(farm_active)
@@ -910,6 +1010,24 @@ class HomeTab(QWidget):
             self._team_code = (key, code)
         self.team_detail.setText(' · '.join(part for part in (source, self._team_code[1]) if part))
 
+    def _refresh_run(self):
+        text, icon_name, kind, enabled = run_view(self._run_button(), self._hotkey())
+        button = self.run_button
+        button.setText(text)
+        button.setIcon(kit_icon(icon_name, ON_ACCENT if kind == 'accent' else WHITE))
+        button.setEnabled(enabled)
+        if button.property('kind') != kind:
+            button.setProperty('kind', kind)
+            style_button(button, kind, radius=17, size=14)
+
+    def _combat_enabled(self, task):
+        if self._combat_wanted is not None:
+            wanted, deadline = self._combat_wanted
+            if bool(task.enabled) != wanted and time.monotonic() < deadline:
+                return wanted
+            self._combat_wanted = None
+        return bool(task.enabled)
+
     def _refresh_combat(self, farm_active):
         task = self._auto_task()
         self.combat_card.setVisible(task is not None)
@@ -917,12 +1035,14 @@ class HomeTab(QWidget):
             return
         executor = self._executor()
         in_combat = executor is not None and getattr(executor, 'current_task', None) is task
-        status, tone, action = combat_view(self._run_button(), task.enabled, in_combat, farm_active)
-        self._combat_action = action
+        enabled = self._combat_enabled(task)
+        run_button = self._run_button()
+        status, tone = combat_view(run_button, enabled, in_combat, farm_active)
         self.combat_header.set_status(status, tone)
+        self.combat_toggle.set_on(enabled)
         f_start_key = getattr(task, 'F_START_KEY', '按 F 开始战斗')
         f_start = bool(task.config.get(f_start_key))
-        self.combat_hint.setText(combat_hint(tone, action, f_start, self._hotkey(), farm_active))
+        self.combat_hint.setText(combat_hint(run_button, enabled, f_start, self._hotkey(), farm_active))
         chips = combat_chips(task.config, f_start_key, getattr(task, 'F_DELAY_KEY', 'F 之后等待(秒)'))
         # 一行放不下就从后面往前藏, 不让标签被截掉半个字
         room = CARD_WIDTH - 36
@@ -934,20 +1054,6 @@ class HomeTab(QWidget):
             if fits:
                 room -= width + self.chip_row.spacing()
         hotkey = self._hotkey()
-        button = self.combat_button
-        button.setEnabled(action != 'disabled')
-        if action == 'pause':
-            button.setText(f'暂停  {hotkey}' if hotkey else '暂停')
-            button.setIcon(kit_icon('pause', WHITE))
-            style_button(button, 'glass')
-        elif action == 'cancel':
-            button.setText('取消启动')
-            button.setIcon(kit_icon('x', WHITE))
-            style_button(button, 'glass')
-        else:
-            button.setText(f'开始  {hotkey}' if hotkey else '开始')
-            button.setIcon(kit_icon('play', ON_ACCENT))
-            style_button(button, 'accent')
         if in_combat and not farm_active:
             self.live_title.setText('自动战斗 · 战斗中')
             self.live_detail.setText(f'按 {hotkey} 暂停' if hotkey else '')
@@ -990,24 +1096,35 @@ class HomeTab(QWidget):
 
     # --- 操作 -----------------------------------------------------------------------
 
-    def _on_combat_action(self):
-        task = self._auto_task()
-        action = self._combat_action
+    def _on_run_action(self):
+        """右上角总开关: 跟按 F9 一样, 交给运行栏去启动/暂停/取消启动。"""
         try:
-            if action == 'pause':
-                og.executor.pause()
-            elif action == 'cancel':
-                og.app.start_controller.cancel_start()
-            elif action == 'start' and task is not None:
-                from ok.ui.qt.tasks.tasks_page import set_trigger_enabled
-                if not task.enabled:
-                    set_trigger_enabled(task, True)
-                if self._run_button() == 'start':
-                    og.app.start_controller.start()
+            run_bar = self._run_bar()
+            if run_bar is not None:
+                run_bar.refresh()
+                run_bar.toggle_executor()
+            else:
+                og.app.start_controller.start()
         except Exception as e:
-            logger.error(f'主页: 自动战斗按钮出错 {e}')
+            logger.error(f'主页: 启动按钮出错 {e}')
             self._toast(str(e), 'danger')
         QTimer.singleShot(200, self.refresh)
+
+    def _on_combat_toggle(self):
+        """自动战斗自己的开关: 只开关这个任务, 不启动也不暂停整个识别。"""
+        task = self._auto_task()
+        if task is None:
+            return
+        wanted = not self.combat_toggle.on
+        try:
+            from ok.ui.qt.tasks.tasks_page import set_trigger_enabled
+            set_trigger_enabled(task, wanted)
+            self._combat_wanted = (wanted, time.monotonic() + 3)
+        except Exception as e:
+            logger.error(f'主页: 自动战斗开关出错 {e}')
+            self._toast(str(e), 'danger')
+        self.refresh()
+        QTimer.singleShot(300, self.refresh)
 
     def _on_farm_action(self):
         task = self._farm_task()

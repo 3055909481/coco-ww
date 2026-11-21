@@ -79,20 +79,36 @@ class CombatCardTest(unittest.TestCase):
         config = {'按 F 开始战斗': True, 'F 之后等待(秒)': 'bad', 'Auto Target': False, 'Use Liberation': False}
         self.assertEqual(home.combat_chips(config), ['按 F 开打', '大世界不放大招'])
 
-    def test_view_follows_executor_and_task(self):
-        self.assertEqual(home.combat_view('start', True, False, False), ('未开始', 'idle', 'start'))
-        self.assertEqual(home.combat_view('pause', False, False, False), ('已关闭', 'idle', 'start'))
-        self.assertEqual(home.combat_view('pause', True, False, False)[2], 'pause')
-        self.assertEqual(home.combat_view('pause', True, True, False), ('战斗中', 'accent', 'pause'))
-        self.assertEqual(home.combat_view('pause', True, False, True), ('交给刷4C', 'accent', 'pause'))
-        self.assertEqual(home.combat_view('cancel', True, False, False)[2], 'cancel')
-        self.assertEqual(home.combat_view('disabled', True, False, False)[2], 'disabled')
+    def test_view_follows_switch_and_executor(self):
+        # 开关开着但总开关没启动: 提醒去启动识别
+        self.assertEqual(home.combat_view('start', True, False, False), ('等启动识别', 'warning'))
+        # 开关关着: 不管总开关
+        self.assertEqual(home.combat_view('start', False, False, False), ('已关闭', 'idle'))
+        self.assertEqual(home.combat_view('pause', False, False, False), ('已关闭', 'idle'))
+        self.assertEqual(home.combat_view('pause', True, False, False)[1], 'success')
+        self.assertEqual(home.combat_view('pause', True, True, False), ('战斗中', 'accent'))
+        self.assertEqual(home.combat_view('pause', True, False, True), ('交给刷4C', 'accent'))
+        self.assertEqual(home.combat_view('cancel', True, False, False), ('正在启动游戏', 'accent'))
+        self.assertEqual(home.combat_view('disabled', True, False, False)[1], 'warning')
 
     def test_hint(self):
-        self.assertEqual(home.combat_hint('accent', 'pause', True, 'F11'), '按 F11 暂停')
-        self.assertIn('按 F', home.combat_hint('idle', 'start', True, 'F11'))
-        self.assertEqual(home.combat_hint('idle', 'start', False, ''), '开始后进战斗自动打')
-        self.assertIn('刷4C', home.combat_hint('accent', 'pause', True, 'F11', farm_active=True))
+        self.assertIn('开关', home.combat_hint('pause', False, True, 'F9'))
+        self.assertEqual(home.combat_hint('start', True, True, 'F9'), '识别还没启动，点右上角「启动」或按 F9')
+        self.assertEqual(home.combat_hint('start', True, True, ''), '识别还没启动，点右上角「启动」')
+        self.assertIn('按 F', home.combat_hint('pause', True, True, 'F9'))
+        self.assertEqual(home.combat_hint('pause', True, False, 'F9'), '进战斗自动打')
+        self.assertIn('刷4C', home.combat_hint('pause', False, True, 'F9', farm_active=True))
+
+
+class RunButtonTest(unittest.TestCase):
+    def test_follows_run_bar_state(self):
+        self.assertEqual(home.run_view('start', 'F9'), ('启动  F9', 'play', 'accent', True))
+        self.assertEqual(home.run_view('pause', 'F9'), ('暂停  F9', 'pause', 'dark', True))
+        self.assertEqual(home.run_view('cancel', 'F9'), ('取消启动', 'x', 'dark', True))
+        self.assertEqual(home.run_view('disabled', 'F9')[3], False)
+
+    def test_without_hotkey(self):
+        self.assertEqual(home.run_view('start', '')[0], '启动')
 
 
 class FarmCardTest(unittest.TestCase):
@@ -141,6 +157,7 @@ class HomeTabWidgetTest(unittest.TestCase):
                 self.assertEqual(tab.nav_section, 'run')
                 self.assertTrue(tab.startup_page)
                 self.assertFalse(tab.add_after_default_tabs)
+                self.assertEqual(tab.run_button.text(), '启动')
                 tab.deleteLater()
             finally:
                 Config.config_folder = old
