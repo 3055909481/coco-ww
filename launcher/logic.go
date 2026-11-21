@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -92,26 +91,20 @@ func readLocalVersion(appDir string) string {
 	return ""
 }
 
-type ghRelease struct {
-	TagName string `json:"tag_name"`
-	HTMLURL string `json:"html_url"`
-	Draft   bool   `json:"draft"`
-	Prerelease bool `json:"prerelease"`
-}
-
-// 检查 GitHub 上是否有比本地更新的正式版。网络失败一律视为"没有更新"，不阻塞启动。
+// 检查 GitHub 上是否有比本地更新的版本。
+// 走 raw.githubusercontent.com 的 version.txt（不计入 GitHub API 配额，不会被限流），
+// 网络失败一律视为"没有更新"，不阻塞启动。
 func checkUpdate(current string) (newer bool, url string, latest string) {
-	if repo == "" || strings.Contains(repo, "/") == false {
+	if repo == "" || !strings.Contains(repo, "/") {
 		return false, "", ""
 	}
-	api := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=20", repo)
+	rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/obfuscated/version.txt", repo)
 	client := &http.Client{Timeout: httpTimeout}
-	req, err := http.NewRequest(http.MethodGet, api, nil)
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return false, "", ""
 	}
 	req.Header.Set("User-Agent", "coco-ww-launcher")
-	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, "", ""
@@ -120,28 +113,16 @@ func checkUpdate(current string) (newer bool, url string, latest string) {
 	if resp.StatusCode != http.StatusOK {
 		return false, "", ""
 	}
-	var releases []ghRelease
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+	buf := make([]byte, 128)
+	n, _ := resp.Body.Read(buf)
+	tag := strings.TrimSpace(string(buf[:n]))
+	if tag == "" || len(tag) > 40 {
 		return false, "", ""
 	}
-	// 取最新的正式版（跳过 draft / prerelease），按版本号取最大
-	var best *ghRelease
-	for i := range releases {
-		r := &releases[i]
-		if r.Draft || r.Prerelease || r.TagName == "" {
-			continue
-		}
-		if best == nil || compareVersion(r.TagName, best.TagName) > 0 {
-			best = r
-		}
+	if compareVersion(tag, current) > 0 {
+		return true, fmt.Sprintf("https://github.com/%s/releases/latest", repo), tag
 	}
-	if best == nil {
-		return false, "", ""
-	}
-	if compareVersion(best.TagName, current) > 0 {
-		return true, best.HTMLURL, best.TagName
-	}
-	return false, "", best.TagName
+	return false, "", tag
 }
 
 // require 校验整包必需的文件是否齐全，返回缺失项的描述列表。

@@ -218,8 +218,45 @@ def _manifest_url(release):
     return None
 
 
+def _fetch_releases_from_raw():
+    """GitHub API 限流时的降级路径：raw 域名 + release 下载域名都不计入 API 配额。
+
+    obfuscated 分支的 version.txt 由发版流程写入，内容就是最新版本号；
+    清单走 release 的 download 链接（github.com 域名，实测不受 API 限流影响）。
+    只能拿到最新版，但对"检查更新/更新到最新"这个用途完全够。
+    """
+    raw_version = (f"https://raw.githubusercontent.com/{REPO}/obfuscated/version.txt")
+    try:
+        with _open(raw_version) as response:
+            tag = response.read().decode("utf-8").strip()
+    except (HTTPError, OSError) as error:
+        raise RuntimeError(f"检查更新失败，且备用源也不可用: {error}") from error
+    if not tag or len(tag) > 40:
+        raise RuntimeError("备用源返回的版本号不对")
+    from ok.util.version import compare_versions
+    try:
+        compare_versions(tag, tag)
+    except ValueError as error:
+        raise RuntimeError(f"备用源版本号格式不对: {tag}") from error
+    return {tag: {
+        "version": tag,
+        "kind": "tag",
+        "update_note": [],
+        "prerelease": False,
+        "published_at": "",
+        "manifest_url": f"https://github.com/{REPO}/releases/download/{tag}/{MANIFEST_ASSET}",
+    }}
+
+
 def _fetch_releases():
-    data = _get_json(API_RELEASES, accept="application/vnd.github+json")
+    try:
+        data = _get_json(API_RELEASES, accept="application/vnd.github+json")
+    except RuntimeError as error:
+        # 只有"API 限流"才降级；其它错误（网络、格式）照原样抛出，避免掩盖真问题
+        if "限流" in str(error):
+            _log().warning("coco-ww update: GitHub API 限流，改用 raw 备用源")
+            return _fetch_releases_from_raw()
+        raise
     if not isinstance(data, list):
         raise RuntimeError("GitHub 返回的 Release 列表格式不对")
     releases = {}

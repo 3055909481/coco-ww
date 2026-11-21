@@ -83,7 +83,7 @@ jobs:
           # 先跑测试：此时还没有 requireAdministrator 的 syso，测试 exe 不会要求提权
           go test ./...
           go install github.com/tc-hib/go-winres@latest
-          NUMVER="${VERSION#v}.0"   # 例：v1.0.6 -> 1.0.6.0
+          NUMVER="${VERSION#v}.0"   # 例：v1.0.7 -> 1.0.7.0
           "$(go env GOPATH)/bin/go-winres.exe" simply \
             --icon ../icons/icon.ico --manifest gui --admin --arch amd64 \
             --out rsrc --no-suffix \
