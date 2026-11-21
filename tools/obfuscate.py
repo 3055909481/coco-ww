@@ -77,7 +77,7 @@ class _LocalRenamer(ast.NodeTransformer):
 
     def __init__(self):
         self.counter = 0
-        self.scope_stack = [set()]  # 每层：本作用域已声明的名字（用于判断哪些需要改写）
+        self.scope_stack = [_Scope()]  # 模块作用域：无绑定，作为查不到的终点
 
     def _new_name(self):
         self.counter += 1
@@ -85,17 +85,14 @@ class _LocalRenamer(ast.NodeTransformer):
         return name
 
     def visit_Name(self, node):
-        # 只在最内层"拥有该名字"的作用域里替换；外层作用域的名字保持原样，
-        # 由它自己的函数处理。这样闭包引用会自然指向外层已改名的变量。
-        for owns in reversed(self.scope_stack):
-            if node.id in owns:
-                node.id = self._rename_map_for(owns)[node.id]
-                break
+        # 从内到外找"绑定该名字"的作用域。关键：一旦某层绑定了名字（参数或局部变量），
+        # 就只能用它自己的映射，即使该名字没被改名（如参数）也不能穿透到外层——
+        # 否则 lambda 参数 char 会被外层的同名推导变量 _obf62 错误替换（NameError）。
+        for scope in reversed(self.scope_stack):
+            if node.id in scope.bound:
+                node.id = scope.mapping.get(node.id, node.id)
+                return node
         return node
-
-    def _rename_map_for(self, owns):
-        # owns 是 frozenset 场景不支持索引，实际用 _Scope 对象
-        return owns.mapping
 
     def _collect(self, body, arguments):
         """返回 (可改名集合, 是否含危险构造)。不递归进嵌套函数体。"""
@@ -156,13 +153,14 @@ class _LocalRenamer(ast.NodeTransformer):
             self.visit(node.returns)
 
         safe, danger = self._collect(node.body, node.args)
-        scope = _Scope()
+        param_names = {arg.arg for arg in _all_arg_nodes(node.args)}
+        # 参数名绝不改名（外部可能用关键字参数调用），即使函数体里对它重新赋值。
+        # 因此从待改名集合里剔除参数名；但它们仍属于本作用域绑定，挡住外层穿透。
+        safe = safe - param_names
+        scope = _Scope(bound=param_names | safe)
         if not danger:
             for name in sorted(safe):
                 scope.mapping[name] = self._new_name()
-            for arg in _all_arg_nodes(node.args):
-                if arg.arg in scope.mapping:
-                    arg.arg = scope.mapping[arg.arg]
 
         self.scope_stack.append(scope)
         node.body = [self.visit(stmt) for stmt in node.body]
@@ -179,13 +177,12 @@ class _LocalRenamer(ast.NodeTransformer):
         for expr in _arg_expressions(node.args):
             self.visit(expr)
         safe, danger = self._collect([node.body], node.args)
-        scope = _Scope()
+        param_names = {arg.arg for arg in _all_arg_nodes(node.args)}
+        safe = safe - param_names  # lambda 参数也不改名
+        scope = _Scope(bound=param_names | safe)
         if not danger:
             for name in sorted(safe):
                 scope.mapping[name] = self._new_name()
-            for arg in _all_arg_nodes(node.args):
-                if arg.arg in scope.mapping:
-                    arg.arg = scope.mapping[arg.arg]
         self.scope_stack.append(scope)
         node.body = self.visit(node.body)
         self.scope_stack.pop()
@@ -201,15 +198,21 @@ class _LocalRenamer(ast.NodeTransformer):
 
 
 class _Scope:
-    """一个函数作用域：记录 原名 -> 唯一新名。"""
+    """一个函数作用域。
 
-    __slots__ = ("mapping",)
+    bound: 该作用域绑定的所有名字（参数 + 局部变量），含未改名的参数；
+    mapping: 其中被改名的 原名 -> 唯一新名。
+    visit_Name 只认最近的绑定层，未改名的绑定（参数）也必须挡住外层穿透。
+    """
 
-    def __init__(self):
+    __slots__ = ("mapping", "bound")
+
+    def __init__(self, bound=None):
         self.mapping = {}
+        self.bound = set(bound or ())
 
     def __contains__(self, name):
-        return name in self.mapping
+        return name in self.bound
 
 
 class _DocstringStripper(ast.NodeTransformer):

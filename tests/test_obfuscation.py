@@ -55,6 +55,26 @@ class TestAstObfuscation(unittest.TestCase):
         left, right = self._run_pair(src, "(Box(capacity=3, level=9).capacity, Box(capacity=3, level=9).level)")
         self.assertEqual(left, right)
 
+    def test_lambda_param_shadows_outer_local(self):
+        """回归：外层推导变量与 lambda 参数同名，曾导致 lambda 体被外层 _obf 名污染而 NameError。"""
+        src = ("class C:\n"
+               "    def __init__(self, last, index):\n"
+               "        self.last = last\n"
+               "        self.index = index\n"
+               "def pick(chars):\n"
+               "    chars = [char for char in chars if char is not None]\n"
+               "    return min(chars, key=lambda char: (char.last, char.index))\n")
+        call = "pick([C(2, 1), C(1, 2)]).last"
+        self.assertEqual(*self._run_pair(src, call))
+
+    def test_reassigned_parameter_not_renamed(self):
+        """回归：函数体对参数重新赋值时，参数名也不能改，否则关键字调用失败。"""
+        src = ("def f(items, limit=10):\n"
+               "    items = list(items)[:limit]\n"
+               "    total = len(items)\n"
+               "    return total\n")
+        self.assertEqual(*self._run_pair(src, "f(items=[1, 2, 3], limit=2)"))
+
     def test_global_statement(self):
         src = "_counter = 0\ndef bump():\n    global _counter\n    _counter += 1\n    return _counter\n"
         self.assertEqual(*self._run_pair(src, "(bump(), bump())"))
