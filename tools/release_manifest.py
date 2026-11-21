@@ -66,15 +66,22 @@ def build_manifest_from_dir(tree_dir, version, commit):
 
 
 def change_lines(prev_tag, commit):
-    """上一版到这一版的提交标题, 去掉只改版本号的提交 (标题就是 vX.Y.Z)。"""
-    if not prev_tag:
+    """上一版到这一版的提交标题, 去掉只改版本号的提交 (标题就是 vX.Y.Z)。
+
+    commit 必须是源码分支（main）上的提交：清单里的 commit 指向 obfuscated 分支，
+    那是 orphan 分支、没有 prev_tag 的祖先，git log 会失败。取不到变更就降级为空列表。
+    """
+    if not prev_tag or not commit:
         return []
-    subjects = git("log", "--no-merges", "--format=%s", f"{prev_tag}..{commit}").splitlines()
+    try:
+        subjects = git("log", "--no-merges", "--format=%s", f"{prev_tag}..{commit}").splitlines()
+    except subprocess.CalledProcessError:
+        return []
     return [s for s in subjects if s.strip() and not re.fullmatch(r"v\d+(\.\d+)*", s.strip())]
 
 
-def build_notes(version, prev_tag, commit, full_url, runtime_changed):
-    changes = change_lines(prev_tag, commit)
+def build_notes(version, prev_tag, source_commit, full_url, runtime_changed):
+    changes = change_lines(prev_tag, source_commit)
     lines = [f"{changes[0] if changes else '小更新'}。" if len(changes) == 1 else "小更新。", ""]
     lines += ["## 下载和启动", ""]
     if runtime_changed:
@@ -111,6 +118,9 @@ def main():
     parser.add_argument("--from-dir", default="",
                         help="从混淆产物目录生成清单（pyc 版），此时 --commit 传 obfuscated 分支提交号")
     parser.add_argument("--version", default="", help="--from-dir 模式下显式指定版本号")
+    parser.add_argument("--source-commit", default="HEAD",
+                        help="变更日志用哪个源码提交（main 分支）；--from-dir 时应传 main 的 HEAD，"
+                             "不能用 obfuscated 分支的 --commit")
     args = parser.parse_args()
 
     if args.from_dir:
@@ -121,7 +131,7 @@ def main():
                 with open(version_file, encoding="utf-8") as f:
                     version = f.read().strip()
         manifest = build_manifest_from_dir(args.from_dir, version, args.commit)
-        source_commit = None  # 变更日志仍用 main 分支的 HEAD
+        source_commit = git("rev-parse", args.source_commit)
     else:
         commit = git("rev-parse", args.commit)
         manifest = build_manifest(commit)
@@ -134,7 +144,7 @@ def main():
     runtime_changed = False
     if args.prev_tag and source_commit:
         runtime_changed = bool(git("diff", "--name-only", args.prev_tag, source_commit, "--", "requirements.txt"))
-    notes = build_notes(manifest["version"], args.prev_tag, args.commit, args.full_url, runtime_changed)
+    notes = build_notes(manifest["version"], args.prev_tag, source_commit, args.full_url, runtime_changed)
     with open(os.path.join(args.out_dir, "notes.md"), "w", encoding="utf-8") as f:
         f.write(notes)
     print(f"version={manifest['version']}")

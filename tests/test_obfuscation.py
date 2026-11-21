@@ -177,9 +177,13 @@ class TestBuildArtifact(unittest.TestCase):
     def test_manifest_from_artifact(self):
         manifest_script = ROOT / "tools" / "release_manifest.py"
         out_dir = Path(self.tempdir.name) / "manifest"
+        # --commit 用 orphan 分支式 SHA（与 main 无共同祖先），--source-commit 用 HEAD。
+        # 这正是 CI 里 obfuscated 分支的场景：改坏的话 change_lines 的 git log 会崩。
         result = subprocess.run([sys.executable, "-X", "utf8", str(manifest_script),
                                  str(out_dir), "--from-dir", str(self.out),
-                                 "--commit", "a" * 40],
+                                 "--commit", "a" * 40,
+                                 "--source-commit", "HEAD",
+                                 "--prev-tag", "v1.0.4"],
                                 capture_output=True, text=True, cwd=str(ROOT), timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((out_dir / "update-manifest.json").read_text(encoding="utf-8"))
